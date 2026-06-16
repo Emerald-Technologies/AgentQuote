@@ -1,4 +1,30 @@
+# Local development
 .env
+.venv/
+venv/
+
+# Python
 __pycache__/
 *.pyc
-.venv/
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Foundry
+.foundry/
+
+# Dev scripts
+dev/
+
+# OS
+.DS_Store
+Thumbs.db

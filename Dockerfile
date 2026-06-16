@@ -2,14 +2,12 @@ FROM mcr.microsoft.com/devcontainers/python:3.12
 
 WORKDIR /app
 
-COPY . user_agent/
-WORKDIR /app/user_agent
+# Install dependencies first (cacheable layer — code changes won't invalidate this)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN if [ -f requirements.txt ]; then \
-        pip install -r requirements.txt; \
-    else \
-        echo "No requirements.txt found"; \
-    fi
+# Then copy source code
+COPY . .
 
 EXPOSE 8088
 

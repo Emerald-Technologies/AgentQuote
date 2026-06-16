@@ -3,5 +3,4 @@ agent-framework-foundry>=1.2.2
 agent-framework-foundry-hosting==1.0.0a260429
 azure-identity
 python-dotenv
-debugpy
 agent-dev-cli>=0.0.1b260427
