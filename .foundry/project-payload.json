@@ -1,0 +1,8 @@
+{
+  "kind": "AIServices",
+  "location": "eastus2",
+  "properties": {
+    "description": "Team coding assistant project",
+    "displayName": "CodingAssistant"
+  }
+}

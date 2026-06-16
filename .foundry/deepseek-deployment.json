@@ -1,0 +1,13 @@
+{
+  "sku": {
+    "name": "GlobalStandard",
+    "capacity": 200
+  },
+  "properties": {
+    "model": {
+      "format": "DeepSeek",
+      "name": "DeepSeek-V4-Pro",
+      "version": "2026-04-23"
+    }
+  }
+}

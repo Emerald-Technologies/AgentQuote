@@ -1,0 +1,11 @@
+{
+  "kind": "AIServices",
+  "sku": { "name": "S0" },
+  "location": "eastus2",
+  "identity": { "type": "SystemAssigned" },
+  "properties": {
+    "customSubDomainName": "et-foundry-e2",
+    "publicNetworkAccess": "Enabled",
+    "restore": true
+  }
+}

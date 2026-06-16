@@ -1,0 +1,15 @@
+{
+  "name": "coding-assistant",
+  "definition": {
+    "kind": "hosted",
+    "image": "etfoundryacr.azurecr.io/coding-assistant:20260616",
+    "cpu": "0.5",
+    "memory": "1Gi",
+    "container_protocol_versions": [
+      { "protocol": "responses", "version": "1.0.0" }
+    ],
+    "environment_variables": {
+      "AZURE_AI_MODEL_DEPLOYMENT_NAME": "DeepSeek-V4-Pro"
+    }
+  }
+}

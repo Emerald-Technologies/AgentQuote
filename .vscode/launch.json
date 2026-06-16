@@ -1,0 +1,37 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Coding Assistant (agentdev + Inspector)",
+      "type": "python",
+      "request": "attach",
+      "connect": {
+        "host": "127.0.0.1",
+        "port": 5679
+      },
+      "preLaunchTask": "Open Agent Inspector",
+      "presentation": {
+        "group": "agent",
+        "order": 1
+      }
+    },
+    {
+      "name": "Debug Coding Assistant (CLI mode)",
+      "type": "python",
+      "request": "launch",
+      "module": "debugpy",
+      "args": [
+        "--listen",
+        "127.0.0.1:5679",
+        "main.py",
+        "--cli"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {},
+      "presentation": {
+        "group": "agent",
+        "order": 2
+      }
+    }
+  ]
+}
