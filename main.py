@@ -10,6 +10,10 @@ import urllib.parse
 import urllib.request
 
 from agent_framework import Agent
+from agent_framework._compaction import (
+    CompactionProvider,
+    ContextWindowCompactionStrategy,
+)
 from agent_framework.foundry import FoundryChatClient
 from agent_framework_foundry_hosting import ResponsesHostServer
 from azure.identity import DefaultAzureCredential
@@ -436,56 +440,38 @@ def http_request(url: str, method: str = "GET", headers: dict | None = None, bod
         return f"Error making request to '{url}': {e}"
 
 
-SYSTEM_PROMPT = """You are an expert coding assistant powered by DeepSeek. Your role is to help developers write, review, debug, and understand code across all programming languages and frameworks.
+SYSTEM_PROMPT = """You are an expert coding assistant powered by DeepSeek. Help developers write, review, debug, and understand code across all languages and frameworks.
 
-You can:
-- Write clean, idiomatic code in any language when asked
-- Review and improve existing code (performance, readability, security, best practices)
-- Debug errors and explain the root cause
-- Explain concepts, patterns, and algorithms clearly
-- Generate unit tests and documentation
-- Help with architecture and design decisions
-- Suggest libraries, tools, and frameworks for a given task
-- Read, write, and make targeted edits to files in the workspace
-- Delete and move/rename files
-- Search file contents across the workspace, explore directory trees, and find symbol definitions
-- Run shell commands
-- Make HTTP requests to external APIs and URLs
-- View git status, diffs, and commit history
-
-When writing code:
-- Always prefer clear, readable code over clever one-liners
-- Follow language-specific conventions and best practices (PEP8 for Python, etc.)
-- Include brief inline comments for non-obvious logic
-- Highlight potential security concerns (OWASP Top 10 awareness)
-- Keep answers focused and concise unless depth is requested
-
-When working with files:
-- Use get_directory_tree first to understand a repo's structure before diving in
-- Use search_files to find relevant code before reading entire files
-- Use find_symbol to locate function/class definitions and usages
-- Use read_file to understand existing code before suggesting changes
-- Use replace_in_file for targeted edits to existing files — always include enough context to be unique
-- Use write_file only to create new files or fully replace a file's content
-- Use delete_file and move_file for file management
-- Use http_request to fetch documentation, call APIs, or retrieve external data
-- Use git_status and git_diff to understand what has changed before reviewing
-- Use run_command sparingly — prefer the dedicated tools when possible
-
-When debugging:
-- Identify the root cause, not just the symptom
-- Explain why the issue occurred
-- Provide a corrected version with explanation
-
-Always ask clarifying questions if the request is ambiguous before writing code.
-Reference the AGENTS.md documentation if present for any questions about your capabilities or limitations."""
+Core rules:
+- Write clear, idiomatic code. Follow language conventions. Keep answers concise.
+- Flag security concerns (OWASP Top 10). Ask clarifying questions when ambiguous.
+- For targeted edits, use replace_in_file with enough context to match uniquely.
+- Prefer read_file before suggesting changes. Use get_directory_tree to understand repos.
+- Reference AGENTS.md if present for capabilities and limitations."""
 
 
 def main():
+    # Context-window compaction: when the conversation approaches the model's
+    # 128K token limit, old tool-call groups are collapsed into summaries
+    # (triggers at 50% budget) and the oldest messages are truncated
+    # (triggers at 80% budget).  This prevents silent degradation on long
+    # conversations without losing the high-level thread.
+    compaction = ContextWindowCompactionStrategy(
+        max_context_window_tokens=128_000,
+        max_output_tokens=16_384,
+        tool_eviction_threshold=0.5,
+        truncation_threshold=0.8,
+        keep_last_tool_call_groups=4,
+    )
+
     client = FoundryChatClient(
         project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
         model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"],
         credential=DefaultAzureCredential(),
+        # Sends system prompt as the "system" role so the inference endpoint
+        # can cache the shared prefix (prompt + tool defs) across requests.
+        instruction_role="system",
+        compaction_strategy=compaction,
     )
 
     agent = Agent(
@@ -496,6 +482,12 @@ def main():
             get_directory_tree, search_files, find_symbol,
             git_status, git_diff, get_git_log,
             delete_file, move_file, http_request,
+        ],
+        # CompactionProvider runs before every model call: if the accumulated
+        # context nears the budget it compacts old tool results and truncates
+        # stale messages so the model always works with a focused window.
+        context_providers=[
+            CompactionProvider(before_strategy=compaction),
         ],
         # History is managed by the hosting infrastructure
         # https://developers.openai.com/api/reference/resources/responses/methods/create
