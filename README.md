@@ -48,7 +48,8 @@ copy .env.example .env
 | Variable | Description |
 |---|---|
 | `FOUNDRY_PROJECT_ENDPOINT` | Your Azure AI Foundry project endpoint URL |
-| `AZURE_AI_MODEL_DEPLOYMENT_NAME` | The model deployment name (e.g. `DeepSeek-V4-Pro`) |
+| `AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO` | The pro model deployment name (e.g. `DeepSeek-V4-Pro`) |
+| `AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH` | The flash model deployment name (e.g. `DeepSeek-V4-Flash`) |
 
 ## Running Locally
 

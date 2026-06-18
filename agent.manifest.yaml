@@ -19,9 +19,14 @@ template:
   environment_variables:
     - name: FOUNDRY_PROJECT_ENDPOINT
       value: "{{FOUNDRY_PROJECT_ENDPOINT}}"
-    - name: AZURE_AI_MODEL_DEPLOYMENT_NAME
-      value: "{{AZURE_AI_MODEL_DEPLOYMENT_NAME}}"
+    - name: AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO
+      value: "{{AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO}}"
+    - name: AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH
+      value: "{{AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH}}"
 resources:
   - kind: model
-    id: DeepSeek-V4-Pro
-    name: AZURE_AI_MODEL_DEPLOYMENT_NAME
+    id: deepseek-v4-pro
+    name: AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO
+  - kind: model
+    id: deepseek-v4-flash
+    name: AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH

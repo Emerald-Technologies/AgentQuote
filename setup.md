@@ -179,7 +179,8 @@ Create `.foundry/agent-payload.json`:
       { "protocol": "responses", "version": "1.0.0" }
     ],
     "environment_variables": {
-      "AZURE_AI_MODEL_DEPLOYMENT_NAME": "DeepSeek-V4-Pro"
+      "AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO": "DeepSeek-V4-Pro",
+      "AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH": "DeepSeek-V4-Flash"
     }
   }
 }
@@ -256,7 +257,8 @@ Update `.env` in the repo root with the new endpoint:
 
 ```
 FOUNDRY_PROJECT_ENDPOINT="https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>"
-AZURE_AI_MODEL_DEPLOYMENT_NAME="DeepSeek-V4-Pro"
+AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO="DeepSeek-V4-Pro"
+AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH="DeepSeek-V4-Flash"
 ```
 
 ---
