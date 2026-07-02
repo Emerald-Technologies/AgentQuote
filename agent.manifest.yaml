@@ -1,17 +1,19 @@
-name: coding-assistant
+name: bom-processor
 description: >
-  A coding assistant agent hosted on Microsoft Foundry, powered by DeepSeek-V4-Pro.
-  Helps developers write, review, debug, and understand code across all languages and frameworks.
+  A BOM processing agent for electronic contract manufacturing. Learns customer assembly BOM formats
+  and develops per-customer parser scripts that normalize BOMs into a canonical quoting format.
+  Built on Microsoft Foundry, powered by DeepSeek-V4.
 metadata:
   tags:
     - Agent Framework
-    - Coding Assistant
-    - Code Review
-    - Debugging
+    - BOM Processing
+    - Electronic Manufacturing
+    - Quoting
+    - Supply Chain
     - Azure AI AgentServer
     - Responses Protocol
 template:
-  name: coding-assistant
+  name: bom-processor
   kind: hosted
   protocols:
     - protocol: responses
@@ -19,14 +21,14 @@ template:
   environment_variables:
     - name: FOUNDRY_PROJECT_ENDPOINT
       value: "{{FOUNDRY_PROJECT_ENDPOINT}}"
-    - name: AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO
-      value: "{{AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO}}"
+#    - name: AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO
+#      value: "{{AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO}}"
     - name: AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH
       value: "{{AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH}}"
 resources:
-  - kind: model
-    id: deepseek-v4-pro
-    name: AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO
+#  - kind: model
+#    id: deepseek-v4-pro
+#    name: AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO
   - kind: model
     id: deepseek-v4-flash
     name: AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH

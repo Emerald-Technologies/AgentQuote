@@ -1,6 +1,6 @@
-# Coding Assistant Agent — Deployment Setup Guide
+# BOM Processor Agent — Deployment Setup Guide
 
-End-to-end walkthrough for deploying the coding assistant as a Foundry Hosted Agent.
+End-to-end walkthrough for deploying the BOM processor as a Foundry Hosted Agent.
 All commands are PowerShell (`pwsh`). Run them in order.
 
 ---
@@ -61,7 +61,7 @@ Set-Location "C:\path\to\aiFoundrySetup"
 
 az acr build `
   --registry <acr-name> `
-  --image coding-assistant:20260615 `
+  --image bom-processor:20260615 `
   --platform linux/amd64 `
   --file Dockerfile .
 ```
@@ -69,7 +69,7 @@ az acr build `
 Verify the image landed:
 
 ```powershell
-az acr repository show-tags --name <acr-name> --repository coding-assistant -o table
+az acr repository show-tags --name <acr-name> --repository bom-processor -o table
 ```
 
 > **Note:** The Dockerfile uses `mcr.microsoft.com/devcontainers/python:3.12` as the base image to avoid Docker Hub rate limits during ACR cloud builds. Do not change it back to `python:3.12-slim`.
@@ -169,10 +169,10 @@ Create `.foundry/agent-payload.json`:
 
 ```json
 {
-  "name": "coding-assistant",
+  "name": "bom-processor",
   "definition": {
     "kind": "hosted",
-    "image": "<acr-name>.azurecr.io/coding-assistant:<image-tag>",
+    "image": "<acr-name>.azurecr.io/bom-processor:<image-tag>",
     "cpu": "0.5",
     "memory": "1Gi",
     "container_protocol_versions": [
@@ -269,10 +269,10 @@ After RBAC is assigned (allow ~2 min for propagation):
 
 ```powershell
 $token = az account get-access-token --resource "https://ai.azure.com" --query "accessToken" -o tsv
-$endpoint = "https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>/agents/coding-assistant/endpoint/protocols/openai/responses"
+$endpoint = "https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>/agents/bom-processor/endpoint/protocols/openai/responses"
 
 # Simple test message
-$body = '{"input":"Say hello and confirm you are the coding assistant."}'
+$body = '{"input":"Confirm you are the BOM processor agent and describe your canonical format."}'
 Invoke-RestMethod -Uri $endpoint -Method POST `
   -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
   -Body $body | ConvertTo-Json -Depth 5
@@ -285,7 +285,7 @@ Invoke-RestMethod -Uri $endpoint -Method POST `
 Once deployed, the agent is available at:
 
 ```
-https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>/agents/coding-assistant/endpoint/protocols/openai/responses
+https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>/agents/bom-processor/endpoint/protocols/openai/responses
 ```
 
 Team members authenticate with `az login` + `DefaultAzureCredential` in code, or via the Foundry Portal at **[ai.azure.com](https://ai.azure.com)**.

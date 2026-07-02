@@ -42,7 +42,7 @@
     GlobalStandard TPM capacity in thousands (default: 200).
 
 .PARAMETER AgentName
-    Name for the hosted agent (default: coding-assistant).
+    Name for the hosted agent (default: bom-processor).
 
 .PARAMETER DockerfilePath
     Path to the Dockerfile directory. Defaults to current directory.
@@ -68,11 +68,11 @@ param(
     [Parameter(Mandatory)][string] $AcrName,
     [Parameter(Mandatory)][string] $ImageTag,
 
-    [string] $ModelName     = "DeepSeek-V4-Pro",
+    [string] $ModelName     = "DeepSeek-V4-Flash",
     [string] $ModelVersion  = "2026-04-23",
     [string] $ModelFormat   = "DeepSeek",
     [int]    $ModelCapacity = 200,
-    [string] $AgentName     = "coding-assistant",
+    [string] $AgentName     = "bom-processor",
     [string] $DockerfilePath = "."
 )
 
@@ -223,7 +223,7 @@ $agentPayload = @{
         memory     = "1Gi"
         container_protocol_versions = @(@{ protocol = "responses"; version = "1.0.0" })
         environment_variables = @{
-            AZURE_AI_MODEL_DEPLOYMENT_NAME = $ModelName
+            AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH = $ModelName
         }
     }
 } | ConvertTo-Json -Depth 6
@@ -250,7 +250,7 @@ $projectPrincipal = az rest --method GET `
 Write-Step "9. Update .env"
 $envFile = Join-Path $PSScriptRoot ".env"
 if (Test-Path $envFile) {
-    $envContent = "FOUNDRY_PROJECT_ENDPOINT=`"$foundryApi`"`nAZURE_AI_MODEL_DEPLOYMENT_NAME=`"$ModelName`""
+    $envContent = "FOUNDRY_PROJECT_ENDPOINT=`"$foundryApi`"`nAZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH=`"$ModelName`""
     $envContent | Set-Content $envFile -Encoding UTF8
     Write-Ok ".env updated with new project endpoint"
 } else {

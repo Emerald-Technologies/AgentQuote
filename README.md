@@ -1,8 +1,10 @@
-# Coding Assistant Agent
+# BOM Processor Agent
 
-A hosted AI coding assistant built on Microsoft Foundry using the Agent Framework and powered by **DeepSeek-V4-Pro**.
+A hosted AI agent for electronic contract manufacturing. Built on Microsoft Foundry using the Agent Framework, powered by **DeepSeek-V4**.
 
-The agent helps developers write, review, debug, and understand code across all programming languages and frameworks. It is exposed via the OpenAI-compatible `/responses` protocol, so it can be consumed from any repo that supports the Responses API.
+**Primary objective:** Learn customer assembly BOM formats and develop per-customer parser scripts that normalize BOMs into a canonical quoting format.
+
+The agent is exposed via the OpenAI-compatible `/responses` protocol and can be invoked programmatically or from the Foundry Portal.
 
 ## Prerequisites
 
@@ -14,14 +16,24 @@ The agent helps developers write, review, debug, and understand code across all 
 ## Project Structure
 
 ```
-aiFoundrySetup/
+agentQuote/
 ├── main.py                  # Agent entrypoint
-├── agent.yaml               # Foundry hosting manifest
 ├── agent.manifest.yaml      # Agent metadata
 ├── requirements.txt         # Python dependencies
 ├── Dockerfile               # Container image
+├── README.md                # This file
+├── setup.md                 # Deployment walkthrough
 ├── .env                     # Local secrets (not committed)
-├── .env.example             # Secret template for other repos
+├── format/
+│   └── finalformat.xlsx     # Canonical BOM schema (quoting module target)
+├── parsers/                 # Per-customer BOM parser scripts
+│   └── <customer_name>/
+│       └── parse.py
+├── boms/                    # Customer sample BOMs for reference
+│   └── <customer_name>/
+│       └── sample_bom.xlsx
+├── dev/
+│   └── deploy-agent.ps1     # Deployment automation script
 └── .vscode/
     ├── launch.json          # VS Code debug configurations
     └── tasks.json           # VS Code tasks (server + inspector)
@@ -68,14 +80,32 @@ The agent listens on `http://localhost:8088`.
 ```bash
 curl -X POST http://localhost:8088/responses \
   -H "Content-Type: application/json" \
-  -d '{"input": "Write a Python function to reverse a linked list."}'
+  -d '{"input": "Analyze the BOM sample at boms/acme/sample.xlsx and create a parser."}'
 ```
 
 ## Debugging in VS Code
 
 1. Press **F5** and select **"Debug Coding Assistant (agentdev + Inspector)"**
 2. The Foundry Toolkit Agent Inspector will open automatically
-3. Send messages and inspect the full conversation flow, tool calls, and traces
+3. Send a BOM file path and ask the agent to analyze it
+
+## Canonical BOM Format
+
+The quoting module expects BOMs in the format defined by `format/finalformat.xlsx`:
+
+| Column | Type | Description |
+|---|---|---|
+| `line_number` | int | Sequence number |
+| `item_number` | str | Customer's part/item identifier |
+| `item_name` | str | Description of the item |
+| `revision` | str | Revision letter/number |
+| `item_category` | str | Part, Document, Assembly, PCB |
+| `unit_of_measure` | str | EA, FT, IN, etc. |
+| `quantity` | float | Per-assembly quantity |
+| `reference_designator` | str | PCB refdes (e.g. R1,R2,C1-C5) |
+| `bom_notes` | str | Production notes, RoHS status |
+| `manufacturer_1`..`manufacturer_8` | str | Manufacturer names |
+| `manufacturer_item_number_1`..`manufacturer_item_number_8` | str | Manufacturer part numbers |
 
 ## Using This Agent from Other Repos
 
@@ -98,22 +128,10 @@ client = AzureOpenAI(
 )
 
 response = client.responses.create(
-    model="coding-assistant",
-    input="Explain the difference between a mutex and a semaphore.",
+    model="bom-processor",
+    input="Parse the BOM at boms/acme/sample.xlsx and normalize it for quoting.",
 )
 print(response.output_text)
-```
-
-### VS Code Copilot Instructions (`.github/copilot-instructions.md`)
-
-Add this to any repo to use the deployed agent as a custom Copilot context:
-
-```markdown
-This repository uses a self-hosted coding assistant agent at:
-<your-deployed-agent-endpoint>
-
-When asking coding questions, the agent follows OWASP Top 10 security practices,
-writes idiomatic code, and includes inline comments for non-obvious logic.
 ```
 
 ## Deploying to Foundry
@@ -135,20 +153,4 @@ az login
 
 For production, assign the **Azure AI User** role to the agent's managed identity.
 
-Permissions needed
-# 1. Allow agent container runtime to call the model (run twice - one per identity)
-az role assignment create \
-  --assignee "9a574021-0728-4f3c-bf9a-7966b97f1070" \
-  --role "Foundry User" \
-  --scope "/subscriptions/be5a3beb-686a-4703-aaa8-ceb70667ad77/resourceGroups/ems-rg-e1/providers/Microsoft.CognitiveServices/accounts/et-foundry-e2"
-
-az role assignment create \
-  --assignee "462a694e-5c1e-4864-a5e1-cb309f488e54" \
-  --role "Foundry User" \
-  --scope "/subscriptions/be5a3beb-686a-4703-aaa8-ceb70667ad77/resourceGroups/ems-rg-e1/providers/Microsoft.CognitiveServices/accounts/et-foundry-e2"
-
-# 2. Allow Foundry to pull the container image from ACR
-az role assignment create \
-  --assignee "59a291d9-4ad5-4fe9-9cae-a530bbbd7a86" \
-  --role "AcrPull" \
-  --scope "/subscriptions/be5a3beb-686a-4703-aaa8-ceb70667ad77/resourceGroups/ems-rg-e1/providers/Microsoft.ContainerRegistry/registries/etfoundryacr"
+Permissions are assigned during deployment (see setup.md).

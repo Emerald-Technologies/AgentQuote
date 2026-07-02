@@ -137,42 +137,72 @@ def replace_in_file(path: str, old_str: str, new_str: str) -> str:
         return f"Error replacing in '{path}': {e}"
 
 
-SYSTEM_PROMPT = """You are an expert coding assistant powered by DeepSeek. Help developers write, review, debug, and understand code.
+SYSTEM_PROMPT = """You are a BOM Processing Agent for Emerald Technologies, an electronic contract manufacturer.
 
-Core efficiency rules:
-- Provide the shortest correct answer. NO prose, NO preambles, NO restating the prompt.
-- Use bullets only when necessary.
-- Never narrate or summarize the output of tools. If you use a tool, immediately proceed to the next action or give your final answer.
-- Ask at most ONE clarifying question if completely blocked.
-- Write clear, idiomatic code and prefer direct targeted edits with `replace_in_file`.
-- Prefer reading small file chunks via `read_file` (with start_line/end_line) rather than whole files.
-- Shell First: Use `run_command` with ripgrep (rg), grep, find, ls, tree, mv, rm, and curl instead of relying on custom python tools.
-- Flag security concerns immediately (OWASP Top 10) but keep it brief.
-- Reference AGENTS.md if present for capabilities and limitations."""
+PRIMARY OBJECTIVE: Learn the formatting and structure of customer assembly BOMs and develop per-customer parser/normalizer scripts that output to a canonical quoting format.
+
+## Canonical Target Schema (quoting module input)
+
+The quoting module expects an Excel file matching `format/finalformat.xlsx` with these columns:
+- line_number (int) — sequence number
+- item_number (str) — customer's part/item identifier
+- item_name (str) — description of the item
+- revision (str) — revision letter/number
+- item_category (str) — e.g. Part, Document, Assembly, PCB
+- unit_of_measure (str) — EA, FT, IN, etc.
+- quantity (float) — per-assembly quantity
+- reference_designator (str) — PCB refdes (e.g. R1,R2,C1-C5)
+- bom_notes (str) — production notes, RoHS status, etc.
+- manufacturer_1 through manufacturer_8 (str) — manufacturer names
+- manufacturer_item_number_1 through manufacturer_item_number_8 (str) — MPNs
+
+## Workflow
+1. When given a customer BOM file, first analyze its structure: identify headers, column meanings, data types, quirks (merged cells, multi-line rows, embedded notes). Use `run_command` with Python/pandas to inspect.
+2. Map each customer column to the canonical schema above. Flag columns that don't map cleanly.
+3. Write a parser script in `parsers/<customer_name>/parse.py` that:
+   - Reads the customer's native BOM format (Excel, CSV, fixed-width, etc.)
+   - Normalizes it to the canonical schema
+   - Outputs an Excel file matching `format/finalformat.xlsx`
+   - Logs warnings for unmappable data, missing required fields, and data quality issues
+4. Validate: run the parser against the sample BOM and compare output to the canonical format.
+5. Save sample BOMs in `boms/<customer_name>/` for reference.
+
+## Script Design Rules
+- Each customer gets a self-contained parser in `parsers/<customer_name>/parse.py`
+- Parser must accept `--input <path>` and `--output <path>` CLI arguments
+- Use `pandas` and `openpyxl` (already available)
+- Handle common BOM quirks: header rows that aren't row 1, merged cells, empty rows, footer/summary rows, multi-sheet workbooks
+- Add a docstring at the top explaining the customer's format and mapping decisions
+- Never hard-code secrets or credentials
+
+## Tone
+- Be concise. Give the answer, not a story.
+- When developing a parser, show the code and explain only non-obvious mapping decisions.
+- Flag data quality issues immediately (missing quantities, unrecognized columns, ambiguous mappings)."""
 
 
-class RoutingFoundryChatClient(FoundryChatClient):
-    """Dynamically routes requests between Pro and Flash models based on difficulty."""
-    def __init__(self, pro_model: str, flash_model: str, **kwargs):
-        super().__init__(model=flash_model, **kwargs)
-        self.pro_model = pro_model
-        self.flash_model = flash_model
-
-    def get_response(self, messages, *args, **kwargs):
-        # Heuristic: analyze the last user message
-        last_user_text = ""
-        for m in reversed(messages):
-            role = getattr(m, "role", "") or (m.get("role") if isinstance(m, dict) else "")
-            if role == "user":
-                last_user_text = getattr(m, "content", "") or (m.get("content") if isinstance(m, dict) else "")
-                break
-        
-        last_user_text = str(last_user_text).lower()
-        hard_markers = ["bug", "debug", "error", "refactor", "architect", "security", "complex", "why does", "explain why", "issue"]
-        is_hard = len(last_user_text) > 300 or any(m in last_user_text for m in hard_markers)
-        
-        self.model = self.pro_model if is_hard else self.flash_model
-        return super().get_response(messages, *args, **kwargs)
+# class RoutingFoundryChatClient(FoundryChatClient):
+#     """Dynamically routes requests between Pro and Flash models based on difficulty."""
+#     def __init__(self, pro_model: str, flash_model: str, **kwargs):
+#         super().__init__(model=flash_model, **kwargs)
+#         self.pro_model = pro_model
+#         self.flash_model = flash_model
+#
+#     def get_response(self, messages, *args, **kwargs):
+#         # Heuristic: analyze the last user message
+#         last_user_text = ""
+#         for m in reversed(messages):
+#             role = getattr(m, "role", "") or (m.get("role") if isinstance(m, dict) else "")
+#             if role == "user":
+#                 last_user_text = getattr(m, "content", "") or (m.get("content") if isinstance(m, dict) else "")
+#                 break
+#
+#         last_user_text = str(last_user_text).lower()
+#         hard_markers = ["bug", "debug", "error", "refactor", "architect", "security", "complex", "why does", "explain why", "issue"]
+#         is_hard = len(last_user_text) > 300 or any(m in last_user_text for m in hard_markers)
+#
+#         self.model = self.pro_model if is_hard else self.flash_model
+#         return super().get_response(messages, *args, **kwargs)
 
 def main():
     # Context-window compaction: when the conversation approaches the model's
@@ -180,17 +210,16 @@ def main():
     # (triggers at 30% budget) and the oldest messages are truncated
     # (triggers at 50% budget) to aggressively save tokens.
     compaction = ContextWindowCompactionStrategy(
-        max_context_window_tokens=64_000,
+        max_context_window_tokens=100_000,
         max_output_tokens=4_096,
         tool_eviction_threshold=0.3,
         truncation_threshold=0.6,
         keep_last_tool_call_groups=1,
     )
 
-    client = RoutingFoundryChatClient(
+    client = FoundryChatClient(
         project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
-        pro_model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO"],
-        flash_model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH"],
         credential=DefaultAzureCredential(),
         instruction_role="system",
         compaction_strategy=compaction,
