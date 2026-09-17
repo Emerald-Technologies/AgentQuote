@@ -625,6 +625,13 @@ class _LazyAgent:
 def main():
     lazy = _LazyAgent()
 
+    # Enable the resilient task subsystem (TaskManager) so background=true
+    # requests run durably with crash recovery. Must be set before the
+    # server's lifespan startup. Non-hosted mode uses LocalFileTaskProvider
+    # (JSON under AGENTSERVER_STATE_ROOT, default ~/.agentserver/tasks).
+    from azure.ai.agentserver.core.tasks import set_resilient_tasks_enabled  # noqa: PLC0415
+    set_resilient_tasks_enabled(True)
+
     # Pre-warm in background thread — runs concurrently with Hypercorn startup
     import threading as _t
     _t.Thread(target=lazy._get, daemon=True, name="agent-init").start()
