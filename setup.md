@@ -1,5 +1,181 @@
 # BOM Processor Agent — Deployment Setup Guide
 
+End-to-end walkthrough for deploying the BOM processor. Two paths are documented:
+
+1. **Azure Government** — hosted on **Container Apps** (Hosted Agents are not available in Gov regions)
+2. **Commercial Azure** — hosted on **Foundry Hosted Agents** (original walkthrough)
+
+All commands are PowerShell (`pwsh`). Run them in order.
+
+---
+
+# Part A — Azure Government Deployment (Container Apps)
+
+> **Why Container Apps?** Foundry Hosted Agents are not enabled in Azure Government regions. The agent container is self-contained (a Responses API server on port 8088), so it runs unchanged in a Container App. The only code difference is a Gov scope fix in `main.py` (see note below).
+
+## Gov Info You Need Before Starting
+
+| Item | Value used |
+|---|---|
+| Azure cloud | `AzureUSGovernment` |
+| Subscription | `37d47e73-56ae-433b-a340-86eac088c78e` (Azure subscription ITAR) |
+| Resource group | `et-rg-adf` (usgovvirginia) |
+| ACR | `etContainerRegistry` (`etcontainerregistry.azurecr.us`) |
+| Model | `gpt-5.6-luna` v2026-07-09, DataZoneStandard, capacity 10 (10,000 TPM) |
+| Foundry project | `AzureGovAgents` on account `azuregovagents-resource` |
+| Storage account | `etbomstoragegov` |
+| Container App | `bom-processor-gov` in env `et-bom-ca-env` |
+
+## Gov Step 1 — Login to Azure Government
+
+```powershell
+az cloud set --name AzureUSGovernment
+az login
+az account show --query "{name:name, id:id}" -o table
+```
+
+## Gov Step 2 — Create the Foundry AIServices Resource
+
+Create `.foundry/account-create-gov.json`:
+
+```json
+{
+  "kind": "AIServices",
+  "sku": { "name": "S0" },
+  "location": "usgovvirginia",
+  "identity": { "type": "SystemAssigned" },
+  "properties": {
+    "customSubDomainName": "<foundry-account-name>",
+    "publicNetworkAccess": "Enabled"
+  }
+}
+```
+
+Then run (note the `.us` management endpoint):
+
+```powershell
+az rest --method PUT `
+  --url "https://management.usgovcloudapi.net/subscriptions/<subscription-id>/resourceGroups/et-rg-adf/providers/Microsoft.CognitiveServices/accounts/<foundry-account-name>?api-version=2024-10-01" `
+  --resource "https://management.usgovcloudapi.net" `
+  --body "@.foundry/account-create-gov.json" `
+  --query "{name:name, location:location, state:properties.provisioningState, identity:identity.type}" -o table
+```
+
+> **Important:** When you create the project in the portal (ai.azure.us), the portal may create a **second** AIServices account for the project. Check `az cognitiveservices account list -g et-rg-adf` after this step. The model deployment and RBAC must target the account that actually hosts the project (in our case `azuregovagents-resource`).
+
+## Gov Step 3 — Deploy gpt-5.6-luna
+
+Create `.foundry/luna-deployment-gov.json` (get the exact version from the portal or `list-models`):
+
+```json
+{
+  "sku": { "name": "DataZoneStandard", "capacity": 10 },
+  "properties": {
+    "model": {
+      "format": "OpenAI",
+      "name": "gpt-5.6-luna",
+      "version": "2026-07-09"
+    }
+  }
+}
+```
+
+```powershell
+az rest --method PUT `
+  --url "https://management.usgovcloudapi.net/subscriptions/<subscription-id>/resourceGroups/et-rg-adf/providers/Microsoft.CognitiveServices/accounts/<project-hosting-account>/deployments/gpt-5.6-luna?api-version=2024-10-01" `
+  --resource "https://management.usgovcloudapi.net" `
+  --body "@.foundry/luna-deployment-gov.json" `
+  --query "{name:name, sku:sku.name, capacity:sku.capacity, state:properties.provisioningState}" -o table
+```
+
+## Gov Step 4 — Create the Foundry Project (Portal)
+
+1. Go to **ai.azure.us** → **+ Create project**
+2. Select the AIServices resource → name it (e.g. `AzureGovAgents`)
+3. Copy the project endpoint: `https://<account>.services.ai.azure.us/api/projects/<project>`
+
+## Gov Step 5 — Build and Push the Container Image
+
+```powershell
+az acr build `
+  --registry etContainerRegistry `
+  --image bom-processor:<tag> `
+  --platform linux/amd64 `
+  --file Dockerfile .
+```
+
+## Gov Step 6 — Create Storage Account and Containers
+
+```powershell
+az storage account create --name etbomstoragegov --resource-group et-rg-adf `
+  --location usgovvirginia --sku Standard_LRS
+
+foreach ($c in 'boms','parsers','format') {
+  az storage container create --name $c --account-name etbomstoragegov --auth-mode login
+}
+
+az storage account show-connection-string --name etbomstoragegov `
+  --resource-group et-rg-adf --query connectionString -o tsv
+```
+
+## Gov Step 7 — Create the Container App
+
+Create a user-assigned identity for ACR image pulls, then create the app from a YAML spec (`.foundry/bom-containerapp-gov.yaml`):
+
+```powershell
+az identity create --name id-bom-processor-gov --resource-group et-rg-adf --location usgovvirginia
+
+# Give the pull identity AcrPull on the Gov ACR
+$acrScope = "/subscriptions/<subscription-id>/resourceGroups/et-rg-adf/providers/Microsoft.ContainerRegistry/registries/etContainerRegistry"
+az role assignment create --assignee "<pull-identity-principal-id>" --role "AcrPull" --scope $acrScope
+
+az containerapp env create --name et-bom-ca-env --resource-group et-rg-adf --location usgovvirginia
+
+az containerapp create --name bom-processor-gov --resource-group et-rg-adf `
+  --yaml .foundry/bom-containerapp-gov.yaml
+```
+
+The YAML sets:
+- Both `UserAssigned` (ACR pull) and `SystemAssigned` (model auth) identities
+- ACR registry auth via the pull identity
+- Env vars: `FOUNDRY_PROJECT_ENDPOINT`, `AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH`, `BOM_STORAGE_CONNECTION_STRING` (as a secret)
+- Ingress on target port **8088**
+
+## Gov Step 8 — Assign RBAC for Model Access
+
+Grant the container app's **system-assigned** identity the **Foundry User** role on the account that hosts the project:
+
+```powershell
+$sysId = az containerapp show --name bom-processor-gov --resource-group et-rg-adf `
+  --query "identity.principalId" -o tsv
+
+$cogScope = "/subscriptions/<subscription-id>/resourceGroups/et-rg-adf/providers/Microsoft.CognitiveServices/accounts/<project-hosting-account>"
+az role assignment create --assignee $sysId --role "Foundry User" --scope $cogScope
+```
+
+> **Role note:** `Cognitive Services OpenAI User` is NOT sufficient for Foundry AIServices accounts — use **Foundry User**. Allow ~2-5 min for RBAC propagation in Gov.
+
+## Gov Step 9 — Smoke Test
+
+```powershell
+$endpoint = "https://bom-processor-gov.<env-name>.usgovvirginia.azurecontainerapps.us/responses"
+$body = '{"input":"Confirm you are the BOM processor agent and describe your canonical format.","store":false}'
+Invoke-RestMethod -Uri $endpoint -Method POST -ContentType "application/json" -Body $body -TimeoutSec 180 | ConvertTo-Json -Depth 6
+```
+
+A successful response has `"status": "completed"` and non-empty `"output"`.
+
+## Gov Gotchas (learned during this deployment)
+
+1. **Hosted Agents unavailable in Gov** → use Container Apps.
+2. **SDK hardcodes commercial token scope** — `azure-ai-projects` always requests `https://ai.azure.com/.default`, which Gov managed-identity endpoints reject with `invalid_scope`. `main.py` wraps the credential to translate the scope to `https://ai.azure.us/.default` when the project endpoint is a `.azure.us` host.
+3. **Portal may create a second AIServices account** — deploy the model and assign RBAC on the account that actually hosts the project.
+4. **Use `Foundry User`, not `Cognitive Services OpenAI User`** for model invocation on AIServices accounts.
+
+---
+
+# Part B — Commercial Azure Deployment (Foundry Hosted Agent)
+
 End-to-end walkthrough for deploying the BOM processor as a Foundry Hosted Agent.
 All commands are PowerShell (`pwsh`). Run them in order.
 
@@ -423,6 +599,26 @@ If you see `"status": "failed"`, check the portal: **ai.azure.com** → **Coding
 ---
 
 ## Current Deployment Values (this repo)
+
+### Azure Government (active)
+
+| Setting | Value |
+|---|---|
+| Cloud | `AzureUSGovernment` |
+| Subscription | `37d47e73-56ae-433b-a340-86eac088c78e` (Azure subscription ITAR) |
+| Resource group | `et-rg-adf` (usgovvirginia) |
+| Foundry account | `azuregovagents-resource` (usgovvirginia) |
+| Foundry project | `AzureGovAgents` |
+| ACR | `etContainerRegistry` (`etcontainerregistry.azurecr.us`) |
+| Container App | `bom-processor-gov` in env `et-bom-ca-env` |
+| Agent endpoint | `https://bom-processor-gov.calmglacier-732dba63.usgovvirginia.azurecontainerapps.us/responses` |
+| Model | `gpt-5.6-luna` v2026-07-09, DataZoneStandard, capacity 10 (10,000 TPM) |
+| Storage account | `etbomstoragegov` |
+| Pull identity | `id-bom-processor-gov` (`4d332ea7-b039-423d-bcb4-97bd01c872d0`) |
+| App system identity | `c4293fbe-7426-47be-84c4-c228777b51ea` |
+| Image tag | `20260917b` |
+
+### Commercial Azure (legacy)
 
 | Setting | Value |
 |---|---|

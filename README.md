@@ -1,17 +1,26 @@
 # BOM Processor Agent
 
-A hosted AI agent for electronic contract manufacturing. Built on Microsoft Foundry using the Agent Framework, powered by **DeepSeek-V4**.
+A hosted AI agent for electronic contract manufacturing. Built on Microsoft Foundry using the Agent Framework, powered by **gpt-5.6-luna** (Azure Government deployment).
 
-**Primary objective:** Learn customer assembly BOM formats and develop per-customer parser scripts that normalize BOMs into a stardardized quoting format.
+**Primary objective:** Learn customer assembly BOM formats and develop per-customer parser scripts that normalize BOMs into a standardized quoting format.
 
-The agent is exposed via the OpenAI-compatible `/responses` protocol and can be invoked programmatically or from the Foundry Portal.
+The agent is exposed via the OpenAI-compatible `/responses` protocol and runs as an Azure Container App in Azure Government.
+
+## Deployments
+
+| Environment | Hosting | Model | Endpoint |
+|---|---|---|---|
+| **Azure Gov** (current) | Container App `bom-processor-gov` in `et-bom-ca-env` (usgovvirginia) | `gpt-5.6-luna` (10K TPM) | `https://bom-processor-gov.calmglacier-732dba63.usgovvirginia.azurecontainerapps.us/responses` |
+| Commercial (legacy) | Foundry Hosted Agent | `DeepSeek-V4-Flash` | See "Current Deployment Values" in setup.md |
+
+> **Note:** Foundry Hosted Agents are not available in Azure Government regions. The Gov deployment uses Container Apps with the same container image — the agent code is identical.
 
 ## Prerequisites
 
 - Python 3.12+
 - [Azure Developer CLI (azd)](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd)
 - [Foundry Toolkit VS Code extension](https://marketplace.visualstudio.com/items?itemName=ms-windows-ai-studio.windows-ai-studio) (for Agent Inspector)
-- Access to the `et-foundry` Azure AI Foundry project
+- Access to the `AzureGovAgents` Foundry project (Gov) or `CodingAssistant` project (commercial)
 
 ## Project Structure
 
@@ -60,8 +69,8 @@ copy .env.example .env
 | Variable | Description |
 |---|---|
 | `FOUNDRY_PROJECT_ENDPOINT` | Your Azure AI Foundry project endpoint URL |
-| `AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO` | The pro model deployment name (e.g. `DeepSeek-V4-Pro`) |
-| `AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH` | The flash model deployment name (e.g. `DeepSeek-V4-Flash`) |
+| `AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH` | The model deployment name (e.g. `gpt-5.6-luna` in Gov, `DeepSeek-V4-Flash` in commercial) |
+| `BOM_STORAGE_CONNECTION_STRING` | Connection string for the BOM storage account |
 
 ## Running Locally
 
@@ -109,7 +118,7 @@ The quoting module expects BOMs in the format defined by `format/finalformat.xls
 
 ## Using This Agent from Other Repos
 
-This agent speaks the OpenAI-compatible `/responses` protocol. Once deployed to Foundry, other repos can call it via the Foundry-hosted endpoint.
+This agent speaks the OpenAI-compatible `/responses` protocol. Once deployed, other repos can call it via the hosted endpoint.
 
 ### Python example (using `openai` SDK)
 
@@ -117,12 +126,13 @@ This agent speaks the OpenAI-compatible `/responses` protocol. Once deployed to 
 from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
+# Azure Gov uses the .us audience; commercial uses cognitiveservices.azure.com
 token_provider = get_bearer_token_provider(
-    DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+    DefaultAzureCredential(), "https://ai.azure.us/.default"
 )
 
 client = AzureOpenAI(
-    azure_endpoint="<your-deployed-agent-endpoint>",
+    azure_endpoint="https://bom-processor-gov.calmglacier-732dba63.usgovvirginia.azurecontainerapps.us",
     azure_ad_token_provider=token_provider,
     api_version="2025-01-01-preview",
 )
@@ -134,7 +144,25 @@ response = client.responses.create(
 print(response.output_text)
 ```
 
-## Deploying to Foundry
+> **Note:** The Container App endpoint is currently open (no auth enforced at ingress). If you need Entra-authenticated access, add Container App authentication or put it behind a private endpoint.
+
+## Deploying
+
+### Azure Government (Container Apps)
+
+Hosted Agents are not available in Gov regions, so the agent runs as a Container App. See `setup.md` for the full walkthrough. Key steps:
+
+```powershell
+# 1. Build and push the image to the Gov ACR
+az acr build --registry etContainerRegistry --image bom-processor:<tag> `
+  --platform linux/amd64 --file Dockerfile .
+
+# 2. Update the container app to the new image
+az containerapp update --name bom-processor-gov --resource-group et-rg-adf `
+  --image etcontainerregistry.azurecr.us/bom-processor:<tag>
+```
+
+### Commercial (Foundry Hosted Agent)
 
 ```bash
 # Deploy with Azure Developer CLI
@@ -151,6 +179,8 @@ The agent uses `DefaultAzureCredential`. For local development, run:
 az login
 ```
 
-For production, assign the **Azure AI User** role to the agent's managed identity.
+For production (Gov), the container app's system-assigned managed identity is granted **Foundry User** on the `azuregovagents-resource` Cognitive Services account.
+
+> **Gov scope fix:** the `azure-ai-projects` SDK hardcodes the token scope to `https://ai.azure.com/.default`, which Gov managed-identity endpoints reject. `main.py` wraps the credential to translate the scope to `https://ai.azure.us/.default` when the project endpoint is a `.azure.us` host.
 
 Permissions are assigned during deployment (see setup.md).

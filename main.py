@@ -546,8 +546,27 @@ def _create_agent():
         credential = (ManagedIdentityCredential(client_id=_instance_client_id)
                       if _instance_client_id else DefaultAzureCredential())
 
+        # Azure Gov fix: the SDK hardcodes scope "https://ai.azure.com/.default"
+        # but Gov managed-identity endpoints only issue tokens for the .us audience.
+        # Wrap the credential to translate the scope transparently.
+        _project_ep = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
+        if ".azure.us" in _project_ep:
+            class _GovScopeCredential:
+                """Translate commercial AI scope to Gov audience."""
+                def __init__(self, inner):
+                    self._inner = inner
+                def get_token(self, *scopes, **kwargs):
+                    translated = tuple(
+                        s.replace("https://ai.azure.com/.default",
+                                  "https://ai.azure.us/.default")
+                        for s in scopes
+                    )
+                    return self._inner.get_token(*translated, **kwargs)
+            credential = _GovScopeCredential(credential)
+            _log.info("Gov scope translation enabled for credential.")
+
         client = FoundryChatClient(
-            project_endpoint=os.environ["FOUNDRY_PROJECT_ENDPOINT"],
+            project_endpoint=_project_ep,
             model=os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH"],
             credential=credential,
             instruction_role="system",
