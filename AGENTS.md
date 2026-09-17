@@ -25,6 +25,7 @@ Agents must prioritize:
 6. Provide the user with copy-safe, one-shot style code when appropriate and write to the terminal when applicable
 7. Log key decisions, assumptions, and approvals in the task response.
 8. Prefer solving problems using the standard library and already-installed packages before introducing new dependencies. Only propose a new library or external repository if the standard approach is clearly insufficient, and always ask before adding it.
+9. Do not say or use canonical during chat or in builds. Instead use official, standard, agreed in chat or fact in datasets.
 
 ## Validation Gates (Ask Before Action)
 

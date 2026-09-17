@@ -2,7 +2,7 @@
 
 A hosted AI agent for electronic contract manufacturing. Built on Microsoft Foundry using the Agent Framework, powered by **DeepSeek-V4**.
 
-**Primary objective:** Learn customer assembly BOM formats and develop per-customer parser scripts that normalize BOMs into a canonical quoting format.
+**Primary objective:** Learn customer assembly BOM formats and develop per-customer parser scripts that normalize BOMs into a stardardized quoting format.
 
 The agent is exposed via the OpenAI-compatible `/responses` protocol and can be invoked programmatically or from the Foundry Portal.
 
@@ -25,7 +25,7 @@ agentQuote/
 ├── setup.md                 # Deployment walkthrough
 ├── .env                     # Local secrets (not committed)
 ├── format/
-│   └── finalformat.xlsx     # Canonical BOM schema (quoting module target)
+│   └── finalformat.xlsx     # Official BOM schema (quoting module target)
 ├── parsers/                 # Per-customer BOM parser scripts
 │   └── <customer_name>/
 │       └── parse.py
@@ -89,7 +89,7 @@ curl -X POST http://localhost:8088/responses \
 2. The Foundry Toolkit Agent Inspector will open automatically
 3. Send a BOM file path and ask the agent to analyze it
 
-## Canonical BOM Format
+## Official BOM Format
 
 The quoting module expects BOMs in the format defined by `format/finalformat.xlsx`:
 

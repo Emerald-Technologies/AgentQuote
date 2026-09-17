@@ -13,7 +13,7 @@ Reference file: `format/finalformat.xlsx`
 | 2 | `item_number` | str | Yes | Customer's internal part/item identifier |
 | 3 | `item_name` | str | Yes | Human-readable description of the item |
 | 4 | `revision` | str | No | Revision letter/number (e.g. A, B, 01) |
-| 5 | `item_category` | str | No | Classification: Part, Document, Assembly, PCB, etc. |
+| 5 | `item_category` | str | Yes | Classification: exactly `Part` or `Document` (never empty) |
 | 6 | `unit_of_measure` | str | No | EA (each), FT (feet), IN (inches), LB (pounds), etc. |
 | 7 | `quantity` | float | Yes | Per-assembly quantity (can be fractional for bulk items like solder) |
 | 8 | `reference_designator` | str | No | PCB reference designators (e.g. "R1,R2,R5" or "C1-C10") |
@@ -38,6 +38,9 @@ Reference file: `format/finalformat.xlsx`
 ## Data Type Notes
 
 - `line_number`: Integer, must be sequential and unique within a BOM
+- `item_category`: Must be populated on every row with exactly `Part` or `Document`.
+  Documents (drawings, specs, manuals, labels, artwork) are `Document`; all physical
+  components and hardware are `Part`. Default to `Part` when uncertain. Never leave empty.
 - `quantity`: Float — supports fractional values (e.g. 0.04 for bulk solder by weight)
 - All string fields: UTF-8, no leading/trailing whitespace after normalization
 - Empty cells should be `NaN`/`None` in the output, not empty strings

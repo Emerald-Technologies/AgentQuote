@@ -23,3 +23,12 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+#MD
+AGENTS.md
+
+#logs
+*.log
+
+#parsers
+parsers/

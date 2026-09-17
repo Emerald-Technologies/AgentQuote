@@ -2,5 +2,9 @@ agent-framework-core>=1.2.2
 agent-framework-foundry>=1.2.2
 agent-framework-foundry-hosting==1.0.0a260429
 azure-identity
+azure-storage-blob
 python-dotenv
 agent-dev-cli>=0.0.1b260427
+pandas
+openpyxl
+xlrd

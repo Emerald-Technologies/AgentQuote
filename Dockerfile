@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/python:3.12
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -11,4 +11,5 @@ COPY . .
 
 EXPOSE 8088
 
-CMD ["python", "main.py"]
+# Use a slim Python base to stay within the hosted agent CPU tier image size limit.
+ENTRYPOINT ["python", "main.py"]

@@ -13,6 +13,7 @@ All commands are PowerShell (`pwsh`). Run them in order.
 | Resource group name | Azure Portal or team lead | `ems-rg-e1` |
 | Foundry account name | Chosen by you — must be globally unique | `et-foundry-e2` |
 | ACR name | Chosen by you — must be globally unique, alphanumeric only | `etfoundryacr` |
+| Storage account name | Chosen by you — must be globally unique, lowercase alphanumeric | `etbomstorage` |
 | Deployment region | Must be in the [Hosted Agents supported list](https://learn.microsoft.com/azure/foundry/agents/concepts/hosted-agents#region-availability) | `eastus2` |
 | Azure account with Owner/UAA role | Required for the RBAC steps at the end | — |
 
@@ -50,6 +51,70 @@ az acr create `
 
 ---
 
+## Step 2B — Create Storage Account and Blob Containers
+
+This is where customer BOMs, parser scripts, and the canonical format live. The agent reads BOMs from blob storage and writes parsers back to it.
+
+```powershell
+# Create the storage account
+az storage account create `
+  --name <storage-account-name> `
+  --resource-group <resource-group> `
+  --location <region> `
+  --sku Standard_LRS `
+  --query "{name:name, location:location}" -o table
+
+# Create the three containers
+az storage container create `
+  --name boms `
+  --account-name <storage-account-name> `
+  --auth-mode login
+
+az storage container create `
+  --name parsers `
+  --account-name <storage-account-name> `
+  --auth-mode login
+
+az storage container create `
+  --name format `
+  --account-name <storage-account-name> `
+  --auth-mode login
+```
+
+Upload the canonical format reference and any existing sample BOMs:
+
+```powershell
+# Upload the canonical schema
+az storage blob upload `
+  --account-name <storage-account-name> `
+  --container-name format `
+  --name finalformat.xlsx `
+  --file format\finalformat.xlsx `
+  --auth-mode login `
+  --overwrite
+
+# Upload sample BOMs (repeat per customer)
+az storage blob upload `
+  --account-name <storage-account-name> `
+  --container-name boms `
+  --name acme/sample.xlsx `
+  --file boms\acme\sample.xlsx `
+  --auth-mode login
+```
+
+Get the connection string for the agent's environment variable:
+
+```powershell
+az storage account show-connection-string `
+  --name <storage-account-name> `
+  --resource-group <resource-group> `
+  --query connectionString -o tsv
+```
+
+Save this connection string — you'll need it in Step 7 (agent payload) and Step 9 (.env).
+
+---
+
 ## Step 3 — Build and Push the Container Image
 
 Run from the repo root (where the `Dockerfile` lives). Uses ACR Cloud Build — no local Docker needed.
@@ -72,7 +137,7 @@ Verify the image landed:
 az acr repository show-tags --name <acr-name> --repository bom-processor -o table
 ```
 
-> **Note:** The Dockerfile uses `mcr.microsoft.com/devcontainers/python:3.12` as the base image to avoid Docker Hub rate limits during ACR cloud builds. Do not change it back to `python:3.12-slim`.
+> **Note:** The Dockerfile uses `mcr.microsoft.com/devcontainers/python:3.12` as the base image to avoid Docker Hub rate limits during ACR cloud builds. Do not change it back to `python:3.12-slim`. The Dockerfile overrides the default `ENTRYPOINT` from this image — the devcontainers base image ships with `/usr/local/share/docker-init.sh` as its entrypoint (a VS Code workspace setup script), which hangs in the Foundry cloud environment and prevents the server from starting.
 
 ---
 
@@ -180,7 +245,8 @@ Create `.foundry/agent-payload.json`:
     ],
     "environment_variables": {
       "AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO": "DeepSeek-V4-Pro",
-      "AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH": "DeepSeek-V4-Flash"
+      "AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH": "DeepSeek-V4-Flash",
+      "BOM_STORAGE_CONNECTION_STRING": "<storage-connection-string>"
     }
   }
 }
@@ -259,6 +325,7 @@ Update `.env` in the repo root with the new endpoint:
 FOUNDRY_PROJECT_ENDPOINT="https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>"
 AZURE_AI_MODEL_DEPLOYMENT_NAME_PRO="DeepSeek-V4-Pro"
 AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH="DeepSeek-V4-Flash"
+BOM_STORAGE_CONNECTION_STRING="<storage-connection-string>"
 ```
 
 ---
@@ -294,24 +361,64 @@ Team members authenticate with `az login` + `DefaultAzureCredential` in code, or
 
 ## Redeployment (code changes)
 
-To push a new version after editing `main.py`:
+To push a new version after editing `main.py` or any other source file:
+
+**Step 1 — Build and push a new image**
+
+Use today's date as the tag. If you do multiple builds on the same day, append a letter (`20260702b`, `20260702c`, etc.).
 
 ```powershell
-# 1. Rebuild with a new date tag
+Set-Location "C:\Users\Andrew.Shea\OneDrive - Emerald Technologies\Documents\github\agentQuote"
+
 az acr build `
-  --registry <acr-name> `
-  --image coding-assistant:<new-date-tag> `
+  --registry etfoundryacr2 `
+  --image bom-processor:20260702 `
   --platform linux/amd64 `
   --file Dockerfile .
+```
 
-# 2. Update agent-payload.json with the new image tag, then re-POST
+Verify the tag was pushed:
+
+```powershell
+az acr repository show-tags --name etfoundryacr2 --repository bom-processor -o table
+```
+
+**Step 2 — Update the image tag in the payload**
+
+Edit `.foundry/bom-agent-payload.json` and set the `"image"` field to the new tag:
+
+```json
+"image": "etfoundryacr2.azurecr.io/bom-processor:20260702"
+```
+
+**Step 3 — Deploy a new version**
+
+```powershell
 az rest --method POST `
-  --url "https://<foundry-account-name>.services.ai.azure.com/api/projects/<project-name>/agents?api-version=2025-05-15-preview" `
+  --url "https://et-foundry-e2.services.ai.azure.com/api/projects/CodingAssistant/agents/bom-processor/versions?api-version=2025-05-15-preview" `
   --resource "https://ai.azure.com" `
-  --body "@.foundry/agent-payload.json"
+  --body "@.foundry/bom-agent-payload.json"
 ```
 
 Each POST creates a new immutable version. Traffic routes to `@latest` automatically.
+
+**Step 4 — Smoke test**
+
+Wait ~90 seconds for the container to start, then:
+
+```powershell
+$token = az account get-access-token --resource "https://ai.azure.com" --query "accessToken" -o tsv
+$endpoint = "https://et-foundry-e2.services.ai.azure.com/api/projects/CodingAssistant/agents/bom-processor/endpoint/protocols/openai/responses?api-version=2025-05-15-preview"
+
+Invoke-RestMethod -Uri $endpoint -Method POST `
+  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+  -Body '{"input":"Confirm you are the BOM processor agent and describe your canonical format."}' `
+  | ConvertTo-Json -Depth 5
+```
+
+A successful response has `"status": "completed"` and non-empty `"output"`.
+
+If you see `"status": "failed"`, check the portal: **ai.azure.com** → **CodingAssistant** → **Agents** → **bom-processor** → traces for the most recent request.
 
 ---
 
@@ -323,9 +430,114 @@ Each POST creates a new immutable version. Traffic routes to `@latest` automatic
 | Resource group | `ems-rg-e1` |
 | Foundry account | `et-foundry-e2` (East US 2) |
 | Foundry project | `CodingAssistant` |
-| ACR | `etfoundryacr.azurecr.io` |
-| Agent name | `coding-assistant` |
-| Model | `DeepSeek-V4-Pro` GlobalStandard 200K TPM |
-| Agent instance identity | `9a574021-0728-4f3c-bf9a-7966b97f1070` |
-| Blueprint principal | `462a694e-5c1e-4864-a5e1-cb309f488e54` |
+| ACR | `etfoundryacr2.azurecr.io` |
+| Agent name | `bom-processor` |
+| Model | `DeepSeek-V4-Flash` GlobalStandard |
+| Agent instance identity | `bf29e157-aa51-457f-9e94-6e1d45b4d3c4` |
+| Blueprint principal | `bcd30278-80ed-4a70-b15f-a92e38666b5e` |
 | Project managed identity | `59a291d9-4ad5-4fe9-9cae-a530bbbd7a86` |
+| Storage account | (to be created — see Step 2B) |
+
+---
+
+## Usage Guide — Blob-Storage Batch Workflow
+
+After deploying with the storage account included, here's how the blob-backed workflow works.
+
+### Drop BOMs into storage
+
+Upload customer BOMs to the `boms` container. Use folder names as customer identifiers:
+
+```powershell
+# One customer at a time
+az storage blob upload `
+  --account-name etbomstorage `
+  --container-name boms `
+  --name acme/sample.xlsx `
+  --file "C:\BOMs\acme_q3.xlsx" `
+  --auth-mode login
+
+# Or bulk via AzCopy (faster for many files)
+azcopy copy "C:\BOMs\*" "https://etbomstorage.blob.core.windows.net/boms/" --recursive
+```
+
+### Tell the agent to process everything
+
+```powershell
+$token = az account get-access-token --resource "https://ai.azure.com" --query "accessToken" -o tsv
+$endpoint = "https://et-foundry-e2.services.ai.azure.com/api/projects/CodingAssistant/agents/bom-processor/endpoint/protocols/openai/responses?api-version=2025-05-15-preview"
+
+$body = @'
+{
+  "input": "List all BOMs in blob storage, check which customers already have parsers, then process all new customers. For each one: download the BOM, analyze the format, write a parser, validate it, and upload the parser back to blob storage."
+}
+'@
+
+Invoke-RestMethod -Uri $endpoint -Method POST `
+  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+  -Body $body | ConvertTo-Json -Depth 5
+```
+
+### How the agent processes BOMs (blob flow)
+
+```
+1. list_boms("boms")       → discovers "acme/sample.xlsx", "omega/quote.xlsx"
+2. list_boms("parsers")     → discovers "acme/parse.py" (skips — already done)
+3. download_blob("omega/quote.xlsx", "boms")  → pulls to /tmp in container
+4. run_command(pandas inspect) → learns the format
+5. write_file("parsers/omega/parse.py") → creates parser in workspace
+6. run_command(python parsers/omega/parse.py --input ... --output ...) → validates
+7. upload_blob("parsers/omega/parse.py", "parsers") → persists to blob
+8. Reports back: what was processed, what was skipped, any errors
+```
+
+### Retrieve parsers from blob
+
+```powershell
+# List all parsers
+az storage blob list --account-name etbomstorage --container-name parsers --query "[].name" -o tsv
+
+# Download a specific parser
+az storage blob download `
+  --account-name etbomstorage `
+  --container-name parsers `
+  --name acme/parse.py `
+  --file parsers\acme\parse.py `
+  --auth-mode login
+```
+
+### Run a parser locally
+
+```powershell
+pip install pandas openpyxl
+python parsers\acme\parse.py --input "C:\BOMs\acme_q3.xlsx" --output "C:\BOMs\acme_q3_normalized.xlsx"
+```
+
+### Data flow recap
+
+```
+You                         Blob Storage                  Agent Container
+ │                             │                              │
+ ├── upload BOM ──────────────► boms/acme/sample.xlsx        │
+ │                             │                              │
+ │                             │    ◄── list_boms("boms") ───┤
+ │                             │    ◄── download_blob() ─────┤
+ │                             │                              ├── analyze
+ │                             │                              ├── write parser
+ │                             │                              ├── run & validate
+ │                             │    upload_blob() ──────────► parsers/acme/parse.py
+ │                             │                              │
+ ├── download parser ◄──────── parsers/acme/parse.py         │
+ │                             │                              │
+ └── run parser locally        │                              │
+```
+
+### Recommended prompt patterns
+
+| Goal | Prompt |
+|---|---|
+| **First run** | `List all BOMs from blob storage and process every customer that doesn't already have a parser. Upload each parser back to blob when done.` |
+| **One customer** | `Download boms/acme/sample.xlsx, analyze it, create parsers/acme/parse.py, validate it, and upload the parser.` |
+| **Resume batch** | `List existing parsers, then process only customers in boms/ that are missing from parsers/.` |
+| **Specific format help** | `Download parsers/acme/parse.py so I can review it.` |
+| **Re-parse after fixes** | `Download boms/acme/updated.xlsx, run parsers/acme/parse.py against it, upload the normalized output.` |
