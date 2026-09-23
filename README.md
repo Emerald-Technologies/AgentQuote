@@ -74,6 +74,13 @@ copy .env.example .env
 
 ## Running Locally
 
+### Candidate authoring job
+
+The local candidate image is built with `Dockerfile.candidate` and accepts only
+the request-scoped `REQUEST_ID` environment variable. Foundry and Blob settings
+remain static configuration; the job uses managed identity and emits only safe
+request/candidate identifiers and status. It does not execute generated code.
+
 ```bash
 # Run directly
 python main.py
@@ -108,7 +115,7 @@ The quoting module expects BOMs in the format defined by `format/finalformat.xls
 | `item_number` | str | Customer's part/item identifier |
 | `item_name` | str | Description of the item |
 | `revision` | str | Revision letter/number |
-| `item_category` | str | Part, Document, Assembly, PCB |
+| `item_category` | str | Exactly `Part` or `Document` |
 | `unit_of_measure` | str | EA, FT, IN, etc. |
 | `quantity` | float | Per-assembly quantity |
 | `reference_designator` | str | PCB refdes (e.g. R1,R2,C1-C5) |
@@ -145,6 +152,42 @@ print(response.output_text)
 ```
 
 > **Note:** The Container App endpoint is currently open (no auth enforced at ingress). If you need Entra-authenticated access, add Container App authentication or put it behind a private endpoint.
+
+## Deterministic Quick Quote Processing API
+
+Quick Quote processing does not use prompts or agent tools. The versioned API
+is a separate service entry point so caller-controlled job, parser, and Blob
+paths never pass through an LLM:
+
+```text
+POST /api/v1/bom/process
+python deterministic_api.py
+```
+
+Build this service with `Dockerfile.deterministic`. Production storage access
+uses `BOM_STORAGE_ACCOUNT_URL` and the Container App managed identity; a storage
+connection string remains a local compatibility fallback only.
+
+The request includes `job_id`, separate `customer_key` and `parser_key` values,
+the RFQ/package identity, and exact source document paths, sizes, and SHA-256
+values. Successful processing writes immutable parsed workbooks and uploads
+`manifest.json` last as the completion marker. Reusing a job ID with a different
+request fails closed.
+
+The deterministic service defaults to `BOM_API_AUTH_MODE=easy_auth` and refuses
+to start unless `BOM_API_ALLOWED_APP_IDS` or `BOM_API_ALLOWED_OBJECT_IDS` has an
+explicit allowlist. `local_disabled` is for loopback-only local tests and must
+not be used in Azure. See `setup.md` for the required ingress controls.
+
+This service is not production-ready until parser execution runs in an isolated
+workload with restricted filesystem, process resources, secrets, and network
+egress. Python subprocess timeouts are not a security sandbox.
+
+Local deployment-artifact validation (no Azure calls):
+
+```powershell
+.\dev\Test-DeterministicDeploymentReadiness.ps1
+```
 
 ## Deploying
 

@@ -1,0 +1,207 @@
+"""Small, deliberately tool-free Foundry author used by the candidate job."""
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
+import re
+from html.parser import HTMLParser
+from typing import Any, Callable
+
+MAX_SHEETS = 4
+MAX_ROWS = 20
+MAX_CELLS = 160
+MAX_CHARS = 8_000
+MAX_HTML_BYTES = 2_000_000
+MAX_HTML_TEXT = 2_000
+SYSTEM_INSTRUCTION = (
+    "Write only one Python parser source file. It must accept --input and --output, "
+    "read the supplied BOM, and write a real XLSX workbook to --output using pandas "
+    "or openpyxl. Follow every canonical output rule and exact ordered column list in "
+    "the user message. Reopen and check the workbook before successful exit. Do not "
+    "use network, subprocesses, dynamic code execution, or tools. Return source only. "
+    "Map source component taxonomy (including Capacitor, Resistor, and PCB assembly) "
+    "to canonical item_category='Part'; reserve item_category='Document' for source "
+    "rows that are documents, drawings, or specifications. Preserve the actual source "
+    "category in bom_notes when useful and never fabricate one. For html_table_xls, "
+    "parse with a bounded inert stdlib html.parser.HTMLParser "
+    "implementation only; never use pandas.read_html, read_excel, XML parsing, "
+    "rendering, eval, or other banned APIs."
+)
+_SECRET = re.compile(r"(?:https?://|www\.)[^\s<>]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9])", re.I)
+
+
+def _clean(value: Any) -> str:
+    return _SECRET.sub("[REDACTED]", str(value).replace("\x00", ""))[:300]
+
+
+def _csv_preview(data: bytes) -> list[list[str]]:
+    text = data.decode("utf-8-sig", errors="replace")
+    return [list(row) for row in csv.reader(io.StringIO(text))][:MAX_ROWS]
+
+
+class _PreviewTableParser(HTMLParser):
+    """Extract only bounded table text from Excel's inert HTML export."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+        self._ignored = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "head"}:
+            self._ignored += 1
+        elif not self._ignored and tag == "tr" and len(self.rows) < MAX_ROWS:
+            self._row = []
+        elif not self._ignored and tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "head"}:
+            self._ignored = max(0, self._ignored - 1)
+        elif not self._ignored and tag in {"td", "th"} and self._row is not None and self._cell is not None:
+            self._row.append(" ".join("".join(self._cell).split())[:MAX_HTML_TEXT])
+            self._cell = None
+        elif not self._ignored and tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+            self._cell = None
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored and self._cell is not None:
+            self._cell.append(data[:MAX_HTML_TEXT])
+
+
+def _html_table_preview(data: bytes) -> list[list[str]] | None:
+    sample = data[: min(len(data), 16_384)].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if not (sample[:256].lower().startswith((b"<html", b"<!doctype html", b"<head", b"<table"))
+            or b"<table" in sample[:16_384].lower()):
+        return None
+    parser = _PreviewTableParser()
+    try:
+        parser.feed(data[:MAX_HTML_BYTES].decode("utf-8-sig", errors="replace"))
+        parser.close()
+    except Exception:
+        return None
+    return parser.rows or None
+
+
+def build_preview(source: bytes, extension: str) -> str:
+    """Return bounded, redacted spreadsheet structure; never send raw bytes."""
+    ext = extension.lower().lstrip(".")
+    sheets: list[tuple[str, list[list[Any]]]] = []
+    if ext == "csv":
+        sheets = [("csv", _csv_preview(source))]
+    elif ext in {"xlsx", "xls"}:
+        try:
+            if ext == "xlsx":
+                import openpyxl
+                workbook = openpyxl.load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+                for name in workbook.sheetnames[:MAX_SHEETS]:
+                    ws = workbook[name]
+                    sheets.append((name, [list(row) for row in ws.iter_rows(max_row=MAX_ROWS, values_only=True)]))
+            else:
+                html_rows = _html_table_preview(source)
+                if html_rows is not None:
+                    sheets.append(("html_table_xls", html_rows))
+                else:
+                    import xlrd
+                    workbook = xlrd.open_workbook(file_contents=source, on_demand=True)
+                    for sheet in workbook.sheets()[:MAX_SHEETS]:
+                        sheets.append((sheet.name, [sheet.row_values(i) for i in range(min(MAX_ROWS, sheet.nrows))]))
+        except Exception:
+            sheets = [(ext, [["<unreadable workbook>"]])]
+    else:
+        sheets = [(ext or "unknown", [["<unsupported format>"]])]
+    cells = 0
+    lines = []
+    for name, rows in sheets:
+        lines.append(f"[sheet: {_clean(name)}]")
+        for row in rows:
+            if cells >= MAX_CELLS:
+                break
+            values = [_clean(value) for value in row[:MAX_CELLS - cells]]
+            cells += len(values)
+            lines.append("\t".join(values))
+    return "\n".join(lines)[:MAX_CHARS]
+
+
+def _response_text(response: Any) -> str:
+    for attr in ("text", "output_text"):
+        value = getattr(response, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    messages = getattr(response, "messages", None) or getattr(response, "output", None) or []
+    chunks = []
+    for message in messages:
+        content = getattr(message, "content", message)
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            chunks.extend(str(getattr(part, "text", part)) for part in content)
+    return "\n".join(chunks)
+
+
+def strip_code_fences(text: str) -> str:
+    match = re.fullmatch(r"\s*```(?:python|py)?\s*\n?(.*?)\n?```\s*", text, re.I | re.S)
+    return match.group(1) if match else text
+
+
+class FoundryModelAuthor:
+    def __init__(self, client: Any = None, agent_factory: Callable[..., Any] | None = None):
+        self.client = client
+        self.agent_factory = agent_factory
+
+    def generate(self, prompt: Any, source_bytes: bytes, prior_code: str | None = None,
+                 failed_rule_id: str | None = None) -> str:
+        async def invoke() -> str:
+            factory = self.agent_factory
+            if factory is None:
+                from agent_framework import Agent
+                factory = Agent
+            agent = factory(client=self.client, instructions=SYSTEM_INSTRUCTION, tools=[])
+            rules = "\n".join(f"- {rule}" for rule in prompt.rules)
+            user_text = (f"Canonical columns in exact required order: {', '.join(prompt.canonical_columns)}\n"
+                         f"Canonical output rules:\n{rules}\n"
+                         f"Source format: {prompt.source_analysis.extension}\n"
+                         f"Workbook preview:\n{build_preview(source_bytes, prompt.source_analysis.extension)}")
+            if prior_code is not None:
+                user_text += (
+                    "\nA previous candidate failed static policy rule "
+                    f"[{failed_rule_id or 'unspecified_policy_rule'}]. Correct it and return "
+                    "a complete replacement source file. Do not discuss or reproduce the policy "
+                    "failure. For html_table_xls, explicitly use stdlib html.parser.HTMLParser "
+                    "for compliant bounded parsing and avoid every banned API.\n"
+                    f"Previous candidate (in-memory correction context only):\n{prior_code}"
+                )
+            response = await agent.run(user_text)
+            return strip_code_fences(_response_text(response))
+        return asyncio.run(invoke())
+
+
+def create_foundry_author() -> FoundryModelAuthor:
+    """Construct the Gov client lazily so importing this module stays offline."""
+    from agent_framework_foundry import FoundryChatClient
+    from azure.identity import ManagedIdentityCredential
+    import os
+    credential: Any = ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None)
+    endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
+    if ".azure.us" in endpoint:
+        class GovScopeCredential:
+            def __init__(self, inner): self.inner = inner
+            def get_token(self, *scopes, **kwargs):
+                translated = tuple(scope.replace("https://ai.azure.com/.default", "https://ai.azure.us/.default") for scope in scopes)
+                return self.inner.get_token(*translated, **kwargs)
+        credential = GovScopeCredential(credential)
+    client = FoundryChatClient(
+        project_endpoint=endpoint,
+        model=os.environ.get("AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH", "gpt-5.6-luna"),
+        credential=credential,
+        instruction_role="system",
+    )
+    return FoundryModelAuthor(client=client)

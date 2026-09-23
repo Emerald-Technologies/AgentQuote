@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY bom_processor ./bom_processor
+COPY deterministic_api.py .
+
+RUN useradd --create-home --uid 10001 agentquote \
+	&& chown -R agentquote:agentquote /app
+
+USER 10001
+
+EXPOSE 8088
+
+# Run separately from the prompt-driven Responses service in main.py.
+ENTRYPOINT ["python", "deterministic_api.py"]
