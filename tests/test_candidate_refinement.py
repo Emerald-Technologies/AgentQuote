@@ -213,3 +213,66 @@ def test_authoring_no_feedback_when_none():
     service.request_id = "req-1"
     service.feedback = None
     assert service.feedback is None
+
+
+# --- Status projection tiebreak when a refinement supersedes a candidate ---
+
+def _status_request(request_id, profile_hash):
+    return {
+        "version": "candidate-request.v1", "request_id": request_id,
+        "parser_key": "Customer1", "customer_key": "customer-key",
+        "profile_hash": profile_hash, "source_evidence": [{"document_id": "doc1"}],
+        "profile": {}, "status": "requested",
+    }
+
+
+def _status_manifest(request_id, candidate_id, version):
+    return {
+        "version": version, "status": "generated_unvalidated",
+        "request_id": request_id, "candidate_id": candidate_id,
+        "parser_key": "Customer1", "customer_key": "customer-key",
+        "profile_hash": "a" * 64, "code_sha256": "b" * 64,
+    }
+
+
+def test_status_prefers_refinement_successor_over_superseded_candidate():
+    """Two same-version candidates tie unless one is a refinement source."""
+    from bom_processor.candidate_authoring import AUTHORING_VERSION
+    from bom_processor.candidate_status import CandidateStatusService
+
+    storage = FakeStorage()
+    request_id = "req-1"
+    old, new = "cand-old", "cand-new"
+    storage.registry[f"candidates/requests/{request_id}.json"] = \
+        json.dumps(_status_request(request_id, "a" * 64)).encode()
+    storage.candidates[f"candidates/{request_id}/{old}/candidate-manifest.json"] = \
+        json.dumps(_status_manifest(request_id, old, AUTHORING_VERSION)).encode()
+    storage.candidates[f"candidates/{request_id}/{new}/candidate-manifest.json"] = \
+        json.dumps(_status_manifest(request_id, new, AUTHORING_VERSION)).encode()
+    # A started refinement marker names the old candidate as its source.
+    storage.registry[
+        f"candidate-automation/{request_id}/author-refinement/{AUTHORING_VERSION}/attempt-1.started.json"
+    ] = json.dumps({"request_id": request_id, "job": "author_refinement",
+                    "refinement_of": old}).encode()
+
+    result = CandidateStatusService(storage).get(request_id)
+
+    assert result["candidate_id"] == new
+    assert result["status"] == "generated_unvalidated"
+
+
+def test_status_still_ambiguous_when_no_refinement_lineage():
+    """Without a refinement marker, two same-version candidates stay ambiguous."""
+    from bom_processor.candidate_authoring import AUTHORING_VERSION
+    from bom_processor.candidate_status import CandidateStatusError, CandidateStatusService
+
+    storage = FakeStorage()
+    request_id = "req-1"
+    storage.registry[f"candidates/requests/{request_id}.json"] = \
+        json.dumps(_status_request(request_id, "a" * 64)).encode()
+    for cand in ("cand-old", "cand-new"):
+        storage.candidates[f"candidates/{request_id}/{cand}/candidate-manifest.json"] = \
+            json.dumps(_status_manifest(request_id, cand, AUTHORING_VERSION)).encode()
+
+    with pytest.raises(CandidateStatusError):
+        CandidateStatusService(storage).get(request_id)

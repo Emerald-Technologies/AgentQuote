@@ -108,7 +108,15 @@ class CandidateStatusService:
             top = max(row[0] for row in records)
             choices = [row for row in records if row[0] == top]
             if len(choices) != 1:
-                raise CandidateStatusError("ambiguous candidates")
+                # A refinement re-authors a candidate at the same authoring
+                # version, so the superseded (refined) candidate must not tie
+                # with its successor. Drop any candidate that a started
+                # author-refinement marker names as its refinement source.
+                superseded = self._superseded_by_refinement(request_id)
+                remaining = [row for row in choices if row[2] not in superseded]
+                if len(remaining) != 1:
+                    raise CandidateStatusError("ambiguous candidates")
+                choices = remaining
             _, _, candidate_id, status, validation_id, manifest, decision = choices[0]
             selected = (candidate_id, status, validation_id, manifest, decision)
         result = {"request_id": request_id, "parser_key": request["parser_key"], "customer_key": request["customer_key"],
@@ -152,3 +160,28 @@ class CandidateStatusService:
             return _json(self.storage, failures[-1], True)
         except Exception:
             return None
+
+    def _superseded_by_refinement(self, request_id: str) -> set[str]:
+        """Candidate ids that a started author-refinement marker names as its source.
+
+        Best effort: if the automation namespace cannot be listed or read, no
+        candidate is treated as superseded and the caller falls back to the
+        existing ambiguous-candidate error.
+        """
+        root = f"candidate-automation/{request_id}/author-refinement/"
+        try:
+            paths = self.storage.list_registry_paths(root, self.max_results)
+        except Exception:
+            return set()
+        superseded: set[str] = set()
+        for path in paths:
+            if not path.endswith(".started.json"):
+                continue
+            try:
+                marker = _json(self.storage, path, False)
+            except Exception:
+                continue
+            source = marker.get("refinement_of")
+            if isinstance(source, str) and _ID.fullmatch(source):
+                superseded.add(source)
+        return superseded
