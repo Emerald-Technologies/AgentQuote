@@ -61,6 +61,7 @@ class Storage(Protocol):
     def download_candidate(self, path: str, max_bytes: int) -> bytes: ...
     def upload_candidate_immutable(self, path: str, data: bytes, content_type: str) -> None: ...
     def list_candidate_paths(self, prefix: str, max_results: int) -> list[str]: ...
+    def list_registry_paths(self, prefix: str, max_results: int) -> list[str]: ...
     def download_registry_with_etag(self, path: str, max_bytes: int) -> tuple[bytes, str]: ...
     def upload_registry_if_match(self, path: str, data: bytes, content_type: str, etag: str | None) -> str: ...
 
@@ -163,6 +164,16 @@ class InMemoryStorage:
                         if path.startswith(prefix)})
         if len(paths) > max_results:
             raise ProcessingError("candidate list exceeds limit")
+        return paths
+
+    def list_registry_paths(self, prefix: str, max_results: int) -> list[str]:
+        if not isinstance(prefix, str) or "\\" in prefix or not prefix.endswith("/"):
+            raise ProcessingError("invalid registry prefix")
+        if type(max_results) is not int or not 1 <= max_results <= 100:
+            raise ProcessingError("invalid registry list limit")
+        paths = sorted(path for path in self.registry.keys() if path.startswith(prefix))
+        if len(paths) > max_results:
+            raise ProcessingError("registry list exceeds limit")
         return paths
 
 
@@ -320,6 +331,20 @@ class AzureBlobStorage:
             raise ProcessingError("candidate list failed") from exc
         if len(paths) > max_results:
             raise ProcessingError("candidate list exceeds limit")
+        return sorted(paths)
+
+    def list_registry_paths(self, prefix: str, max_results: int) -> list[str]:
+        if (not isinstance(prefix, str) or "\\" in prefix or ".." in prefix.split("/")
+                or not prefix.endswith("/")):
+            raise ProcessingError("invalid registry prefix")
+        if type(max_results) is not int or not 1 <= max_results <= 100:
+            raise ProcessingError("invalid registry list limit")
+        try:
+            paths = [item.name for item in self._parsers.list_blobs(name_starts_with=prefix)]
+        except Exception as exc:
+            raise ProcessingError("registry list failed") from exc
+        if len(paths) > max_results:
+            raise ProcessingError("registry list exceeds limit")
         return sorted(paths)
 
 

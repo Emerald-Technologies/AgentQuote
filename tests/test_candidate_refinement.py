@@ -38,7 +38,12 @@ class FakeStorage:
         self.candidates[path] = data
 
     def list_candidate_paths(self, prefix, limit):
+        if not prefix.startswith("candidates/"):
+            raise ValueError("invalid candidate prefix")
         return [p for p in self.candidates if p.startswith(prefix)][:limit]
+
+    def list_registry_paths(self, prefix, limit):
+        return [p for p in self.registry if p.startswith(prefix)][:limit]
 
 
 class FakeStarter:
@@ -163,8 +168,8 @@ def test_start_author_refinement_respects_max_attempts():
     # Simulate 2 existing attempts.
     from bom_processor.candidate_authoring import AUTHORING_VERSION
     root = f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}"
-    storage.candidates[f"{root}/attempt-1.started.json"] = b"{}"
-    storage.candidates[f"{root}/attempt-2.started.json"] = b"{}"
+    storage.registry[f"{root}/attempt-1.started.json"] = b"{}"
+    storage.registry[f"{root}/attempt-2.started.json"] = b"{}"
 
     result = automation.start_author_refinement("req-1", "cand-1", None)
     assert result is None

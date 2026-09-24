@@ -50,7 +50,9 @@ class CandidateAutomationService:
         self.storage, self.author_starter, self.validator_starter = storage, author_starter, validator_starter
 
     def _paths(self, prefix: str) -> list[str]:
-        return self.storage.list_candidate_paths(prefix, 100)
+        if prefix.startswith("candidates/"):
+            return self.storage.list_candidate_paths(prefix, 100)
+        return self.storage.list_registry_paths(prefix, 100)
 
     def _marker_exists(self, path: str) -> bool:
         try:
