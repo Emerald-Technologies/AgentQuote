@@ -147,7 +147,12 @@ class CandidateValidationService:
             return self._existing_result(evidence, validation_id, evidence_path)
 
         job_id = f"validate-{validation_id[:32]}"
-        worker_prefix = f"{base}/worker/{job_id}"
+        # The worker writes its result blob with If-None-Match:*, so the path
+        # must be unique per attempt; a deterministic path would let the first
+        # run's (possibly stale-format) result block every later re-run. The
+        # prefix must still end with "/{job_id}" (WorkItem invariant).
+        attempt_suffix = f"{int(time.time() * 1000)}"
+        worker_prefix = f"{base}/worker/attempt-{attempt_suffix}/{job_id}"
         item = WorkItem(
             job_id, "boms", "parsers", "parsers", source_evidence["blob_path"],
             f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
