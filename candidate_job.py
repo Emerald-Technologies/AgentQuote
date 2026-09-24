@@ -19,7 +19,11 @@ def main() -> int:
         credential = (ManagedIdentityCredential(client_id=client_id)
                   if client_id else ManagedIdentityCredential())
         storage = AzureBlobStorage.from_account_url(os.environ["BOM_STORAGE_ACCOUNT_URL"], credential)
-        result = CandidateAuthoringService(request_id, storage, create_foundry_author()).author()
+        feedback = os.environ.get("AUTHOR_FEEDBACK", "") or None
+        # Only pass the feedback keyword when present so older injected doubles
+        # that do not accept it continue to work unchanged.
+        result = (CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback).author()
+                  if feedback else CandidateAuthoringService(request_id, storage, create_foundry_author()).author())
         print(json.dumps({"status": result.status, "request_id": result.request_id,
                           "candidate_id": result.candidate_id, "manifest_path": result.manifest_path}, sort_keys=True))
         return 0

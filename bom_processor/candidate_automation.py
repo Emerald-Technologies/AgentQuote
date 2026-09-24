@@ -175,3 +175,59 @@ class CandidateAutomationService:
             except Exception:
                 pass
         return result
+
+    MAX_AUTHOR_ATTEMPTS = 3
+
+    def start_author_refinement(self, request_id: str, candidate_id: str,
+                                failure_event: dict[str, Any] | None = None) -> str | None:
+        """Re-trigger authoring with feedback after a validation failure.
+
+        Uses a separate attempt namespace from the initial authoring so the
+        original attempt markers do not suppress refinement starts. Each
+        refinement attempt gets its own claim/started markers.
+
+        Returns "started" if a new authoring job was launched, None otherwise.
+        """
+        if self.author_starter is None:
+            return None
+
+        # Check if a newer candidate already exists (avoid duplicate refinement).
+        root = f"candidates/{request_id}/"
+        for path in self._paths(root):
+            if not path.endswith("/candidate-manifest.json"):
+                continue
+            try:
+                manifest = json.loads(self.storage.download_candidate(path, 1_000_000).decode("utf-8"))
+            except Exception:
+                continue
+            if manifest.get("candidate_id") != candidate_id and manifest.get("version") == AUTHORING_VERSION:
+                return None  # A newer candidate already exists.
+
+        # Count existing refinement attempts (separate namespace from initial authoring).
+        refinement_root = f"candidate-automation/{request_id}/author-refinement/{AUTHORING_VERSION}"
+        existing_attempts = sum(
+            1 for path in self._paths(refinement_root + "/")
+            if path.endswith(".started.json") or path.endswith(".claim.json")
+        )
+        if existing_attempts >= self.MAX_AUTHOR_ATTEMPTS:
+            return None  # Exhausted.
+
+        # Build feedback from the validation-failed event.
+        feedback = ""
+        if failure_event and isinstance(failure_event, dict):
+            error_type = failure_event.get("failure") or failure_event.get("error_code") or "unknown"
+            error_message = failure_event.get("failure_message") or ""
+            feedback = f"Previous parser failed with {error_type}: {error_message}"
+
+        # Trigger re-authoring with feedback.
+        values = {"REQUEST_ID": request_id}
+        if feedback:
+            values["AUTHOR_FEEDBACK"] = feedback
+
+        result = self._run_attempt(
+            prefix=refinement_root, values=values,
+            marker_values={"request_id": request_id, "job": "author_refinement",
+                           "authoring_version": AUTHORING_VERSION,
+                           "refinement_of": candidate_id},
+            starter=self.author_starter)
+        return result

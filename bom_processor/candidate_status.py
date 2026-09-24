@@ -126,4 +126,29 @@ class CandidateStatusService:
                     self.automation.start_validator(request_id, candidate_id)
                 except Exception:
                     result["automation_error"] = "validator_start_failed"
+                # Refinement loop: if validation already failed for this
+                # candidate, re-author with the failure feedback. Attempt
+                # markers inside the automation bound the number of retries.
+                try:
+                    failure_event = self._latest_validation_failure(request_id, candidate_id)
+                    if failure_event is not None:
+                        self.automation.start_author_refinement(request_id, candidate_id, failure_event)
+                except Exception:
+                    result.setdefault("automation_error", "author_refinement_start_failed")
         return result
+
+    def _latest_validation_failure(self, request_id: str, candidate_id: str) -> dict[str, Any] | None:
+        """Return the most recent validation-failed event for a candidate, if any."""
+        event_root = f"candidates/events/{request_id}/{candidate_id}/"
+        try:
+            paths = self.storage.list_candidate_paths(event_root, self.max_results)
+        except Exception:
+            return None
+        failures = [p for p in paths if p.startswith(event_root) and "/validation-failed-" in p and p.endswith(".json")]
+        if not failures:
+            return None
+        failures.sort()
+        try:
+            return _json(self.storage, failures[-1], True)
+        except Exception:
+            return None

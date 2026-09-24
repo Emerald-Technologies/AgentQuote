@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -40,6 +41,21 @@ def redact(value: object) -> str:
         except ValueError:
             return "<url>"
     return str(value)
+
+
+def _failure_classification(exc: BaseException) -> dict[str, str]:
+    """Bounded, non-sensitive failure classification for refinement feedback.
+
+    Returns the exception type name and a truncated, redacted message. Never
+    includes paths, URLs, secrets, or full tracebacks.
+    """
+    message = str(exc)
+    # Redact anything that looks like a path or URL.
+    message = re.sub(r"(?:https?://|[A-Za-z]:[\\/]|\\\\|/(?:tmp|home|Users|var|private)/)[^\s\"<>]*", "<path>", message)
+    return {
+        "error_type": type(exc).__name__,
+        "error_message": message[:200],
+    }
 
 
 class UrllibTransport:
@@ -136,6 +152,7 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         return result, 0
     except Exception as exc:
         result["status"] = "failed"; result["failure"] = "transfer_failed"
+        result["failure_classification"] = _failure_classification(exc)
         if isinstance(exc, RuntimeError) and "already exists" in str(exc):
             result["failure"] = "conflict"
         try:

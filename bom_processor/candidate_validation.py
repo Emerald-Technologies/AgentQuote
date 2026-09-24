@@ -156,12 +156,15 @@ class CandidateValidationService:
             f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}",
             "output.xlsx", "result.json",
         )
+        raw_result = None
         try:
             started = self.orchestrator.start(item)
             raw_result = self._poll(item)
             worker = self._verify_worker_result(raw_result, item)
             output = self.storage.download_candidate(item.output_blob, self.max_output_bytes)
-        except CandidateValidationError:
+        except CandidateValidationError as exc:
+            classification = self._extract_failure_classification(raw_result)
+            self._write_validation_failed_event(validation_id, item, exc.code, classification)
             raise
         except Exception:
             raise CandidateValidationError("WORKER_FAILED") from None
@@ -346,3 +349,46 @@ class CandidateValidationService:
             raise CandidateValidationError("SCHEMA_INVALID")
         return CandidateValidationResult(self.request_id, self.candidate_id, validation_id,
                                          evidence_path, status)
+
+    @staticmethod
+    def _extract_failure_classification(raw_result: bytes | None) -> dict[str, str] | None:
+        """Pull the bounded failure classification from the worker result, if present."""
+        if raw_result is None:
+            return None
+        try:
+            value = json.loads(raw_result.decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(value, dict):
+            return None
+        classification = value.get("failure_classification")
+        if isinstance(classification, dict) and isinstance(classification.get("error_type"), str):
+            return {"error_type": classification["error_type"][:100],
+                    "error_message": str(classification.get("error_message", ""))[:200]}
+        return None
+
+    def _write_validation_failed_event(self, validation_id: str, item: WorkItem,
+                                       error_code: str,
+                                       classification: dict[str, str] | None) -> None:
+        """Persist an immutable validation-failed event for the refinement loop.
+
+        Best effort: a failure to write the event must not mask the original
+        validation error, so all exceptions here are swallowed.
+        """
+        try:
+            event = {
+                "version": VALIDATION_VERSION,
+                "event": "candidate.validation_failed",
+                "request_id": self.request_id,
+                "candidate_id": self.candidate_id,
+                "validation_id": validation_id,
+                "error_code": error_code,
+                "failure": (classification or {}).get("error_type"),
+                "failure_message": (classification or {}).get("error_message"),
+                "worker_job": item.job_id,
+            }
+            path = (f"candidates/events/{self.request_id}/{self.candidate_id}/"
+                    f"validation-failed-{validation_id}.json")
+            self.storage.upload_candidate_immutable(path, _json_bytes(event), "application/json")
+        except Exception:
+            pass

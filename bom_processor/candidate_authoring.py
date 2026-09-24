@@ -154,10 +154,13 @@ def _validate_code(code: str, source_subtype: str = "") -> bytes:
 
 
 class CandidateAuthoringService:
-    def __init__(self, request_id: str, storage: Any, model: ModelAuthor):
+    def __init__(self, request_id: str, storage: Any, model: ModelAuthor,
+                 feedback: str | None = None):
         if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
             raise AuthoringError("INVALID_REQUEST_ID")
         self.request_id, self.storage, self.model = request_id, storage, model
+        # Bounded refinement feedback from a prior validation failure, if any.
+        self.feedback = feedback if isinstance(feedback, str) and feedback.strip() else None
     def author(self) -> AuthoringResult:
         path = f"candidates/requests/{self.request_id}.json"
         try:
@@ -176,6 +179,11 @@ class CandidateAuthoringService:
         rules = CANONICAL_OUTPUT_RULES
         if request["profile"].get("source_subtype") == "html_table_xls":
             rules += HTML_XLS_RULES
+        if self.feedback:
+            # Refinement context: tell the model what the previous attempt got wrong.
+            rules = rules + (f"IMPORTANT REFINEMENT CONTEXT: {self.feedback}. "
+                             "Regenerate the parser to avoid this failure while still "
+                             "satisfying all other rules.",)
         prompt = AuthoringPrompt(tuple(CANONICAL_COLUMNS), rules, request["profile"], analysis)
         source_subtype = request["profile"].get("source_subtype", "")
         try:
