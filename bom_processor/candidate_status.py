@@ -134,11 +134,18 @@ class CandidateStatusService:
                     self.automation.start_validator(request_id, candidate_id)
                 except Exception:
                     result["automation_error"] = "validator_start_failed"
+            if self.automation and status in {"generated_unvalidated", "schema_invalid"}:
                 # Refinement loop: if validation already failed for this
                 # candidate, re-author with the failure feedback. Attempt
                 # markers inside the automation bound the number of retries.
                 try:
                     failure_event = self._latest_validation_failure(request_id, candidate_id)
+                    if failure_event is None and status == "schema_invalid":
+                        # Older validators did not write failure events for
+                        # schema/semantic rejections. Synthesize one so the
+                        # refinement loop can still proceed.
+                        failure_event = {"failure": "SchemaError",
+                                         "failure_message": "canonical_schema_invalid"}
                     if failure_event is not None:
                         self.automation.start_author_refinement(request_id, candidate_id, failure_event)
                 except Exception:

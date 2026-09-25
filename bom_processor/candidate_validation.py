@@ -240,8 +240,15 @@ class CandidateValidationService:
         except BlobConflictError:
             raise CandidateValidationError("VALIDATION_CONFLICT") from None
         if not schema_valid:
+            self._write_validation_failed_event(
+                validation_id, item, "SCHEMA_INVALID",
+                {"error_type": "SchemaError", "error_message": "canonical_schema_invalid"})
             raise CandidateValidationError("SCHEMA_INVALID")
         if not semantic["valid"]:
+            self._write_validation_failed_event(
+                validation_id, item, "SEMANTIC_INVALID",
+                {"error_type": "SemanticError",
+                 "error_message": f"semantic_output_invalid coverage_basis={semantic.get('coverage_basis', 'unknown')}"})
             raise CandidateValidationError("SEMANTIC_INVALID")
         return CandidateValidationResult(self.request_id, self.candidate_id, validation_id,
                                          evidence_path, resulting_status)
