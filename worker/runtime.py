@@ -53,6 +53,23 @@ def _regular(path: Path, root: Path) -> bool:
     return _inside(path, root) and path.is_file() and not path.is_symlink()
 
 
+def _bounded_log_tail(path: Path, limits: Limits, max_chars: int = 500) -> str:
+    """Return a bounded, path-redacted tail of a log file for failure feedback.
+
+    Only the last ``max_chars`` characters are kept so a noisy parser cannot
+    bloat the result. Temp-directory paths are redacted to avoid leaking the
+    worker's filesystem layout.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    text = data[-(max_chars * 4):].decode("utf-8", errors="replace")
+    import re as _re
+    text = _re.sub(r"(?:/[^\s\"'<>]*agentquote[^\s\"'<>]*|[A-Za-z]:[\\/][^\s\"'<>]*)", "<path>", text)
+    return text[-max_chars:].strip()
+
+
 def _preexec(limits: Limits) -> Callable[[], None] | None:
     if os.name != "posix":
         return None
@@ -174,6 +191,7 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                 value = (_result(job, "failed", failure, **base), 3)
                 return (*value, None) if return_output else value
             if proc.returncode != 0:
+                base["stderr_tail"] = _bounded_log_tail(stderr, limits)
                 value = (_result(job, "failed", "parser_exit", exit_code=proc.returncode, **base), 4)
                 return (*value, None) if return_output else value
             if not _regular(output, root) or output.stat().st_size == 0:

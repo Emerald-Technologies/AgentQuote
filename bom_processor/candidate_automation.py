@@ -230,10 +230,14 @@ class CandidateAutomationService:
                 return None  # A newer candidate already exists.
 
         # Count existing refinement attempts (separate namespace from initial authoring).
+        # Count only started markers: each attempt writes both a claim and a
+        # started marker, so counting both would double the budget. A claim
+        # without a started marker represents an in-flight attempt, which
+        # _run_attempt treats as occupied rather than consumed.
         refinement_root = f"candidate-automation/{request_id}/author-refinement/{AUTHORING_VERSION}"
         existing_attempts = sum(
             1 for path in self._paths(refinement_root + "/")
-            if path.endswith(".started.json") or path.endswith(".claim.json")
+            if path.endswith(".started.json")
         )
         if existing_attempts >= self.MAX_AUTHOR_ATTEMPTS:
             return None  # Exhausted.

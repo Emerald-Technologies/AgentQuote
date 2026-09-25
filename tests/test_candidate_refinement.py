@@ -74,9 +74,35 @@ def test_failure_classification_redacts_paths():
 
 
 def test_failure_classification_truncates_long_messages():
-    exc = ValueError("x" * 500)
+    exc = ValueError("x" * 900)
     result = _failure_classification(exc)
-    assert len(result["error_message"]) <= 200
+    assert len(result["error_message"]) <= 500
+
+
+def test_failure_classification_includes_detail():
+    exc = RuntimeError("parser failed")
+    result = _failure_classification(exc, detail="input is a legacy binary Excel file (OLE2/BIFF .xls)")
+    assert "parser failed" in result["error_message"]
+    assert "OLE2/BIFF" in result["error_message"]
+
+
+def test_input_format_hint_detects_ole2_xls():
+    from worker.transfer import _input_format_hint
+    ole2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 100
+    hint = _input_format_hint(ole2, "input.xls")
+    assert "xlrd" in hint
+    assert "openpyxl cannot read it" in hint
+
+
+def test_input_format_hint_detects_xlsx():
+    from worker.transfer import _input_format_hint
+    hint = _input_format_hint(b"PK\x03\x04" + b"\x00" * 100, "input.xlsx")
+    assert "openpyxl" in hint
+
+
+def test_input_format_hint_empty_for_unknown():
+    from worker.transfer import _input_format_hint
+    assert _input_format_hint(b"\x00\x01\x02\x03", "input.csv") == ""
 
 
 # --- Validation-failed event writing ---

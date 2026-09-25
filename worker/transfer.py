@@ -43,19 +43,40 @@ def redact(value: object) -> str:
     return str(value)
 
 
-def _failure_classification(exc: BaseException) -> dict[str, str]:
+def _failure_classification(exc: BaseException, *, detail: str = "") -> dict[str, str]:
     """Bounded, non-sensitive failure classification for refinement feedback.
 
     Returns the exception type name and a truncated, redacted message. Never
-    includes paths, URLs, secrets, or full tracebacks.
+    includes paths, URLs, secrets, or full tracebacks. ``detail`` carries an
+    optional bounded hint (input format, parser stderr tail) that helps the
+    authoring model self-correct.
     """
     message = str(exc)
+    if detail:
+        message = f"{message} | {detail}"
     # Redact anything that looks like a path or URL.
     message = re.sub(r"(?:https?://|[A-Za-z]:[\\/]|\\\\|/(?:tmp|home|Users|var|private)/)[^\s\"<>]*", "<path>", message)
     return {
         "error_type": type(exc).__name__,
-        "error_message": message[:200],
+        "error_message": message[:500],
     }
+
+
+def _input_format_hint(input_bytes: bytes, input_name: str) -> str:
+    """Bounded format hint derived from the input's magic bytes.
+
+    Helps the authoring model pick the right reader (e.g. xlrd for legacy
+    binary .xls files, which openpyxl cannot open).
+    """
+    head = input_bytes[:8]
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return ("input is a legacy binary Excel file (OLE2/BIFF .xls); "
+                "openpyxl cannot read it - use xlrd (open_workbook(file_contents=...)) instead")
+    if head.startswith(b"PK\x03\x04"):
+        return "input is a ZIP-based Office file (.xlsx); use openpyxl"
+    if head.startswith(b"<?xml") or head.lstrip().startswith(b"<"):
+        return "input appears to be XML/HTML text, not a binary spreadsheet"
+    return ""
 
 
 class UrllibTransport:
@@ -136,7 +157,10 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         run_result, code, output = ran
         run_result.pop("logs", None)
         if code != 0 or output is None:
-            raise RuntimeError("parser failed")
+            stderr_tail = str(run_result.get("stderr_tail") or "")
+            format_hint = _input_format_hint(source, input_name)
+            detail = " ".join(part for part in (format_hint, stderr_tail) if part)
+            raise RuntimeError(f"parser failed{(' | ' + detail) if detail else ''}")
         result["output"] = {"sha256": hashlib.sha256(output).hexdigest(), "size": len(output),
                      "content_type": content_type}
         result["parser"] = _evidence(parser, parser_hash, parser_size)

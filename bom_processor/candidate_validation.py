@@ -369,7 +369,7 @@ class CandidateValidationService:
         classification = value.get("failure_classification")
         if isinstance(classification, dict) and isinstance(classification.get("error_type"), str):
             return {"error_type": classification["error_type"][:100],
-                    "error_message": str(classification.get("error_message", ""))[:200]}
+                    "error_message": str(classification.get("error_message", ""))[:500]}
         return None
 
     def _write_validation_failed_event(self, validation_id: str, item: WorkItem,
