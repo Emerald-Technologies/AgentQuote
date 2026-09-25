@@ -192,6 +192,34 @@ def test_start_author_refinement_skips_if_newer_candidate():
     assert len(starter.calls) == 0
 
 
+def test_start_author_refinement_continues_after_superseded_source_exists():
+    """Attempt 2 must not be blocked by the original candidate it refined.
+
+    After attempt 1, both the original (superseded) candidate and the refined
+    candidate exist at the same authoring version. The superseded source must
+    not be treated as a "newer candidate" that blocks a further refinement.
+    """
+    storage = FakeStorage()
+    starter = FakeStarter()
+    automation = CandidateAutomationService(storage, author_starter=starter)
+
+    from bom_processor.candidate_authoring import AUTHORING_VERSION
+    # The original candidate (the source attempt 1 refined) still exists.
+    original = {"candidate_id": "cand-original", "version": AUTHORING_VERSION}
+    storage.candidates["candidates/req-1/cand-original/candidate-manifest.json"] = \
+        json.dumps(original).encode()
+    # A started refinement marker names the original as its source.
+    storage.registry[
+        f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}/attempt-1.started.json"
+    ] = json.dumps({"request_id": "req-1", "job": "author_refinement",
+                    "refinement_of": "cand-original"}).encode()
+
+    result = automation.start_author_refinement("req-1", "cand-refined", None)
+
+    assert result == "started"
+    assert len(starter.calls) == 1
+
+
 # --- Authoring with feedback ---
 
 def test_authoring_injects_feedback_into_rules():

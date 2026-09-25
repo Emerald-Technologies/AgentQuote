@@ -54,6 +54,23 @@ class CandidateAutomationService:
             return self.storage.list_candidate_paths(prefix, 100)
         return self.storage.list_registry_paths(prefix, 100)
 
+    def _refinement_sources(self, request_id: str) -> set[str]:
+        """Candidate ids that started author-refinement markers name as their source."""
+        root = f"candidate-automation/{request_id}/author-refinement/"
+        sources: set[str] = set()
+        try:
+            paths = self._paths(root)
+        except Exception:
+            return sources
+        for path in paths:
+            if not path.endswith(".started.json"):
+                continue
+            marker = self._read_marker(path)
+            source = (marker or {}).get("refinement_of")
+            if isinstance(source, str) and source:
+                sources.add(source)
+        return sources
+
     def _marker_exists(self, path: str) -> bool:
         try:
             self.storage.download_registry(path, 100_000)
@@ -87,10 +104,12 @@ class CandidateAutomationService:
         return "claimed" if self._marker_exists(f"{prefix}/attempt-{attempt}.claim.json") else "vacant"
 
     def _run_attempt(self, *, prefix: str, values: Mapping[str, str], marker_values: Mapping[str, Any],
-                     starter: Any) -> str | None:
+                     starter: Any, treat_started_as_complete: bool = False) -> str | None:
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             state = self._attempt_state(prefix, attempt)
             if state == "started":
+                if treat_started_as_complete:
+                    continue  # Attempt finished; proceed to the next slot.
                 return None
             if state == "failed":
                 continue
@@ -194,6 +213,9 @@ class CandidateAutomationService:
             return None
 
         # Check if a newer candidate already exists (avoid duplicate refinement).
+        # A candidate that a started refinement marker names as its source is
+        # superseded, not newer, so it must not block a further refinement.
+        superseded = self._refinement_sources(request_id)
         root = f"candidates/{request_id}/"
         for path in self._paths(root):
             if not path.endswith("/candidate-manifest.json"):
@@ -202,7 +224,9 @@ class CandidateAutomationService:
                 manifest = json.loads(self.storage.download_candidate(path, 1_000_000).decode("utf-8"))
             except Exception:
                 continue
-            if manifest.get("candidate_id") != candidate_id and manifest.get("version") == AUTHORING_VERSION:
+            other_id = manifest.get("candidate_id")
+            if (other_id != candidate_id and other_id not in superseded
+                    and manifest.get("version") == AUTHORING_VERSION):
                 return None  # A newer candidate already exists.
 
         # Count existing refinement attempts (separate namespace from initial authoring).
@@ -231,5 +255,9 @@ class CandidateAutomationService:
             marker_values={"request_id": request_id, "job": "author_refinement",
                            "authoring_version": AUTHORING_VERSION,
                            "refinement_of": candidate_id},
-            starter=self.author_starter)
+            starter=self.author_starter,
+            # The caller only invokes this after the previous attempt's output
+            # has been validated and failed, so a "started" marker means that
+            # attempt completed and the next slot should be used.
+            treat_started_as_complete=True)
         return result
