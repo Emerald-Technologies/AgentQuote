@@ -46,8 +46,13 @@ class AzureCandidateJobStarter:
 class CandidateAutomationService:
     MAX_ATTEMPTS = 3
 
-    def __init__(self, storage: Any, author_starter: Any = None, validator_starter: Any = None):
+    def __init__(self, storage: Any, author_starter: Any = None, validator_starter: Any = None,
+                 max_author_attempts: int | None = None):
         self.storage, self.author_starter, self.validator_starter = storage, author_starter, validator_starter
+        if max_author_attempts is not None:
+            if type(max_author_attempts) is not int or max_author_attempts < 1:
+                raise ValueError("invalid author attempt limit")
+            self.MAX_AUTHOR_ATTEMPTS = max_author_attempts
 
     def _paths(self, prefix: str) -> list[str]:
         if prefix.startswith("candidates/"):
@@ -104,8 +109,10 @@ class CandidateAutomationService:
         return "claimed" if self._marker_exists(f"{prefix}/attempt-{attempt}.claim.json") else "vacant"
 
     def _run_attempt(self, *, prefix: str, values: Mapping[str, str], marker_values: Mapping[str, Any],
-                     starter: Any, treat_started_as_complete: bool = False) -> str | None:
-        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+                     starter: Any, treat_started_as_complete: bool = False,
+                     max_attempts: int | None = None) -> str | None:
+        limit = max_attempts if max_attempts is not None else self.MAX_ATTEMPTS
+        for attempt in range(1, limit + 1):
             state = self._attempt_state(prefix, attempt)
             if state == "started":
                 if treat_started_as_complete:
@@ -260,6 +267,7 @@ class CandidateAutomationService:
                            "authoring_version": AUTHORING_VERSION,
                            "refinement_of": candidate_id},
             starter=self.author_starter,
+            max_attempts=self.MAX_AUTHOR_ATTEMPTS,
             # The caller only invokes this after the previous attempt's output
             # has been validated and failed, so a "started" marker means that
             # attempt completed and the next slot should be used.

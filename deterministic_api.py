@@ -414,6 +414,10 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
     }
     if any(not value for value in author_environment.values()) or any(not value for value in validator_environment.values()):
         raise RuntimeError("candidate automation environment is not set")
+    max_author_attempts: int | None = None
+    raw_limit = os.environ.get("BOM_CANDIDATE_MAX_AUTHOR_ATTEMPTS", "").strip()
+    if raw_limit:
+        max_author_attempts = int(raw_limit)
     return CandidateAutomationService(
         storage,
         AzureCandidateJobStarter(**common, job_name=os.environ["BOM_CANDIDATE_AUTHOR_JOB_NAME"],
@@ -423,7 +427,8 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
         AzureCandidateJobStarter(**common, job_name=os.environ["BOM_CANDIDATE_VALIDATOR_JOB_NAME"],
                                  container_name=os.environ.get("BOM_CANDIDATE_VALIDATOR_CONTAINER_NAME", "candidate-validator"),
                                  image=os.environ.get("BOM_CANDIDATE_VALIDATOR_IMAGE", ""),
-                                 base_environment=validator_environment, resources=resources))
+                                 base_environment=validator_environment, resources=resources),
+        max_author_attempts=max_author_attempts)
 
 
 def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,

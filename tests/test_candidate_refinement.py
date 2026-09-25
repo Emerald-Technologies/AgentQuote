@@ -246,6 +246,33 @@ def test_start_author_refinement_continues_after_superseded_source_exists():
     assert len(starter.calls) == 1
 
 
+def test_max_author_attempts_is_configurable():
+    """The attempt budget can be raised via the constructor (env-driven)."""
+    storage = FakeStorage()
+    starter = FakeStarter()
+    automation = CandidateAutomationService(storage, author_starter=starter,
+                                            max_author_attempts=6)
+    assert automation.MAX_AUTHOR_ATTEMPTS == 6
+
+    from bom_processor.candidate_authoring import AUTHORING_VERSION
+    root = f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}"
+    # Three started attempts would exhaust the default budget of 3.
+    for attempt in (1, 2, 3):
+        storage.registry[f"{root}/attempt-{attempt}.started.json"] = b"{}"
+
+    result = automation.start_author_refinement("req-1", "cand-1", None)
+
+    assert result == "started"
+    assert len(starter.calls) == 1
+
+
+def test_max_author_attempts_rejects_invalid_limit():
+    with pytest.raises(ValueError):
+        CandidateAutomationService(FakeStorage(), max_author_attempts=0)
+    with pytest.raises(ValueError):
+        CandidateAutomationService(FakeStorage(), max_author_attempts=2.5)
+
+
 # --- Authoring with feedback ---
 
 def test_authoring_injects_feedback_into_rules():
