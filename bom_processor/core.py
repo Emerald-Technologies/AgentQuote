@@ -633,6 +633,14 @@ def _validate_xlsx(path: Path, max_rows: int) -> None:
                 if column in required_strings:
                     raise ProcessingError("required value invalid")
                 continue
+            # Identifier-like columns may legitimately hold numeric cells
+            # (e.g. an item number 500009 stored as an int by the source
+            # workbook). Coerce numbers to their canonical string form;
+            # bools are never valid cell values here.
+            if isinstance(value, bool):
+                raise ProcessingError("string value invalid")
+            if isinstance(value, (int, float)):
+                value = str(int(value)) if float(value).is_integer() else str(value)
             if not isinstance(value, str) or not value or value != value.strip():
                 raise ProcessingError("string value invalid")
     if not frame["item_category"].isin(["Part", "Document"]).all():
