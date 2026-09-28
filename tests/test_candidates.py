@@ -56,3 +56,29 @@ def test_candidate_required_api_response_is_bounded_and_safe():
         "request_id": "f" * 64, "parser_key": "Customer1", "profile_hash": "e" * 64,
     }}
     assert "blob" not in json.dumps(response).lower()
+
+
+def test_candidate_required_response_surfaces_author_attempt_exhaustion():
+    candidate = CandidateRequiredError("f" * 64, "Customer1", "e" * 64)
+
+    class Processor:
+        def process(self, request):
+            raise candidate
+
+    class Automation:
+        def start_author(self, request_id):
+            assert request_id == "f" * 64
+            return "exhausted"
+
+    config = ApiConfig("127.0.0.1", 0, "local_disabled", frozenset(), frozenset(), 4096, 1, {})
+    api = ProcessingApi(config, Processor, automation_factory=Automation)
+    body = json.dumps({
+        "job_id": "job1", "customer_key": "customer-key", "parser_key": "Customer1",
+        "rfq_uuid": "12345678-1234-4234-8234-123456789012", "package_version": "1",
+        "documents": [{"document_id": "doc1", "blob_path": "customer-key/rfq-12345678-1234-4234-8234-123456789012/package-1/original-boms/doc1.csv", "size_bytes": 1, "sha256": "a" * 64}],
+    }).encode()
+
+    status, response = api.handle(Message(), body)
+
+    assert status == 202
+    assert response["automation_error"] == "author_attempts_exhausted"

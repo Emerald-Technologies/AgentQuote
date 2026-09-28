@@ -186,7 +186,8 @@ class ProcessingApi:
                 "profile_hash": exc.profile_hash}}
             if self.automation_factory:
                 try:
-                    self.automation_factory().start_author(exc.request_id)
+                    if self.automation_factory().start_author(exc.request_id) == "exhausted":
+                        payload["automation_error"] = "author_attempts_exhausted"
                 except Exception:
                     payload["automation_error"] = "author_start_failed"
             return 202, payload

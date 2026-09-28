@@ -78,7 +78,8 @@ def test_authoring_restarts_when_only_old_policy_candidate_and_marker_exist():
     result = CandidateAutomationService(storage, author_starter=starter).start_author(REQUEST_ID)
 
     assert result == "started"
-    assert starter.values == [{"REQUEST_ID": REQUEST_ID}]
+    assert starter.values == [{"REQUEST_ID": REQUEST_ID, "AUTHOR_ATTEMPT": "1",
+                               "AUTHOR_ATTEMPT_KIND": "author"}]
     marker = json.loads(storage.registry[
         f"candidate-automation/{REQUEST_ID}/author-started-{AUTHORING_VERSION}.json"])
     assert marker["authoring_version"] == AUTHORING_VERSION
@@ -122,6 +123,25 @@ def test_existing_claim_suppresses_concurrent_duplicate_start():
     assert CandidateAutomationService(storage, author_starter=Starter()).start_author(REQUEST_ID) is None
 
 
+def test_failed_terminal_marker_overrides_started_and_advances_attempt():
+    storage = InMemoryStorage()
+    prefix = f"candidate-automation/{REQUEST_ID}/author/{AUTHORING_VERSION}"
+    for state in ("claim", "started", "failed"):
+        put(storage, f"{prefix}/attempt-1.{state}.json", {"attempt": 1}, registry=True)
+
+    class Starter:
+        def __init__(self): self.values = []
+        def start(self, values):
+            self.values.append(dict(values))
+            return "execution-2"
+
+    starter = Starter()
+    assert CandidateAutomationService(storage, author_starter=starter).start_author(REQUEST_ID) == "started"
+    assert starter.values == [{"REQUEST_ID": REQUEST_ID, "AUTHOR_ATTEMPT": "2",
+                               "AUTHOR_ATTEMPT_KIND": "author"}]
+    assert f"{prefix}/attempt-2.started.json" in storage.registry
+
+
 def test_started_attempt_and_attempt_limit_suppress_additional_starts():
     storage = InMemoryStorage()
     prefix = f"candidate-automation/{REQUEST_ID}/author/{AUTHORING_VERSION}"
@@ -133,4 +153,4 @@ def test_started_attempt_and_attempt_limit_suppress_additional_starts():
         def start(self, values):
             raise AssertionError("attempt limit must suppress another start")
 
-    assert CandidateAutomationService(storage, author_starter=Starter()).start_author(REQUEST_ID) is None
+    assert CandidateAutomationService(storage, author_starter=Starter()).start_author(REQUEST_ID) == "exhausted"

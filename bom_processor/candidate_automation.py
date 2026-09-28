@@ -103,22 +103,22 @@ class CandidateAutomationService:
             return False
 
     def _attempt_state(self, prefix: str, attempt: int) -> str:
-        for state in ("started", "failed"):
+        # Terminal evidence must win over the earlier started marker. Both are
+        # immutable, so a completed or failed job necessarily retains started.
+        for state in ("completed", "failed", "started"):
             if self._marker_exists(f"{prefix}/attempt-{attempt}.{state}.json"):
                 return state
         return "claimed" if self._marker_exists(f"{prefix}/attempt-{attempt}.claim.json") else "vacant"
 
     def _run_attempt(self, *, prefix: str, values: Mapping[str, str], marker_values: Mapping[str, Any],
-                     starter: Any, treat_started_as_complete: bool = False,
-                     max_attempts: int | None = None) -> str | None:
+                     starter: Any, max_attempts: int | None = None,
+                     author_attempt_kind: str | None = None) -> str | None:
         limit = max_attempts if max_attempts is not None else self.MAX_ATTEMPTS
         for attempt in range(1, limit + 1):
             state = self._attempt_state(prefix, attempt)
             if state == "started":
-                if treat_started_as_complete:
-                    continue  # Attempt finished; proceed to the next slot.
                 return None
-            if state == "failed":
+            if state in {"failed", "completed"}:
                 continue
             if state == "claimed":
                 # An unpaired claim is deliberately treated as in-flight.  Do not
@@ -130,7 +130,13 @@ class CandidateAutomationService:
                     continue
                 return None
             try:
-                execution_name = starter.start(values)
+                start_values = dict(values)
+                if author_attempt_kind:
+                    start_values.update({
+                        "AUTHOR_ATTEMPT": str(attempt),
+                        "AUTHOR_ATTEMPT_KIND": author_attempt_kind,
+                    })
+                execution_name = starter.start(start_values)
             except Exception as exc:
                 # Persist only a bounded, non-sensitive failure classification.
                 try:
@@ -146,7 +152,7 @@ class CandidateAutomationService:
             }
             self._write_marker(f"{prefix}/attempt-{attempt}.started.json", started)
             return "started"
-        return None
+        return "exhausted"
 
     def start_author(self, request_id: str) -> str | None:
         if self.author_starter is None:
@@ -170,7 +176,7 @@ class CandidateAutomationService:
         result = self._run_attempt(
             prefix=root, values={"REQUEST_ID": request_id},
             marker_values={"request_id": request_id, "job": "author", "authoring_version": AUTHORING_VERSION},
-            starter=self.author_starter)
+            starter=self.author_starter, author_attempt_kind="author")
         if result == "started":
             # Retain the old marker shape for readers deployed before attempt records.
             try:
@@ -268,8 +274,7 @@ class CandidateAutomationService:
                            "refinement_of": candidate_id},
             starter=self.author_starter,
             max_attempts=self.MAX_AUTHOR_ATTEMPTS,
-            # The caller only invokes this after the previous attempt's output
-            # has been validated and failed, so a "started" marker means that
-            # attempt completed and the next slot should be used.
-            treat_started_as_complete=True)
+            # The author job writes terminal evidence. A started marker alone
+            # remains in flight and must not fan out concurrent refinements.
+            author_attempt_kind="author-refinement")
         return result

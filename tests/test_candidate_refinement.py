@@ -181,6 +181,8 @@ def test_start_author_refinement_triggers():
     assert result == "started"
     assert len(starter.calls) == 1
     assert starter.calls[0]["REQUEST_ID"] == "req-1"
+    assert starter.calls[0]["AUTHOR_ATTEMPT"] == "1"
+    assert starter.calls[0]["AUTHOR_ATTEMPT_KIND"] == "author-refinement"
     assert "AUTHOR_FEEDBACK" in starter.calls[0]
     assert "KeyError" in starter.calls[0]["AUTHOR_FEEDBACK"]
 
@@ -191,14 +193,14 @@ def test_start_author_refinement_respects_max_attempts():
     automation = CandidateAutomationService(storage, author_starter=starter)
     automation.MAX_AUTHOR_ATTEMPTS = 2
 
-    # Simulate 2 existing attempts.
+    # Simulate 2 terminal attempts.
     from bom_processor.candidate_authoring import AUTHORING_VERSION
     root = f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}"
-    storage.registry[f"{root}/attempt-1.started.json"] = b"{}"
-    storage.registry[f"{root}/attempt-2.started.json"] = b"{}"
+    storage.registry[f"{root}/attempt-1.failed.json"] = b"{}"
+    storage.registry[f"{root}/attempt-2.failed.json"] = b"{}"
 
     result = automation.start_author_refinement("req-1", "cand-1", None)
-    assert result is None
+    assert result == "exhausted"
     assert len(starter.calls) == 0
 
 
@@ -239,6 +241,10 @@ def test_start_author_refinement_continues_after_superseded_source_exists():
         f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}/attempt-1.started.json"
     ] = json.dumps({"request_id": "req-1", "job": "author_refinement",
                     "refinement_of": "cand-original"}).encode()
+    storage.registry[
+        f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}/attempt-1.completed.json"
+    ] = json.dumps({"request_id": "req-1", "job": "author_refinement",
+                    "refinement_of": "cand-original"}).encode()
 
     result = automation.start_author_refinement("req-1", "cand-refined", None)
 
@@ -256,14 +262,50 @@ def test_max_author_attempts_is_configurable():
 
     from bom_processor.candidate_authoring import AUTHORING_VERSION
     root = f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}"
-    # Three started attempts would exhaust the default budget of 3.
+    # Three completed attempts would exhaust the default budget of 3.
     for attempt in (1, 2, 3):
-        storage.registry[f"{root}/attempt-{attempt}.started.json"] = b"{}"
+        storage.registry[f"{root}/attempt-{attempt}.completed.json"] = b"{}"
 
     result = automation.start_author_refinement("req-1", "cand-1", None)
 
     assert result == "started"
     assert len(starter.calls) == 1
+    assert starter.calls[0]["AUTHOR_ATTEMPT"] == "4"
+
+
+def test_started_refinement_does_not_fan_out_before_terminal_marker():
+    storage = FakeStorage()
+    starter = FakeStarter()
+    automation = CandidateAutomationService(storage, author_starter=starter)
+    from bom_processor.candidate_authoring import AUTHORING_VERSION
+    root = f"candidate-automation/req-1/author-refinement/{AUTHORING_VERSION}"
+    storage.registry[f"{root}/attempt-1.started.json"] = json.dumps({
+        "request_id": "req-1", "job": "author_refinement", "refinement_of": "cand-1",
+    }).encode()
+
+    assert automation.start_author_refinement("req-1", "cand-1", None) is None
+    assert starter.calls == []
+
+
+def test_requested_status_retries_author_and_surfaces_exhaustion():
+    from bom_processor.candidate_status import CandidateStatusService
+
+    storage = FakeStorage()
+    storage.registry["candidates/requests/req-1.json"] = json.dumps(
+        _status_request("req-1", "a" * 64)).encode()
+
+    class Automation:
+        def __init__(self): self.calls = []
+        def start_author(self, request_id):
+            self.calls.append(request_id)
+            return "exhausted"
+
+    automation = Automation()
+    result = CandidateStatusService(storage, automation=automation).get("req-1")
+
+    assert automation.calls == ["req-1"]
+    assert result["status"] == "requested"
+    assert result["automation_error"] == "author_attempts_exhausted"
 
 
 def test_max_author_attempts_rejects_invalid_limit():

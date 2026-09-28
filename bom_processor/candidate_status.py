@@ -121,6 +121,12 @@ class CandidateStatusService:
             selected = (candidate_id, status, validation_id, manifest, decision)
         result = {"request_id": request_id, "parser_key": request["parser_key"], "customer_key": request["customer_key"],
                   "status": status, "profile_hash": request["profile_hash"], "source_document_count": len(source)}
+        if self.automation and not selected and status == "requested":
+            try:
+                if self.automation.start_author(request_id) == "exhausted":
+                    result["automation_error"] = "author_attempts_exhausted"
+            except Exception:
+                result["automation_error"] = "author_start_failed"
         if selected:
             candidate_id, _, validation_id, manifest, decision = selected
             result["candidate_id"] = candidate_id
