@@ -144,8 +144,12 @@ class CandidateStatusService:
             if decision:
                 for key in ("decision_id", "variant_id"):
                     if isinstance(decision.get(key), str): result[key] = decision[key]
-                if isinstance(decision.get("version"), str):
-                    result["variant_version"] = decision["version"]
+                variant_version = decision.get("variant_version")
+                legacy_version = decision.get("version")
+                if isinstance(variant_version, str):
+                    result["variant_version"] = variant_version
+                elif isinstance(legacy_version, str) and not legacy_version.startswith("admin-decision."):
+                    result["variant_version"] = legacy_version
             if self.automation and status == "generated_unvalidated":
                 try:
                     self.automation.start_validator(request_id, candidate_id)
