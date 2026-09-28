@@ -49,6 +49,7 @@ def test_status_selects_new_v3_candidate_instead_of_contained_v2_approval():
     put(storage, f"candidates/decisions/{REQUEST_ID}/{old}/validation-1.json", {
         "request_id": REQUEST_ID, "candidate_id": old, "decision": "approve",
         "validation_id": "validation-1", "decision_id": "decision-1",
+        "variant_id": "old-variant", "version": "1",
     }, registry=True)
 
     result = CandidateStatusService(storage).get(REQUEST_ID)
@@ -56,6 +57,25 @@ def test_status_selects_new_v3_candidate_instead_of_contained_v2_approval():
     assert result["candidate_id"] == new
     assert result["status"] == "generated_unvalidated"
     assert "decision_id" not in result
+
+
+def test_approved_status_projects_explicit_variant_version():
+    storage = InMemoryStorage()
+    put(storage, f"candidates/requests/{REQUEST_ID}.json", request(), registry=True)
+    candidate_id = "candidate-v3"
+    put(storage, f"candidates/{REQUEST_ID}/{candidate_id}/candidate-manifest.json",
+        manifest(candidate_id, "candidate-authoring.v3"))
+    put(storage, f"candidates/decisions/{REQUEST_ID}/{candidate_id}/validation-1.json", {
+        "request_id": REQUEST_ID, "candidate_id": candidate_id, "decision": "approve",
+        "validation_id": "validation-1", "decision_id": "decision-1",
+        "variant_id": "variant-1", "version": "1",
+    }, registry=True)
+
+    result = CandidateStatusService(storage).get(REQUEST_ID)
+
+    assert result["variant_id"] == "variant-1"
+    assert result["variant_version"] == "1"
+    assert "version" not in result
 
 
 def test_authoring_restarts_when_only_old_policy_candidate_and_marker_exist():

@@ -142,8 +142,10 @@ class CandidateStatusService:
                 except ProcessingError:
                     result["review_error"] = "review_unavailable"
             if decision:
-                for key in ("decision_id", "variant_id", "version"):
+                for key in ("decision_id", "variant_id"):
                     if isinstance(decision.get(key), str): result[key] = decision[key]
+                if isinstance(decision.get("version"), str):
+                    result["variant_version"] = decision["version"]
             if self.automation and status == "generated_unvalidated":
                 try:
                     self.automation.start_validator(request_id, candidate_id)
