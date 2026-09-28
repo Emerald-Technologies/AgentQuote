@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from .core import ProcessingError
+from .candidate_review import CandidateReviewError, CandidateReviewService
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _HASH = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -132,6 +133,14 @@ class CandidateStatusService:
             result["candidate_id"] = candidate_id
             if validation_id: result["validation_id"] = validation_id
             if isinstance(manifest.get("code_sha256"), str) and _HASH.fullmatch(manifest["code_sha256"]): result["code_hash"] = manifest["code_sha256"]
+            if status in {"awaiting_approval", "approved"} and isinstance(validation_id, str):
+                try:
+                    result["review"] = CandidateReviewService(self.storage).get(
+                        request_id, candidate_id, validation_id)[0]
+                except CandidateReviewError as exc:
+                    result["review_error"] = str(exc).lower()
+                except ProcessingError:
+                    result["review_error"] = "review_unavailable"
             if decision:
                 for key in ("decision_id", "variant_id", "version"):
                     if isinstance(decision.get(key), str): result[key] = decision[key]

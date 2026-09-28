@@ -14,6 +14,7 @@ import binascii
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ from bom_processor import (
     CandidateStatusService,
     CandidateAutomationService,
     AzureCandidateJobStarter,
+    CandidateReviewError,
+    CandidateReviewService,
 )
 from bom_processor.core import CONTRACT_VERSION
 from bom_processor.master_registry import RegistryError
@@ -45,6 +48,10 @@ log = logging.getLogger("agentquote.deterministic_api")
 ROUTE = "/api/v1/bom/process"
 DECISION_ROUTE = "/api/v1/parser-candidates/decision"
 STATUS_ROUTE_PREFIX = "/api/v1/parser-candidates/requests/"
+REVIEW_OUTPUT_ROUTE = re.compile(
+    r"^/api/v1/parser-candidates/requests/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/"
+    r"candidates/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/validations/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/output$")
 
 
 @dataclass(frozen=True)
@@ -236,10 +243,13 @@ class DecisionApi:
             return 422, _error("invalid_request", "Decision request is invalid.", request_id)
         try:
             result = self.service_factory().decide(**request)
-            return 200, {"decision_id": result["decision_id"],
+            response = {"decision_id": result["decision_id"],
                          "status": result["decision"],
                          "candidate_id": result["candidate_id"],
                          "validation_id": result["validation_id"]}
+            if isinstance(result.get("parser"), dict):
+                response["parser"] = result["parser"]
+            return 200, response
         except RegistryError as exc:
             code = str(exc)
             status = 409 if code in {"DECISION_CONFLICT", "REGISTRY_CONFLICT"} else 422
@@ -277,6 +287,29 @@ class CandidateStatusApi:
             return 500, _error("internal_error", "An internal error occurred.", response_id)
 
 
+class CandidateReviewOutputApi:
+    def __init__(self, config: ApiConfig,
+                 service_factory: Callable[[], CandidateReviewService]) -> None:
+        self.config, self.service_factory = config, service_factory
+
+    def handle(self, headers: Any, request_id: str, candidate_id: str,
+               validation_id: str) -> tuple[int, bytes | dict[str, Any]]:
+        response_id = uuid.uuid4().hex
+        try:
+            authorize(headers, self.config)
+            return 200, self.service_factory().get(request_id, candidate_id, validation_id)[1]
+        except PermissionError:
+            return 401, _error("unauthenticated", "Authentication is required.", response_id)
+        except LookupError:
+            return 403, _error("forbidden", "Caller is not authorized.", response_id)
+        except (CandidateReviewError, BlobNotFoundError):
+            return 409, _error("review_unavailable", "Parsed BOM review is unavailable.", response_id)
+        except Exception as exc:
+            log.error("Unexpected review output failure; request_id=%s exception_type=%s",
+                      response_id, type(exc).__name__)
+            return 500, _error("internal_error", "An internal error occurred.", response_id)
+
+
 def _decision_request(value: Any) -> dict[str, Any]:
     """Bind both deployed camelCase and service snake_case names, strictly."""
     if not isinstance(value, dict):
@@ -293,9 +326,13 @@ def _decision_request(value: Any) -> dict[str, Any]:
     if any(key not in aliases for key in value) or len({aliases[key] for key in value}) != len(value):
         raise ValueError("unknown or duplicate field")
     bound = {aliases[key]: item for key, item in value.items()}
-    required = {"request_id", "candidate_id", "validation_id", "decision", "reason", "ticket", "actor_id"}
+    required = {"request_id", "candidate_id", "validation_id", "decision", "actor_id"}
     if not required.issubset(bound) or not all(isinstance(bound[key], str) for key in required):
         raise ValueError("required field missing")
+    if any(key in bound and not isinstance(bound[key], str) for key in ("reason", "ticket")):
+        raise ValueError("invalid audit field")
+    bound.setdefault("reason", "")
+    bound.setdefault("ticket", "")
     if bound["decision"] not in {"approve", "reject"}:
         raise ValueError("invalid decision")
     if bound["decision"] == "approve":
@@ -433,7 +470,8 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
 
 
 def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
-                 status_api: CandidateStatusApi | None = None) -> type[BaseHTTPRequestHandler]:
+                 status_api: CandidateStatusApi | None = None,
+                 review_output_api: CandidateReviewOutputApi | None = None) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "AgentQuoteDeterministicAPI/1"
 
@@ -464,6 +502,17 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self._write(status, payload)
 
         def do_GET(self) -> None:  # noqa: N802
+            review_match = REVIEW_OUTPUT_ROUTE.fullmatch(self.path)
+            if review_match:
+                if review_output_api is None:
+                    self._write(404, _error("not_found", "Route was not found.", uuid.uuid4().hex))
+                    return
+                response_status, payload = review_output_api.handle(self.headers, *review_match.groups())
+                if isinstance(payload, bytes):
+                    self._write_binary(response_status, payload)
+                else:
+                    self._write(response_status, payload)
+                return
             if self.path.startswith(STATUS_ROUTE_PREFIX):
                 request_id = self.path[len(STATUS_ROUTE_PREFIX):]
                 if status_api is None or not request_id or "/" in request_id or "?" in request_id:
@@ -490,6 +539,16 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self.end_headers()
             self.wfile.write(data)
 
+        def _write_binary(self, status: int, data: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", 'attachment; filename="parsed-bom.xlsx"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+
     return Handler
 
 
@@ -506,7 +565,10 @@ def main() -> None:
             (storage := _storage_factory()),
             automation=(_candidate_automation_factory(config, storage)
                         if config.candidate_automation_enabled else None)))
-    server = ThreadingHTTPServer((config.host, config.port), make_handler(api, decision_api, status_api))
+    review_output_api = CandidateReviewOutputApi(
+        config, lambda: CandidateReviewService(_storage_factory()))
+    server = ThreadingHTTPServer(
+        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api))
     log.info("Deterministic BOM API listening on port %d", config.port)
     server.serve_forever()
 

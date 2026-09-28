@@ -29,6 +29,7 @@ from .candidate_validation import (CandidateValidationError, CandidateValidation
 from .admin_promotion import AdminDecisionService
 from .candidate_status import CandidateStatusError, CandidateStatusService
 from .candidate_automation import CandidateAutomationService, AzureCandidateJobStarter
+from .candidate_review import CandidateReviewError, CandidateReviewService
 
 __all__ = [
     "AzureBlobStorage",
@@ -60,4 +61,5 @@ __all__ = [
     "AdminDecisionService",
     "CandidateStatusError", "CandidateStatusService",
     "CandidateAutomationService", "AzureCandidateJobStarter",
+    "CandidateReviewError", "CandidateReviewService",
 ]

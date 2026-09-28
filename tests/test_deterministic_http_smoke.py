@@ -76,3 +76,27 @@ def test_loopback_invalid_json_returns_400(server_url):
         urlopen(request, timeout=2)
     assert failure.value.code == 400
     assert json.load(failure.value)["error"]["code"] == "invalid_json"
+
+
+def test_review_output_route_returns_bound_xlsx():
+    config = ApiConfig(
+        host="127.0.0.1", port=0, auth_mode="local_disabled",
+        allowed_app_ids=frozenset(), allowed_object_ids=frozenset(),
+        max_body_bytes=4096, max_concurrent_jobs=1, processor_options={},
+    )
+    class ReviewApi:
+        def handle(self, _headers, request_id, candidate_id, validation_id):
+            assert (request_id, candidate_id, validation_id) == ("request-1", "candidate-1", "validation-1")
+            return 200, b"xlsx-bytes"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
+        ProcessingApi(config, Processor), review_output_api=ReviewApi()))
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        url = (f"http://127.0.0.1:{server.server_address[1]}/api/v1/parser-candidates/requests/"
+               "request-1/candidates/candidate-1/validations/validation-1/output")
+        with urlopen(url, timeout=2) as response:
+            assert response.read() == b"xlsx-bytes"
+            assert response.headers.get_content_type() == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            assert response.headers["Content-Disposition"] == 'attachment; filename="parsed-bom.xlsx"'
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)

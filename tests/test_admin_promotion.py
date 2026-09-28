@@ -88,8 +88,11 @@ def test_rejection_is_immutable_and_never_promotes():
 
 def test_approval_publishes_exact_code_and_blob_reader_selects_it():
     storage, service, common = prepared()
-    result = service.decide(decision="approve", variant_id="mystery-csv", version="1", **common)
+    result = service.decide(decision="approve", variant_id="mystery-csv", version="1",
+                            **{**common, "reason": "", "ticket": ""})
     assert result["decision"] == "approve"
+    assert result["parser"]["approval_id"] == result["decision_id"]
+    assert result["parser"]["registry_generation"] == 1
     base = "approved/Customer1/mystery-csv/1"
     candidate_code = storage.candidates[
         f"candidates/{common['request_id']}/{common['candidate_id']}/parse.py"]

@@ -51,9 +51,9 @@ class AdminDecisionService:
                    for x in (request_id, candidate_id, validation_id)):
             raise RegistryError("INVALID_DECISION_ID")
         if (decision not in {"approve", "reject"} or not isinstance(reason, str)
-            or not reason.strip() or len(reason) > MAX_REASON_CHARS
-            or not isinstance(ticket, str) or not ticket.strip()
-            or len(ticket) > MAX_TICKET_CHARS):
+            or len(reason) > MAX_REASON_CHARS or not isinstance(ticket, str)
+            or len(ticket) > MAX_TICKET_CHARS
+            or (decision == "reject" and (not reason.strip() or not ticket.strip()))):
             raise RegistryError("INVALID_DECISION")
         if not isinstance(approver, dict) or not isinstance(approver.get("object_id"), str) or not approver["object_id"].strip():
             raise RegistryError("INVALID_APPROVER")
@@ -125,14 +125,18 @@ class AdminDecisionService:
         for path, data in ((f"{prefix}/parse.py", code), (f"{prefix}/signature.json", _json_bytes(signature.to_dict())), (f"{prefix}/approval.json", _json_bytes(approval.to_dict()))):
             self.storage.upload_registry_immutable(path, data, "text/x-python" if path.endswith(".py") else "application/json")
         variant = ApprovedVariant(parser_key, variant_id, version, f"{prefix}/parse.py", _sha(code), signature.signature_hash, signature.rule_hash, approval_id)
-        self._publish(parser_key, variant, signature, record)
-        return record
+        generation = self._publish(parser_key, variant, signature, record)
+        return {**record, "parser": {"key": parser_key, "blob_path": variant.code_path,
+                "sha256": variant.code_sha256, "approval_id": approval_id,
+                "registry_generation": generation, "rule_hash": signature.rule_hash,
+                "signature_hash": signature.signature_hash, "selection_mode": "registry",
+                "variant_id": variant.variant_id, "version": variant.version}}
 
     @staticmethod
     def _signature(request: dict[str, Any]) -> VariantSignature:
         return VariantSignature.from_profile(request.get("profile", {}))
 
-    def _publish(self, parser_key: str, variant: ApprovedVariant, signature: VariantSignature, record: dict[str, Any]) -> None:
+    def _publish(self, parser_key: str, variant: ApprovedVariant, signature: VariantSignature, record: dict[str, Any]) -> int:
         path = f"registry/{parser_key}/master.json"
         for _ in range(self.max_retries):
             try:
@@ -146,7 +150,7 @@ class AdminDecisionService:
                         "approval_path": f"approved/{parser_key}/{variant.variant_id}/{variant.version}/approval.json"}
             if any(item.get("variant_id") == variant.variant_id and item.get("version") == variant.version for item in variants):
                 if next(item for item in variants if item.get("variant_id") == variant.variant_id and item.get("version") == variant.version) != expected: raise RegistryError("REGISTRY_CONFLICT")
-                return
+                return int(master["generation"])
             variants.append(expected)
             master = {"schema":"master-registry.v1", "parser_key":parser_key, "generation":master["generation"] + 1, "variants":variants}
             master_bytes = _json_bytes(master)
@@ -162,7 +166,9 @@ class AdminDecisionService:
             self.storage.upload_registry_immutable(
                 f"registry/{parser_key}/events/{record['decision_id']}-{master['generation']}.json",
                 _json_bytes(promotion_event), "application/json")
-            try: self.storage.upload_registry_if_match(path, master_bytes, "application/json", etag); return
+            try:
+                self.storage.upload_registry_if_match(path, master_bytes, "application/json", etag)
+                return int(master["generation"])
             except BlobConflictError: continue
             except Exception:
                 # A transient storage failure must not leave the registry pointer
