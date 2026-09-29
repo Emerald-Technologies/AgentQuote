@@ -15,6 +15,10 @@ class ResourceExistsError(Exception):
     pass
 
 
+class ResourceModifiedError(Exception):
+    pass
+
+
 class HttpResponseError(Exception):
     pass
 
@@ -24,13 +28,19 @@ class ContentSettings:
         self.content_type = content_type
 
 
+class MatchConditions:
+    IfNotModified = "if-not-modified"
+
+
 @pytest.fixture(autouse=True)
 def fake_azure_modules(monkeypatch):
     azure = ModuleType("azure")
     core = ModuleType("azure.core")
+    core.MatchConditions = MatchConditions
     exceptions = ModuleType("azure.core.exceptions")
     exceptions.ResourceNotFoundError = ResourceNotFoundError
     exceptions.ResourceExistsError = ResourceExistsError
+    exceptions.ResourceModifiedError = ResourceModifiedError
     exceptions.HttpResponseError = HttpResponseError
     storage = ModuleType("azure.storage")
     blob = ModuleType("azure.storage.blob")
@@ -192,3 +202,19 @@ def test_registry_create_conflict_is_preserved_from_immutable_upload():
 
     with pytest.raises(BlobConflictError, match="immutable registry conflict"):
         configured_storage(client).upload_registry_if_match("registry/customer/master.json", b"data", "application/json", None)
+
+
+def test_registry_update_uses_match_conditions_from_azure_core():
+    client = blob_client(b"old")
+    client.get_blob_properties.return_value.etag = "etag-new"
+    storage = configured_storage(client)
+
+    assert storage.upload_registry_if_match(
+        "registry/customer/master.json", b"new", "application/json", "etag-old"
+    ) == "etag-new"
+    assert client.upload_blob.call_args.args == (b"new",)
+    kwargs = client.upload_blob.call_args.kwargs
+    assert kwargs["overwrite"] is True
+    assert kwargs["etag"] == "etag-old"
+    assert kwargs["match_condition"] == MatchConditions.IfNotModified
+    assert isinstance(kwargs["content_settings"], ContentSettings)

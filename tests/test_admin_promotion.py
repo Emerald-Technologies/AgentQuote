@@ -246,9 +246,11 @@ def test_azure_registry_create_uses_supported_create_only_kwargs_and_maps_confli
     exceptions.ResourceModifiedError = ResourceModifiedError
     exceptions.ResourceNotFoundError = ResourceNotFoundError
     exceptions.HttpResponseError = HttpResponseError
+    core = types.ModuleType("azure.core")
+    core.MatchConditions = MatchConditions
     blob = types.ModuleType("azure.storage.blob")
     blob.ContentSettings = ContentSettings
-    blob.MatchConditions = MatchConditions
+    monkeypatch.setitem(sys.modules, "azure.core", core)
     monkeypatch.setitem(sys.modules, "azure.core.exceptions", exceptions)
     monkeypatch.setitem(sys.modules, "azure.storage.blob", blob)
 

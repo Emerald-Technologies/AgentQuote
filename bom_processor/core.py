@@ -262,8 +262,9 @@ class AzureBlobStorage:
                 return client.get_blob_properties().etag
             except Exception as exc:
                 raise ProcessingError("registry properties failed") from exc
+        from azure.core import MatchConditions
         from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
-        from azure.storage.blob import ContentSettings, MatchConditions
+        from azure.storage.blob import ContentSettings
         try:
             kwargs = {"content_settings": ContentSettings(content_type=content_type)}
             kwargs.update(overwrite=True, etag=etag, match_condition=MatchConditions.IfNotModified)
