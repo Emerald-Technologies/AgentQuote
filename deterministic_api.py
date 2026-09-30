@@ -34,6 +34,7 @@ from bom_processor import (
     JobOrchestrator,
     BlobRegistryReader,
     CandidateRequiredError,
+    AggregateCandidateRequiredError,
     AdminDecisionService,
     CandidateStatusService,
     CandidateAutomationService,
@@ -198,6 +199,13 @@ class ProcessingApi:
                 except Exception:
                     payload["automation_error"] = "author_start_failed"
             return 202, payload
+        except AggregateCandidateRequiredError as exc:
+            groups = [{"request_id": item.request_id, "parser_key": item.parser_key,
+                       "profile_hash": item.profile_hash,
+                       "document_ids": list(item.document_ids), "state": item.state}
+                      for item in exc.candidates]
+            return 202, {"version": CONTRACT_VERSION, "status": "candidates_required",
+                         "candidates": groups}
         except ProcessingError as exc:
             if str(exc).startswith("registry:PARSER_FORMAT_NOT_RECOGNIZED"):
                 return 422, _error("parser_format_not_recognized", "No approved parser matches the BOM.", request_id)

@@ -24,16 +24,16 @@ def test_candidate_request_id_is_deterministic_and_replay_safe():
     assert "part" in json.dumps(raw["profile"])
 
 
-def test_equivalent_format_reuses_request_despite_different_source_evidence():
+def test_different_source_evidence_gets_distinct_request_without_stale_reuse():
     storage = InMemoryStorage()
     profile = profile_bytes(b"part,qty\nP1,2\n", ".csv")
     first = persist_candidate(storage, "Customer1", "customer-key", profile,
                               ({"document_id": "one"},))
     second = persist_candidate(storage, "Customer1", "customer-key", profile,
                                ({"document_id": "two"},))
-    assert first.request_id == second.request_id
-    assert second.source_evidence == first.source_evidence
-    assert len(storage.registry) == 1
+    assert first.request_id != second.request_id
+    assert second.source_evidence != first.source_evidence
+    assert len(storage.registry) == 2
 
 
 def test_candidate_required_api_response_is_bounded_and_safe():

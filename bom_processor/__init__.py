@@ -21,7 +21,7 @@ from .job_orchestrator import (
     SasUrls, StartResult, StorageReader, WorkItem, redact_url,
 )
 from .remote import RemoteBomProcessor
-from .candidates import CandidateRequest, CandidateRequiredError
+from .candidates import CandidateRequest, CandidateRequiredError, AggregateCandidateRequiredError
 from .candidate_authoring import (AuthoringError, AuthoringPrompt, AuthoringResult,
                                    CandidateAuthoringService, ModelAuthor, SourceAnalysis)
 from .candidate_validation import (CandidateValidationError, CandidateValidationResult,
@@ -55,7 +55,7 @@ __all__ = [
     "AzureJobStarter", "AzureSasFactory", "JobOrchestrator", "JobStarter",
     "SasFactory", "SasUrls", "StartResult", "StorageReader", "WorkItem", "redact_url",
     "RemoteBomProcessor",
-    "CandidateRequest", "CandidateRequiredError",
+    "CandidateRequest", "CandidateRequiredError", "AggregateCandidateRequiredError",
     "AuthoringError", "AuthoringPrompt", "AuthoringResult", "CandidateAuthoringService",
     "ModelAuthor", "SourceAnalysis",
     "CandidateValidationError", "CandidateValidationResult", "CandidateValidationService",

@@ -21,7 +21,8 @@ from .job_orchestrator import JobOrchestrator, WorkItem
 from .blob_registry import BlobRegistryReader
 from .master_registry import RegistryError
 from .master_registry import profile_bytes
-from .candidates import CandidateRequiredError, persist_candidate
+from .candidates import (AggregateCandidateRequiredError, CandidateRequiredError,
+                         persist_candidate)
 
 
 class RemoteBomProcessor:
@@ -66,36 +67,86 @@ class RemoteBomProcessor:
         existing = self.storage.download_output(manifest_path, self.max_output_bytes)
         if existing is not None:
             return self._validate_manifest(existing, request, fingerprint)
-        selection = None
         verified_sources: dict[str, bytes] = {}
+        for document in request.documents:
+            source = self.storage.download_source(document.blob_path, self.max_source_bytes)
+            if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
+                raise ProcessingError("source integrity check failed")
+            verified_sources[document.document_id] = source
+        selections: dict[str, Any] = {}
+        legacy_parser: bytes | None = None
+        pending: list[CandidateRequiredError] = []
+        profiles: dict[str, Any] = {}
         try:
             if self.registry_reader is None:
                 raise RegistryError("REGISTRY_ABSENT")
             for document in request.documents:
-                source = self.storage.download_source(document.blob_path, self.max_source_bytes)
-                if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
-                    raise ProcessingError("source integrity check failed")
-                verified_sources[document.document_id] = source
-                current = self.registry_reader.select(
-                    request.parser_key, request.customer_key, source,
-                    PurePosixPath(document.blob_path).suffix,
-                )
-                if selection is None:
-                    selection = current
-                elif current.variant != selection.variant:
-                    raise ProcessingError("parser variant mismatch")
-            parser = selection.code
+                try:
+                    current = self.registry_reader.select(
+                        request.parser_key, request.customer_key,
+                        verified_sources[document.document_id],
+                        PurePosixPath(document.blob_path).suffix,
+                    )
+                except RegistryError as item_error:
+                    if item_error.code not in {"PARSER_FORMAT_NOT_RECOGNIZED"}:
+                        raise
+                    profile = profile_bytes(verified_sources[document.document_id],
+                                            PurePosixPath(document.blob_path).suffix)
+                    profiles.setdefault(profile.profile_hash, (profile, []))[1].append(document)
+                    continue
+                selections[document.document_id] = current
         except RegistryError as exc:
             if exc.code == "REGISTRY_ABSENT":
                 try:
-                    parser = self.storage.download_parser(request.parser_key, self.max_parser_bytes)
+                    legacy_parser = self.storage.download_parser(request.parser_key, self.max_parser_bytes)
                 except BlobNotFoundError:
-                    self._require_candidate(request, verified_sources, exc)
-            elif exc.code == "PARSER_FORMAT_NOT_RECOGNIZED":
-                self._require_candidate(request, verified_sources, exc)
+                    pass
+                if legacy_parser is not None:
+                    pass
+                else:
+                    exc = RegistryError("PARSER_FORMAT_NOT_RECOGNIZED")
+            if exc.code == "PARSER_FORMAT_NOT_RECOGNIZED" and legacy_parser is None:
+                for document in request.documents:
+                    if document.document_id in selections:
+                        continue
+                    try:
+                        profile = profile_bytes(verified_sources[document.document_id],
+                                                PurePosixPath(document.blob_path).suffix)
+                    except RegistryError:
+                        raise ProcessingError(f"registry:{exc.code}") from exc
+                    profiles.setdefault(profile.profile_hash, (profile, []))[1].append(document)
+                for profile, documents in profiles.values():
+                    evidence = tuple({"document_id": d.document_id, "blob_path": d.blob_path,
+                                      "size_bytes": d.size_bytes, "sha256": d.sha256.lower()}
+                                     for d in documents)
+                    candidate = persist_candidate(self.storage, request.parser_key,
+                                                  request.customer_key, profile, evidence,
+                                                  self.candidate_clock)
+                    pending.append(CandidateRequiredError(
+                        candidate.request_id, request.parser_key, profile.profile_hash,
+                        tuple(d.document_id for d in documents)))
+                if len(pending) == 1:
+                    raise pending[0] from exc
+                raise AggregateCandidateRequiredError(tuple(pending)) from exc
             else:
-                raise ProcessingError(f"registry:{exc.code}") from exc
-        parser_hash = _sha256(parser)
+                if exc.code != "REGISTRY_ABSENT":
+                    raise ProcessingError(f"registry:{exc.code}") from exc
+        if profiles:
+            for profile, documents in profiles.values():
+                evidence = tuple({"document_id": d.document_id, "blob_path": d.blob_path,
+                                  "size_bytes": d.size_bytes, "sha256": d.sha256.lower()}
+                                 for d in documents)
+                candidate = persist_candidate(self.storage, request.parser_key,
+                                              request.customer_key, profile, evidence,
+                                              self.candidate_clock)
+                pending.append(CandidateRequiredError(
+                    candidate.request_id, request.parser_key, profile.profile_hash,
+                    tuple(d.document_id for d in documents)))
+            if len(pending) == 1:
+                raise pending[0]
+            raise AggregateCandidateRequiredError(tuple(pending))
+        if pending:
+            raise AggregateCandidateRequiredError(tuple(pending))
         claim = {"version": CONTRACT_VERSION, "job_id": request.job_id,
                  "request_fingerprint": fingerprint, "status": "started"}
         prior = self.storage.download_output(claim_path, self.max_output_bytes)
@@ -114,10 +165,11 @@ class RemoteBomProcessor:
             if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                 raise ProcessingError("source integrity check failed")
             worker_job_id = f"{request.job_id}-{document.document_id}"
+            selected = selections.get(document.document_id)
             worker_prefix = f"{prefix}/worker/{worker_job_id}"
             item = WorkItem(worker_job_id, "boms", "parsers", "boms", document.blob_path,
-                            selection.variant.code_path if selection else f"{request.parser_key}/parse.py", document.sha256.lower(), document.size_bytes,
-                            parser_hash, len(parser), worker_prefix,
+                            selected.variant.code_path if selected else f"{request.parser_key}/parse.py", document.sha256.lower(), document.size_bytes,
+                            _sha256(selected.code) if selected else _sha256(legacy_parser), len(selected.code) if selected else len(legacy_parser), worker_prefix,
                             f"input{PurePosixPath(document.blob_path).suffix.lower()}",
                             "output.xlsx", "result.json")
             try:
@@ -141,8 +193,9 @@ class RemoteBomProcessor:
         manifest = {"version": CONTRACT_VERSION, "status": "completed", "job_id": request.job_id,
                     "request_fingerprint": fingerprint, "customer_key": request.customer_key,
                     "rfq_uuid": request.rfq_uuid.lower(), "package_version": request.package_version,
-                    "parser": {"key": request.parser_key, "blob_path": selection.variant.code_path if selection else f"{request.parser_key}/parse.py", "sha256": parser_hash},
+                    "parser": {"key": request.parser_key, "blob_path": selections[request.documents[0].document_id].variant.code_path if legacy_parser is None else f"{request.parser_key}/parse.py", "sha256": _sha256(selections[request.documents[0].document_id].code) if legacy_parser is None else _sha256(legacy_parser)},
                     "results": results}
+        selection = selections.get(request.documents[0].document_id)
         if selection:
             manifest["parser"].update({"variant_id": selection.variant.variant_id, "version": selection.variant.version,
                 "signature_hash": selection.variant.signature_hash, "rule_hash": selection.variant.rule_hash,
@@ -153,23 +206,27 @@ class RemoteBomProcessor:
         self.storage.upload_output_immutable(manifest_path, _json_bytes(manifest), "application/json")
         return manifest
 
-    def _require_candidate(self, request: ProcessingRequest, verified_sources: dict[str, bytes],
-                           cause: Exception) -> None:
-        first = verified_sources[request.documents[0].document_id]
-        profile = profile_bytes(first, PurePosixPath(request.documents[0].blob_path).suffix)
-        for document in request.documents[1:]:
-            other = profile_bytes(verified_sources[document.document_id],
-                                  PurePosixPath(document.blob_path).suffix)
-            if other.profile_hash != profile.profile_hash:
-                raise ProcessingError("parser variant mismatch") from cause
-        evidence = ({"document_id": request.documents[0].document_id,
-                     "blob_path": request.documents[0].blob_path,
-                     "size_bytes": request.documents[0].size_bytes,
-                     "sha256": request.documents[0].sha256.lower()},)
-        candidate = persist_candidate(self.storage, request.parser_key, request.customer_key,
-                                      profile, evidence, self.candidate_clock)
-        raise CandidateRequiredError(candidate.request_id, request.parser_key,
-                                     profile.profile_hash) from cause
+    def _require_candidate(self, request: ProcessingRequest,
+                           verified_sources: dict[str, bytes], cause: Exception) -> None:
+        groups: dict[str, tuple[Any, list[Any]]] = {}
+        for document in request.documents:
+            profile = profile_bytes(verified_sources[document.document_id],
+                                    PurePosixPath(document.blob_path).suffix)
+            groups.setdefault(profile.profile_hash, (profile, []))[1].append(document)
+        errors = []
+        for profile, documents in groups.values():
+            evidence = tuple({"document_id": d.document_id, "blob_path": d.blob_path,
+                              "size_bytes": d.size_bytes, "sha256": d.sha256.lower()}
+                             for d in documents)
+            candidate = persist_candidate(self.storage, request.parser_key,
+                                          request.customer_key, profile, evidence,
+                                          self.candidate_clock)
+            errors.append(CandidateRequiredError(candidate.request_id, request.parser_key,
+                                                  profile.profile_hash,
+                                                  tuple(d.document_id for d in documents)))
+        if len(errors) == 1:
+            raise errors[0] from cause
+        raise AggregateCandidateRequiredError(tuple(errors)) from cause
 
     def _poll(self, item: WorkItem, execution: str) -> bytes:
         deadline = self.clock() + self.timeout_seconds
