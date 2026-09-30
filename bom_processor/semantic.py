@@ -220,10 +220,11 @@ def compare_boms(left_rows: Iterable[Mapping[str, Any]], right_rows: Iterable[Ma
         right_extra |= not set(b_pairs) <= set(a_pairs)
     if not left_extra and not right_extra:
         relation = "equivalent"
-    elif right_extra or left_extra:
-        # Alternatives are set-valued enrichment. Disjoint additions are not
-        # contradictory; when both sides add alternatives there is no unique
-        # richer side, so retain the same non-conflicting dominance relation.
+    elif right_extra and left_extra:
+        # Incomparable optional alternatives are non-material. Neither fixture
+        # is richer, so they are equivalent for approval purposes.
+        relation = "equivalent"
+    else:
         relation = "dominates"
     evidence = []
     if relation == "dominates":

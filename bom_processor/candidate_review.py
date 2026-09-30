@@ -106,6 +106,15 @@ def _parsed_counts(output: bytes) -> dict[str, int]:
     return {"line_items": int(len(frame)), "mpn_cells": len(values), "distinct_mpns": len(set(values))}
 
 
+def _parsed_rows(output: bytes) -> list[dict[str, Any]]:
+    import pandas as pd
+    return pd.read_excel(io.BytesIO(output), engine="openpyxl").to_dict(orient="records")
+
+
+def _manifest_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class CandidateReviewService:
     def __init__(self, storage: Any, *, max_source_bytes: int = 50_000_000,
                  max_output_bytes: int = 50_000_000, max_rows: int = 100_000):
@@ -188,10 +197,17 @@ class CandidateReviewService:
         return summary, output
 
     def get_v3(self, request_id: str, candidate_id: str, validation_id: str) -> dict[str, Any]:
-        """Return complete grouped review metadata; singleton ``get`` remains unchanged."""
+        """Return a byte-bound semantic review manifest for every unique fixture."""
+        if not all(isinstance(value, str) and _ID.fullmatch(value)
+                   for value in (request_id, candidate_id, validation_id)):
+            raise CandidateReviewError("INVALID_REVIEW_ID")
         path = f"candidates/{request_id}/{candidate_id}/validation/{validation_id}/evidence.json"
         evidence = _json(self.storage, path, candidate=True)
         request = _json(self.storage, f"candidates/requests/{request_id}.json")
+        if (request.get("request_id") != request_id or evidence.get("request_id") != request_id
+                or evidence.get("candidate_id") != candidate_id
+                or evidence.get("validation_id") != validation_id):
+            raise CandidateReviewError("REVIEW_BINDING_INVALID")
         sources = request.get("source_evidence")
         fixtures = evidence.get("fixtures")
         if not isinstance(sources, list) or not isinstance(fixtures, list) or not fixtures:
@@ -207,14 +223,18 @@ class CandidateReviewService:
             legacy.setdefault("status", "passed")
             legacy.setdefault("semantic", evidence.get("semantic", {}))
             fixtures = [legacy]
-        expected = {}
+        expected: dict[str, list[dict[str, Any]]] = {}
         for source in sources:
-            if not isinstance(source, dict):
+            if (not isinstance(source, dict) or not isinstance(source.get("sha256"), str)
+                    or not _HASH.fullmatch(source["sha256"])):
                 raise CandidateReviewError("REVIEW_BINDING_INVALID")
             expected.setdefault(str(source.get("sha256", "")).lower(), []).append(source)
-        actual = {}
+        actual: dict[str, dict[str, Any]] = {}
         for item in fixtures:
-            if not isinstance(item, dict) or not isinstance(item.get("fixture_sha256"), str):
+            if (not isinstance(item, dict) or not isinstance(item.get("fixture_sha256"), str)
+                    or not _HASH.fullmatch(item["fixture_sha256"])):
+                raise CandidateReviewError("REVIEW_BINDING_INVALID")
+            if item["fixture_sha256"].lower() in actual:
                 raise CandidateReviewError("REVIEW_BINDING_INVALID")
             actual[item["fixture_sha256"].lower()] = item
         if set(expected) != set(actual) or any(
@@ -225,34 +245,94 @@ class CandidateReviewService:
             raise CandidateReviewError("REVIEW_INCOMPLETE")
         ordered = [actual[digest] for digest in sorted(actual)]
         complete = (evidence.get("status") == "awaiting_approval" and len(ordered) == len(expected)
+                    and evidence.get("complete", True) is True
+                    and evidence.get("fixture_count", len(ordered)) == len(ordered)
                     and all(item.get("status") == "passed" and isinstance(item.get("output"), dict)
                             for item in ordered))
-        semantics = [{"fixture_sha256": item["fixture_sha256"],
-                      "fingerprint": item.get("semantic", {}).get("fingerprint"),
-                      "assembly_identity": item.get("semantic", {}).get("assembly_identity"),
-                      "mapping_required": item.get("semantic", {}).get("mapping_required", True),
-                      "model_summary": item.get("semantic", {}).get("model_summary", {})}
-                     for item in ordered]
-        comparisons = []
-        for left_index, left in enumerate(ordered):
-            for right in ordered[left_index + 1:]:
-                relation = "equivalent"
-                left_sem, right_sem = left.get("semantic", {}), right.get("semantic", {})
-                if left_sem.get("fingerprint") != right_sem.get("fingerprint"):
-                    relation = "conflict"
-                    if left_sem.get("assembly_identity") == right_sem.get("assembly_identity"):
-                        left_mpn = left_sem.get("model_summary", {}).get("mpn_count", 0)
-                        right_mpn = right_sem.get("model_summary", {}).get("mpn_count", 0)
-                        if left_mpn != right_mpn:
-                            relation = "dominates"
-                comparisons.append({"left_fixture_sha256": left["fixture_sha256"], "right_fixture_sha256": right["fixture_sha256"], "relation": relation})
-        return {"version": "candidate-review.v3", "request_id": request_id, "candidate_id": candidate_id,
-                "validation_id": validation_id, "complete": complete, "validation_complete": complete,
-                "approval_ready": complete and not any(item["relation"] == "conflict" for item in comparisons),
-                "status": evidence.get("status"), "source_count": len(sources),
-                "unique_fixture_count": len(ordered),
-                "groups": [{"group_id": f"{request_id}:{candidate_id}", "fixtures": ordered,
-                            "source_document_ids": sorted({a.get("document_id") for item in ordered for a in item.get("source_aliases", [])}),
-                            "semantic": semantics, "comparisons": comparisons}],
-                "evidence": {"candidate": evidence.get("candidate"), "policy_versions": evidence.get("policy_versions", []),
-                             "manifest_sha256": hashlib.sha256(json.dumps(ordered, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}}
+        reviewed: list[dict[str, Any]] = []
+        rows_by_hash: dict[str, list[dict[str, Any]]] = {}
+        for item in ordered:
+            digest = item["fixture_sha256"].lower()
+            output = item.get("output")
+            if not isinstance(output, dict):
+                raise CandidateReviewError("REVIEW_EVIDENCE_INVALID")
+            output_path = output.get("blob_path")
+            if (not isinstance(output_path, str) or not output_path.startswith(
+                    f"candidates/{request_id}/{candidate_id}/validation/{validation_id}/")
+                    or output.get("content_type") != OUTPUT_CONTENT_TYPE
+                    or type(output.get("size_bytes")) is not int
+                    or not 0 < output["size_bytes"] <= self.max_output_bytes
+                    or not isinstance(output.get("sha256"), str)
+                    or not _HASH.fullmatch(output["sha256"])):
+                raise CandidateReviewError("REVIEW_EVIDENCE_INVALID")
+            data = self.storage.download_candidate(output_path, self.max_output_bytes)
+            if len(data) != output["size_bytes"] or hashlib.sha256(data).hexdigest() != output["sha256"]:
+                raise CandidateReviewError("REVIEW_OUTPUT_INVALID")
+            try:
+                _validate_xlsx_bytes(data, self.max_rows)
+                rows_by_hash[digest] = _parsed_rows(data)
+            except Exception:
+                raise CandidateReviewError("REVIEW_OUTPUT_INVALID") from None
+            semantic = item.get("semantic")
+            identity = semantic.get("assembly_identity") if isinstance(semantic, dict) else None
+            mapping_required = (not isinstance(identity, dict) or not str(identity.get("name", "")).strip())
+            reviewed.append({
+                "fixture_sha256": digest,
+                "source_aliases": sorted(item.get("source_aliases", []),
+                                         key=lambda alias: (str(alias.get("document_id", "")), str(alias.get("blob_path", "")))),
+                "output": {key: output[key] for key in ("blob_path", "sha256", "size_bytes", "content_type")},
+                "assembly_identity": identity if not mapping_required else None,
+                "mapping_required": mapping_required,
+                "fingerprint": semantic.get("fingerprint") if isinstance(semantic, dict) else None,
+                "model_summary": semantic.get("model_summary", {}) if isinstance(semantic, dict) else {},
+            })
+
+        grouped: dict[tuple[str, str] | None, list[dict[str, Any]]] = {}
+        for item in reviewed:
+            identity = item["assembly_identity"]
+            key = None if identity is None else AssemblyIdentity(
+                str(identity.get("name", "")), str(identity.get("revision", ""))).normalized()
+            grouped.setdefault(key, []).append(item)
+        groups = []
+        for identity_key in sorted(grouped, key=lambda value: value or ("", "")):
+            members = sorted(grouped[identity_key], key=lambda item: item["fixture_sha256"])
+            comparisons, conflicts, wins = [], False, {item["fixture_sha256"]: 0 for item in members}
+            assembly = AssemblyIdentity(*(identity_key or ("", "")))
+            for left_index, left in enumerate(members):
+                for right in members[left_index + 1:]:
+                    comparison = compare_boms(
+                        rows_by_hash[left["fixture_sha256"]], rows_by_hash[right["fixture_sha256"]],
+                        left_assembly=assembly, right_assembly=assembly)
+                    record = {"left_fixture_sha256": left["fixture_sha256"],
+                              "right_fixture_sha256": right["fixture_sha256"],
+                              "relation": comparison.relation,
+                              "material_differences": list(comparison.evidence)}
+                    if comparison.relation == "dominates":
+                        side = next((entry.get("side") for entry in comparison.evidence
+                                     if entry.get("kind") == "optional_enrichment"), None)
+                        selected = right["fixture_sha256"] if side == "right" else left["fixture_sha256"]
+                        record["selected_fixture_sha256"] = selected
+                        wins[selected] += 1
+                    elif comparison.relation == "equivalent":
+                        record["equivalent_aliases"] = [left["fixture_sha256"], right["fixture_sha256"]]
+                    else:
+                        conflicts = True
+                    comparisons.append(record)
+            selected = None
+            if identity_key is not None and not conflicts:
+                selected = max(members, key=lambda item: (wins[item["fixture_sha256"]], item["fixture_sha256"]))["fixture_sha256"]
+            groups.append({"group_id": _manifest_hash({"assembly_identity": identity_key}),
+                           "assembly_identity": None if identity_key is None else {"name": identity_key[0], "revision": identity_key[1]},
+                           "mapping_required": identity_key is None,
+                           "fixtures": members,
+                           "source_document_ids": sorted({str(alias.get("document_id")) for item in members for alias in item["source_aliases"]}),
+                           "comparisons": comparisons, "has_conflicts": conflicts,
+                           "selected_fixture_sha256": selected})
+        approval_ready = complete and all(not group["mapping_required"] and not group["has_conflicts"] for group in groups)
+        manifest = {"version": "candidate-review.v3", "request_id": request_id, "candidate_id": candidate_id,
+                    "validation_id": validation_id, "complete": complete, "validation_complete": complete,
+                    "approval_ready": approval_ready, "status": evidence.get("status"),
+                    "source_count": len(sources), "unique_fixture_count": len(ordered), "groups": groups,
+                    "candidate": evidence.get("candidate"), "policy_versions": evidence.get("policy_versions", [])}
+        return {**manifest, "evidence": {"candidate": evidence.get("candidate"),
+                "policy_versions": evidence.get("policy_versions", []), "manifest_sha256": _manifest_hash(manifest)}}

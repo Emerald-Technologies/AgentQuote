@@ -210,3 +210,63 @@ def test_worker_output_hash_mismatch_fails_closed():
     with pytest.raises(CandidateValidationError, match="WORKER_OUTPUT_INTEGRITY"):
         service.validate()
     assert not any(path.endswith("/evidence.json") for path in storage.candidates)
+
+
+def test_grouped_validation_pass_fail_and_existing_result_replay():
+    second_path = "customer/rfq-id/package-1/original-boms/doc-2.csv"
+    second = b"mystery,qty\nY,3\n"
+    storage = InMemoryStorage(sources={SOURCE_PATH: SOURCE, second_path: second})
+    profile = profile_bytes(SOURCE, ".csv")
+    request = persist_candidate(storage, "Customer1", "customer-key", profile, ({
+        "document_id": "doc1", "blob_path": SOURCE_PATH, "size_bytes": len(SOURCE),
+        "sha256": hashlib.sha256(SOURCE).hexdigest(),
+    }, {
+        "document_id": "doc2", "blob_path": second_path, "size_bytes": len(second),
+        "sha256": hashlib.sha256(second).hexdigest(),
+    }))
+    candidate = CandidateAuthoringService(request.request_id, storage, Model()).author()
+    orchestrator = Orchestrator(storage, workbook())
+    service = CandidateValidationService(request.request_id, candidate.candidate_id, storage,
+                                         orchestrator, sleep=lambda _: None)
+    first = service.validate()
+    assert first.status == "awaiting_approval"
+    assert service.validate() == first
+    assert len(orchestrator.calls) == 2
+    evidence = json.loads(storage.candidates[first.evidence_path])
+    assert evidence["complete"] is True
+    assert all(item["status"] == "passed" for item in evidence["fixtures"])
+
+    evidence["fixtures"][1]["status"] = "failed"
+    evidence["status"] = "generated_unvalidated"
+    storage.candidates[first.evidence_path] = json.dumps(evidence).encode()
+    replay = service.validate()
+    assert replay.status == "generated_unvalidated"
+    assert len(orchestrator.calls) == 2
+
+
+def test_grouped_validation_fails_aggregate_when_one_fixture_fails():
+    second_path = "customer/rfq-id/package-1/original-boms/doc-2.csv"
+    second = b"mystery,qty\nY,3\n"
+    storage = InMemoryStorage(sources={SOURCE_PATH: SOURCE, second_path: second})
+    request = persist_candidate(storage, "Customer1", "customer-key", profile_bytes(SOURCE, ".csv"), ({
+        "document_id": "doc1", "blob_path": SOURCE_PATH, "size_bytes": len(SOURCE),
+        "sha256": hashlib.sha256(SOURCE).hexdigest(),
+    }, {
+        "document_id": "doc2", "blob_path": second_path, "size_bytes": len(second),
+        "sha256": hashlib.sha256(second).hexdigest(),
+    }))
+    candidate = CandidateAuthoringService(request.request_id, storage, Model()).author()
+
+    class MixedOrchestrator(Orchestrator):
+        def start(self, item):
+            self.output = workbook() if not self.calls else workbook(False)
+            return super().start(item)
+
+    orchestrator = MixedOrchestrator(storage, workbook())
+    result = CandidateValidationService(request.request_id, candidate.candidate_id, storage,
+                                        orchestrator, sleep=lambda _: None).validate()
+    evidence = json.loads(storage.candidates[result.evidence_path])
+    assert result.status == "generated_unvalidated"
+    assert evidence["complete"] is True
+    assert [item["status"] for item in evidence["fixtures"]] == ["passed", "failed"]
+    assert not any("validated-" in path for path in storage.candidates)

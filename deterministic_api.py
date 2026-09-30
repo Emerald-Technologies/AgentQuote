@@ -208,8 +208,17 @@ class ProcessingApi:
                        "profile_hash": item.profile_hash,
                        "document_ids": list(item.document_ids), "state": item.state}
                       for item in exc.candidates]
+            if self.automation_factory:
+                automation = self.automation_factory()
+                for group, item in zip(groups, exc.candidates):
+                    try:
+                        if automation.start_author(item.request_id) == "exhausted":
+                            group["automation_error"] = "author_attempts_exhausted"
+                    except Exception:
+                        group["automation_error"] = "author_start_failed"
             return 202, {"version": CONTRACT_VERSION, "status": "candidates_required",
-                         "candidates": groups}
+                         "job_id": request.job_id,
+                         "request_fingerprint": request.fingerprint(), "candidates": groups}
         except ProcessingError as exc:
             if str(exc).startswith("registry:PARSER_FORMAT_NOT_RECOGNIZED"):
                 return 422, _error("parser_format_not_recognized", "No approved parser matches the BOM.", request_id)
@@ -259,6 +268,8 @@ class DecisionApi:
                          "status": result["decision"],
                          "candidate_id": result["candidate_id"],
                          "validation_id": result["validation_id"]}
+            if isinstance(result.get("review_manifest_sha256"), str):
+                response["reviewManifestSha256"] = result["review_manifest_sha256"]
             if isinstance(result.get("parser"), dict):
                 response["parser"] = result["parser"]
             return 200, response
@@ -327,10 +338,18 @@ class CandidateReviewOutputApi:
         try:
             authorize(headers, self.config)
             evidence = self.service_factory().get_v3(request_id, candidate_id, validation_id)
-            for fixture in evidence["groups"][0]["fixtures"]:
-                if fixture.get("fixture_sha256", "").lower() == fixture_sha256.lower():
-                    output = fixture.get("output", {}).get("blob_path")
-                    return 200, self.service_factory().storage.download_candidate(output, 50_000_000)
+            for group in evidence["groups"]:
+                for fixture in group["fixtures"]:
+                    if fixture.get("fixture_sha256", "").lower() == fixture_sha256.lower():
+                        output = fixture.get("output", {})
+                        data = self.service_factory().storage.download_candidate(
+                            output.get("blob_path", ""), 50_000_000)
+                        import hashlib
+                        if (len(data) != output.get("size_bytes")
+                                or hashlib.sha256(data).hexdigest() != output.get("sha256")
+                                or output.get("content_type") != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
+                            raise CandidateReviewError("REVIEW_OUTPUT_INVALID")
+                        return 200, data
             raise CandidateReviewError("REVIEW_FIXTURE_NOT_FOUND")
         except PermissionError:
             return 401, _error("unauthenticated", "Authentication is required.", response_id)
@@ -352,6 +371,8 @@ def _decision_request(value: Any) -> dict[str, Any]:
         "version": "version", "reason": "reason", "ticket": "ticket",
         "actor_id": "actor_id", "actorId": "actor_id",
         "idempotency_key": "idempotency_key", "idempotencyKey": "idempotency_key",
+        "review_manifest_sha256": "review_manifest_sha256", "reviewManifestSha256": "review_manifest_sha256",
+        "fixture_selections": "fixture_selections", "fixtureSelections": "fixture_selections",
     }
     if any(key not in aliases for key in value) or len({aliases[key] for key in value}) != len(value):
         raise ValueError("unknown or duplicate field")
@@ -359,8 +380,12 @@ def _decision_request(value: Any) -> dict[str, Any]:
     required = {"request_id", "candidate_id", "validation_id", "decision", "actor_id"}
     if not required.issubset(bound) or not all(isinstance(bound[key], str) for key in required):
         raise ValueError("required field missing")
-    if any(key in bound and not isinstance(bound[key], str) for key in ("reason", "ticket")):
+    if any(key in bound and not isinstance(bound[key], str) for key in ("reason", "ticket", "review_manifest_sha256")):
         raise ValueError("invalid audit field")
+    if "fixture_selections" in bound and (not isinstance(bound["fixture_selections"], dict)
+            or any(not isinstance(key, str) or not isinstance(item, str)
+                   for key, item in bound["fixture_selections"].items())):
+        raise ValueError("invalid fixture selections")
     bound.setdefault("reason", "")
     bound.setdefault("ticket", "")
     if bound["decision"] not in {"approve", "reject"}:
@@ -368,7 +393,7 @@ def _decision_request(value: Any) -> dict[str, Any]:
     if bound["decision"] == "approve":
         if not all(isinstance(bound.get(key), str) for key in ("variant_id", "version")):
             raise ValueError("approval variant missing")
-    elif "variant_id" in bound or "version" in bound:
+    elif "variant_id" in bound or "version" in bound or "fixture_selections" in bound:
         raise ValueError("rejection variant supplied")
     actor = bound["actor_id"]
     if not actor or len(actor) > 128 or not all(char.isalnum() or char in "._-" for char in actor):

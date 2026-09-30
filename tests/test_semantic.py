@@ -41,8 +41,7 @@ def test_disjoint_mpn_alternatives_are_non_conflicting_enrichment():
         [row(manufacturer_1="Other", manufacturer_item_number_1="200")],
         left_assembly=A, right_assembly=A,
     )
-    assert result.relation == "dominates"  # neither side wins, but neither conflicts
-    assert result.evidence[0]["side"] == "both"
+    assert result.relation == "equivalent"  # neither side is a strict richer superset
 
 
 @pytest.mark.parametrize("changes", [

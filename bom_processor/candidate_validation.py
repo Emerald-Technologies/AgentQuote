@@ -350,7 +350,7 @@ class CandidateValidationService:
                     "candidate": {"blob_path": f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
                                    "sha256": manifest["code_sha256"], "size_bytes": len(code)},
                     "fixtures": [dict(item) for item in parsed],
-                    "fixture_count": len(parsed), "complete": all_valid,
+                    "fixture_count": len(parsed), "complete": len(parsed) == len(fixtures),
                     "policy_versions": ["arena-html-policy.v1"], "outputs": parsed}
         try:
             self.storage.upload_candidate_immutable(evidence_path, _json_bytes(evidence), "application/json")
@@ -473,6 +473,17 @@ class CandidateValidationService:
                 or evidence.get("candidate_id") != self.candidate_id):
             raise CandidateValidationError("VALIDATION_EVIDENCE_INVALID")
         status = evidence.get("status")
+        fixtures = evidence.get("fixtures")
+        if isinstance(fixtures, list) and fixtures and any("fixture_sha256" in item for item in fixtures if isinstance(item, dict)):
+            if (evidence.get("complete") is not True or len(fixtures) != evidence.get("fixture_count")
+                    or any(not isinstance(item, dict) for item in fixtures)):
+                raise CandidateValidationError("VALIDATION_EVIDENCE_INVALID")
+            passed = all(item.get("status") == "passed" for item in fixtures)
+            expected_status = "awaiting_approval" if passed else "generated_unvalidated"
+            if status != expected_status:
+                raise CandidateValidationError("VALIDATION_EVIDENCE_INVALID")
+            return CandidateValidationResult(self.request_id, self.candidate_id, validation_id,
+                                             evidence_path, status)
         semantic = evidence.get("semantic")
         if (status != "awaiting_approval" or not isinstance(semantic, dict)
             or semantic.get("valid") is not True or semantic.get("result") != "valid"):

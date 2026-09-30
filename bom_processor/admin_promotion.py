@@ -47,7 +47,9 @@ class AdminDecisionService:
 
     def decide(self, *, request_id: str, candidate_id: str, validation_id: str,
                decision: str, approver: Any, reason: str, ticket: str,
-               variant_id: str | None = None, version: str | None = None) -> dict[str, Any]:
+               variant_id: str | None = None, version: str | None = None,
+               review_manifest_sha256: str | None = None,
+               fixture_selections: dict[str, str] | None = None) -> dict[str, Any]:
         if not all(isinstance(x, str) and x and len(x) <= 128 and all(c.isalnum() or c in "._-" for c in x)
                    for x in (request_id, candidate_id, validation_id)):
             raise RegistryError("INVALID_DECISION_ID")
@@ -62,6 +64,14 @@ class AdminDecisionService:
             raise RegistryError("INVALID_VARIANT")
         if decision == "reject" and (variant_id is not None or version is not None):
             raise RegistryError("INVALID_VARIANT")
+        if (review_manifest_sha256 is not None and
+                (not isinstance(review_manifest_sha256, str) or len(review_manifest_sha256) != 64
+                 or any(char not in "0123456789abcdefABCDEF" for char in review_manifest_sha256))):
+            raise RegistryError("INVALID_DECISION")
+        if fixture_selections is not None and (not isinstance(fixture_selections, dict)
+                or any(not isinstance(key, str) or not isinstance(value, str)
+                       for key, value in fixture_selections.items())):
+            raise RegistryError("INVALID_DECISION")
         request = _read(self.storage, f"candidates/requests/{request_id}.json")
         if request.get("request_id") != request_id or request.get("status") != "requested": raise RegistryError("REQUEST_BINDING")
         base = f"candidates/{request_id}/{candidate_id}"
@@ -71,10 +81,19 @@ class AdminDecisionService:
             raise RegistryError("CANDIDATE_BINDING")
         evidence_path = f"{base}/validation/{validation_id}/evidence.json"
         evidence = _read(self.storage, evidence_path, True)
+        grouped_v3 = (evidence.get("version") == "candidate-validation.v3"
+                  and isinstance(evidence.get("fixtures"), list)
+                  and any(isinstance(item, dict) and "fixture_sha256" in item
+                      for item in evidence["fixtures"]))
+        singleton_valid = (evidence.get("schema", {}).get("valid") is True)
+        grouped_valid = (evidence.get("complete") is True
+                 and evidence.get("fixture_count") == len(evidence.get("fixtures", []))
+                 and all(isinstance(item, dict) and item.get("status") == "passed"
+                     for item in evidence.get("fixtures", [])))
         if (evidence.get("request_id") != request_id or evidence.get("candidate_id") != candidate_id
                 or evidence.get("validation_id") != validation_id or evidence.get("status") != "awaiting_approval"
                 or evidence.get("candidate", {}).get("sha256") != _sha(code)
-                or evidence.get("schema", {}).get("valid") is not True):
+            or not (grouped_valid if grouped_v3 else singleton_valid)):
             raise RegistryError("VALIDATION_BINDING")
         try:
             review = CandidateReviewService(self.storage).get_v3(request_id, candidate_id, validation_id)
@@ -85,7 +104,23 @@ class AdminDecisionService:
         evidence_manifest_hash = review.get("evidence", {}).get("manifest_sha256")
         if not isinstance(evidence_manifest_hash, str):
             evidence_manifest_hash = _hash(evidence.get("fixtures", []))
-        if request.get("profile", {}).get("source_subtype") == "html_table_xls":
+        if decision == "approve" and grouped_v3:
+            if review_manifest_sha256 is None or review_manifest_sha256.lower() != evidence_manifest_hash:
+                raise RegistryError("REVIEW_MANIFEST_BINDING")
+            supplied = fixture_selections or {}
+            required_groups = {group["group_id"]: group for group in review.get("groups", [])
+                               if group.get("has_conflicts") is True}
+            if set(supplied) != set(required_groups):
+                raise RegistryError("FIXTURE_SELECTION_INVALID")
+            for group_id, selected_hash in supplied.items():
+                displayed = {item.get("fixture_sha256") for item in required_groups[group_id].get("fixtures", [])}
+                if selected_hash not in displayed:
+                    raise RegistryError("FIXTURE_SELECTION_INVALID")
+            if any(group.get("mapping_required") is True for group in review.get("groups", [])):
+                raise RegistryError("MAPPING_REQUIRED")
+        elif fixture_selections:
+            raise RegistryError("FIXTURE_SELECTION_INVALID")
+        if request.get("profile", {}).get("source_subtype") == "html_table_xls" and not grouped_v3:
             semantic = evidence.get("semantic")
             if (not isinstance(semantic, dict) or semantic.get("valid") is not True
                     or semantic.get("result") != "valid"
@@ -95,12 +130,13 @@ class AdminDecisionService:
         event_path = f"candidates/events/{request_id}/{candidate_id}/validated-{validation_id}.json"
         event = _read(self.storage, event_path, True)
         if event.get("validation_id") != validation_id or event.get("status") != "awaiting_approval": raise RegistryError("VALIDATION_EVENT_INVALID")
-        output = evidence.get("output", {})
-        output_bytes = self.storage.download_candidate(output.get("blob_path", ""), self.max_output_bytes)
-        if _sha(output_bytes) != output.get("sha256") or len(output_bytes) != output.get("size_bytes") or output.get("content_type") != OUTPUT_CONTENT_TYPE:
-            raise RegistryError("OUTPUT_BINDING")
-        try: _validate_xlsx_bytes(output_bytes, self.max_rows)
-        except Exception as exc: raise RegistryError("OUTPUT_SCHEMA_INVALID") from exc
+        if not grouped_v3:
+            output = evidence.get("output", {})
+            output_bytes = self.storage.download_candidate(output.get("blob_path", ""), self.max_output_bytes)
+            if _sha(output_bytes) != output.get("sha256") or len(output_bytes) != output.get("size_bytes") or output.get("content_type") != OUTPUT_CONTENT_TYPE:
+                raise RegistryError("OUTPUT_BINDING")
+            try: _validate_xlsx_bytes(output_bytes, self.max_rows)
+            except Exception as exc: raise RegistryError("OUTPUT_SCHEMA_INVALID") from exc
         signature = self._signature(request)
         if decision == "approve":
             if variant_id is None or version is None or not all(c.isalnum() or c in "._-" for c in variant_id + version): raise RegistryError("INVALID_VARIANT")
@@ -108,6 +144,9 @@ class AdminDecisionService:
         now = self.clock(); now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
         timestamp = now.isoformat().replace("+00:00", "Z")
         identity = {"version":"admin-decision.v1", "request_id":request_id, "candidate_id":candidate_id, "validation_id":validation_id, "decision":decision, "variant_id":variant_id, "variant_version":version, "approver":approver["object_id"], "reason":reason, "ticket":ticket}
+        if grouped_v3:
+            identity["review_manifest_sha256"] = evidence_manifest_hash
+            identity["fixture_selections"] = dict(sorted((fixture_selections or {}).items()))
         approval_id = _hash(identity)
         decision_path = f"candidates/decisions/{request_id}/{candidate_id}/{validation_id}.json"
         record = {**identity, "approved_time": timestamp, "decision_id": approval_id}

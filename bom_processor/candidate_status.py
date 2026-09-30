@@ -91,11 +91,22 @@ class CandidateStatusService:
             validation_id = None
             if ev:
                 validation_id = ev[0].get("validation_id")
-                current = ("awaiting_approval"
-                           if ev[0].get("schema", {}).get("valid") is True
-                           and ev[0].get("semantic", {}).get("valid") is True
-                           and ev[0].get("arena_policy", {}).get("valid", True) is True
-                           else "schema_invalid")
+                fixtures = ev[0].get("fixtures")
+                if (ev[0].get("version") == "candidate-validation.v3"
+                        and isinstance(fixtures, list) and fixtures
+                        and any(isinstance(item, dict) and "fixture_sha256" in item for item in fixtures)):
+                    complete = (ev[0].get("complete") is True
+                                and ev[0].get("fixture_count") == len(fixtures))
+                    passed = complete and all(
+                        isinstance(item, dict) and item.get("status") == "passed"
+                        for item in fixtures)
+                    current = "awaiting_approval" if passed and ev[0].get("status") == "awaiting_approval" else "schema_invalid"
+                else:
+                    current = ("awaiting_approval"
+                               if ev[0].get("schema", {}).get("valid") is True
+                               and ev[0].get("semantic", {}).get("valid") is True
+                               and ev[0].get("arena_policy", {}).get("valid", True) is True
+                               else "schema_invalid")
             matching = [d for d in decisions if d.get("request_id") == request_id and d.get("candidate_id") == candidate_id]
             if len(matching) > 1:
                 raise CandidateStatusError("ambiguous decisions")
