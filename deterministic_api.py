@@ -53,6 +53,10 @@ REVIEW_OUTPUT_ROUTE = re.compile(
     r"^/api/v1/parser-candidates/requests/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/"
     r"candidates/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/validations/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/output$")
+REVIEW_FIXTURE_OUTPUT_ROUTE = re.compile(
+    r"^/api/v1/parser-candidates/requests/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/"
+    r"candidates/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/validations/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/fixtures/([0-9a-fA-F]{64})/output$")
 
 
 @dataclass(frozen=True)
@@ -317,6 +321,24 @@ class CandidateReviewOutputApi:
                       response_id, type(exc).__name__)
             return 500, _error("internal_error", "An internal error occurred.", response_id)
 
+    def handle_fixture(self, headers: Any, request_id: str, candidate_id: str,
+                       validation_id: str, fixture_sha256: str) -> tuple[int, bytes | dict[str, Any]]:
+        response_id = uuid.uuid4().hex
+        try:
+            authorize(headers, self.config)
+            evidence = self.service_factory().get_v3(request_id, candidate_id, validation_id)
+            for fixture in evidence["groups"][0]["fixtures"]:
+                if fixture.get("fixture_sha256", "").lower() == fixture_sha256.lower():
+                    output = fixture.get("output", {}).get("blob_path")
+                    return 200, self.service_factory().storage.download_candidate(output, 50_000_000)
+            raise CandidateReviewError("REVIEW_FIXTURE_NOT_FOUND")
+        except PermissionError:
+            return 401, _error("unauthenticated", "Authentication is required.", response_id)
+        except LookupError:
+            return 403, _error("forbidden", "Caller is not authorized.", response_id)
+        except (CandidateReviewError, BlobNotFoundError):
+            return 409, _error("review_unavailable", "Parsed BOM review is unavailable.", response_id)
+
 
 def _decision_request(value: Any) -> dict[str, Any]:
     """Bind both deployed camelCase and service snake_case names, strictly."""
@@ -510,6 +532,14 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self._write(status, payload)
 
         def do_GET(self) -> None:  # noqa: N802
+            fixture_match = REVIEW_FIXTURE_OUTPUT_ROUTE.fullmatch(self.path)
+            if fixture_match:
+                if review_output_api is None:
+                    self._write(404, _error("not_found", "Route was not found.", uuid.uuid4().hex))
+                    return
+                response_status, payload = review_output_api.handle_fixture(self.headers, *fixture_match.groups())
+                self._write_binary(response_status, payload) if isinstance(payload, bytes) else self._write(response_status, payload)
+                return
             review_match = REVIEW_OUTPUT_ROUTE.fullmatch(self.path)
             if review_match:
                 if review_output_api is None:

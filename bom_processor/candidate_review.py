@@ -11,6 +11,7 @@ from typing import Any
 from .core import OUTPUT_CONTENT_TYPE
 from .remote import _validate_xlsx_bytes
 from .arena_policy import verify_evidence
+from .semantic import AssemblyIdentity, compare_boms, normalize_bom
 
 MAX_METADATA_BYTES = 1_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -187,28 +188,71 @@ class CandidateReviewService:
         return summary, output
 
     def get_v3(self, request_id: str, candidate_id: str, validation_id: str) -> dict[str, Any]:
-        """Return grouped review metadata; singleton ``get`` remains unchanged."""
+        """Return complete grouped review metadata; singleton ``get`` remains unchanged."""
         path = f"candidates/{request_id}/{candidate_id}/validation/{validation_id}/evidence.json"
         evidence = _json(self.storage, path, candidate=True)
         request = _json(self.storage, f"candidates/requests/{request_id}.json")
+        sources = request.get("source_evidence")
         fixtures = evidence.get("fixtures")
-        if not isinstance(fixtures, list) or not fixtures:
+        if not isinstance(sources, list) or not isinstance(fixtures, list) or not fixtures:
             raise CandidateReviewError("REVIEW_INCOMPLETE")
-        complete = evidence.get("status") == "awaiting_approval" and all(item.get("status") == "passed" for item in fixtures if isinstance(item, dict))
-        if not complete:
-            return {"version": "candidate-review.v3", "request_id": request_id, "candidate_id": candidate_id,
-                    "validation_id": validation_id, "complete": False, "status": evidence.get("status"),
-                    "source_count": len(request.get("source_evidence", [])), "unique_fixture_count": len(fixtures),
-                    "groups": [{"group_id": f"{request_id}:{candidate_id}", "fixtures": fixtures}]}
+        # Normalize the pre-group singleton evidence shape without projecting a
+        # grouped request into one fixture.
+        if len(sources) == 1 and len(fixtures) == 1 and "fixture_sha256" not in fixtures[0]:
+            legacy = dict(fixtures[0])
+            legacy["fixture_sha256"] = legacy.get("sha256")
+            legacy["source_aliases"] = [{"document_id": sources[0].get("document_id"),
+                                          "blob_path": sources[0].get("blob_path")}]
+            legacy.setdefault("output", evidence.get("output"))
+            legacy.setdefault("status", "passed")
+            legacy.setdefault("semantic", evidence.get("semantic", {}))
+            fixtures = [legacy]
+        expected = {}
+        for source in sources:
+            if not isinstance(source, dict):
+                raise CandidateReviewError("REVIEW_BINDING_INVALID")
+            expected.setdefault(str(source.get("sha256", "")).lower(), []).append(source)
+        actual = {}
+        for item in fixtures:
+            if not isinstance(item, dict) or not isinstance(item.get("fixture_sha256"), str):
+                raise CandidateReviewError("REVIEW_BINDING_INVALID")
+            actual[item["fixture_sha256"].lower()] = item
+        if set(expected) != set(actual) or any(
+            sorted((a.get("document_id"), a.get("blob_path")) for a in expected[digest]) !=
+            sorted((a.get("document_id"), a.get("blob_path")) for a in actual[digest].get("source_aliases", []))
+            for digest in expected
+        ):
+            raise CandidateReviewError("REVIEW_INCOMPLETE")
+        ordered = [actual[digest] for digest in sorted(actual)]
+        complete = (evidence.get("status") == "awaiting_approval" and len(ordered) == len(expected)
+                    and all(item.get("status") == "passed" and isinstance(item.get("output"), dict)
+                            for item in ordered))
+        semantics = [{"fixture_sha256": item["fixture_sha256"],
+                      "fingerprint": item.get("semantic", {}).get("fingerprint"),
+                      "assembly_identity": item.get("semantic", {}).get("assembly_identity"),
+                      "mapping_required": item.get("semantic", {}).get("mapping_required", True),
+                      "model_summary": item.get("semantic", {}).get("model_summary", {})}
+                     for item in ordered]
+        comparisons = []
+        for left_index, left in enumerate(ordered):
+            for right in ordered[left_index + 1:]:
+                relation = "equivalent"
+                left_sem, right_sem = left.get("semantic", {}), right.get("semantic", {})
+                if left_sem.get("fingerprint") != right_sem.get("fingerprint"):
+                    relation = "conflict"
+                    if left_sem.get("assembly_identity") == right_sem.get("assembly_identity"):
+                        left_mpn = left_sem.get("model_summary", {}).get("mpn_count", 0)
+                        right_mpn = right_sem.get("model_summary", {}).get("mpn_count", 0)
+                        if left_mpn != right_mpn:
+                            relation = "dominates"
+                comparisons.append({"left_fixture_sha256": left["fixture_sha256"], "right_fixture_sha256": right["fixture_sha256"], "relation": relation})
         return {"version": "candidate-review.v3", "request_id": request_id, "candidate_id": candidate_id,
-                "validation_id": validation_id, "complete": True, "status": evidence["status"],
-                "source_count": len(request.get("source_evidence", [])), "unique_fixture_count": len(fixtures),
-                "groups": [{"group_id": f"{request_id}:{candidate_id}", "fixtures": fixtures,
-                            "source_document_ids": sorted({alias.get("document_id") for item in fixtures
-                                                             for alias in item.get("source_aliases", [])}),
-                            "semantic": [{"fixture_sha256": item.get("fixture_sha256"),
-                                          "fingerprint": item.get("semantic", {}).get("fingerprint"),
-                                          "assembly_identity": item.get("semantic", {}).get("assembly_identity"),
-                                          "mapping_required": item.get("semantic", {}).get("assembly_identity") is None}
-                                         for item in fixtures]}],
-                "evidence": {"candidate": evidence.get("candidate"), "policy_versions": evidence.get("policy_versions", [])}}
+                "validation_id": validation_id, "complete": complete, "validation_complete": complete,
+                "approval_ready": complete and not any(item["relation"] == "conflict" for item in comparisons),
+                "status": evidence.get("status"), "source_count": len(sources),
+                "unique_fixture_count": len(ordered),
+                "groups": [{"group_id": f"{request_id}:{candidate_id}", "fixtures": ordered,
+                            "source_document_ids": sorted({a.get("document_id") for item in ordered for a in item.get("source_aliases", [])}),
+                            "semantic": semantics, "comparisons": comparisons}],
+                "evidence": {"candidate": evidence.get("candidate"), "policy_versions": evidence.get("policy_versions", []),
+                             "manifest_sha256": hashlib.sha256(json.dumps(ordered, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}}

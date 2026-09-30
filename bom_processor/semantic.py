@@ -107,6 +107,27 @@ class BomComparison:
         return self.relation == "conflict"
 
 
+def semantic_summary(rows: Iterable[Mapping[str, Any]], *, assembly: AssemblyIdentity | None = None) -> dict[str, Any]:
+    """Produce bounded, deterministic semantic evidence for a parsed fixture."""
+    identity = assembly or AssemblyIdentity("", "")
+    try:
+        model = normalize_bom(rows, identity)
+    except (TypeError, ValueError):
+        return {"valid": False, "mapping_required": True, "assembly_identity": None}
+    assembly_value = {"name": model.assembly[0], "revision": model.assembly[1]}
+    if not any(model.assembly):
+        assembly_value = None
+    return {
+        "valid": True,
+        "result": "valid",
+        "fingerprint": model.fingerprint,
+        "assembly_identity": assembly_value,
+        "mapping_required": assembly_value is None,
+        "model_summary": {"component_count": len(model.components),
+                          "material_component_count": len(model.components)},
+    }
+
+
 def _component(row: Mapping[str, Any]) -> Component:
     item = _norm(_first(row, ("item_number", "item", "part_number", "part number", "component")))
     revision = _norm(_first(row, ("revision", "component_revision", "component revision", "rev")))

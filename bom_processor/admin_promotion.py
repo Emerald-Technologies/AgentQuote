@@ -9,6 +9,7 @@ from typing import Any, Callable
 from .core import BlobConflictError, OUTPUT_CONTENT_TYPE, _json_bytes
 from .master_registry import ApprovalRecord, ApprovedVariant, RegistryError, VariantSignature, _hash
 from .remote import _validate_xlsx_bytes
+from .candidate_review import CandidateReviewError, CandidateReviewService
 
 MAX_METADATA_BYTES = 1_000_000
 MAX_REASON_CHARS = 2_000
@@ -75,6 +76,15 @@ class AdminDecisionService:
                 or evidence.get("candidate", {}).get("sha256") != _sha(code)
                 or evidence.get("schema", {}).get("valid") is not True):
             raise RegistryError("VALIDATION_BINDING")
+        try:
+            review = CandidateReviewService(self.storage).get_v3(request_id, candidate_id, validation_id)
+        except CandidateReviewError as exc:
+            raise RegistryError("VALIDATION_BINDING") from exc
+        if not review.get("validation_complete"):
+            raise RegistryError("VALIDATION_BINDING")
+        evidence_manifest_hash = review.get("evidence", {}).get("manifest_sha256")
+        if not isinstance(evidence_manifest_hash, str):
+            evidence_manifest_hash = _hash(evidence.get("fixtures", []))
         if request.get("profile", {}).get("source_subtype") == "html_table_xls":
             semantic = evidence.get("semantic")
             if (not isinstance(semantic, dict) or semantic.get("valid") is not True
@@ -119,7 +129,7 @@ class AdminDecisionService:
             return record
         approval = ApprovalRecord(approval_id, candidate_id, request["parser_key"], request["customer_key"], variant_id, version,
                                   _hash(manifest), _sha(code), signature.signature_hash, signature.rule_hash,
-                                  _hash(evidence.get("fixtures", [])), approver["object_id"], timestamp)
+                      evidence_manifest_hash, approver["object_id"], timestamp)
         parser_key = request["parser_key"]
         prefix = f"approved/{parser_key}/{variant_id}/{version}"
         for path, data in ((f"{prefix}/parse.py", code), (f"{prefix}/signature.json", _json_bytes(signature.to_dict())), (f"{prefix}/approval.json", _json_bytes(approval.to_dict()))):

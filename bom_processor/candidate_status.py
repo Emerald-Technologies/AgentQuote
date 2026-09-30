@@ -139,8 +139,10 @@ class CandidateStatusService:
             if isinstance(manifest.get("code_sha256"), str) and _HASH.fullmatch(manifest["code_sha256"]): result["code_hash"] = manifest["code_sha256"]
             if status in {"awaiting_approval", "approved"} and isinstance(validation_id, str):
                 try:
-                    result["review"] = CandidateReviewService(self.storage).get(
-                        request_id, candidate_id, validation_id)[0]
+                    result["review"] = CandidateReviewService(self.storage).get_v3(
+                        request_id, candidate_id, validation_id)
+                    result["source_count"] = result["review"].get("source_count", len(source))
+                    result["unique_fixture_count"] = result["review"].get("unique_fixture_count", 0)
                 except CandidateReviewError as exc:
                     result["review_error"] = str(exc).lower()
                 except ProcessingError:
