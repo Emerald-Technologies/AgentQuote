@@ -185,3 +185,30 @@ class CandidateReviewService:
                 if key in policy
             }
         return summary, output
+
+    def get_v3(self, request_id: str, candidate_id: str, validation_id: str) -> dict[str, Any]:
+        """Return grouped review metadata; singleton ``get`` remains unchanged."""
+        path = f"candidates/{request_id}/{candidate_id}/validation/{validation_id}/evidence.json"
+        evidence = _json(self.storage, path, candidate=True)
+        request = _json(self.storage, f"candidates/requests/{request_id}.json")
+        fixtures = evidence.get("fixtures")
+        if not isinstance(fixtures, list) or not fixtures:
+            raise CandidateReviewError("REVIEW_INCOMPLETE")
+        complete = evidence.get("status") == "awaiting_approval" and all(item.get("status") == "passed" for item in fixtures if isinstance(item, dict))
+        if not complete:
+            return {"version": "candidate-review.v3", "request_id": request_id, "candidate_id": candidate_id,
+                    "validation_id": validation_id, "complete": False, "status": evidence.get("status"),
+                    "source_count": len(request.get("source_evidence", [])), "unique_fixture_count": len(fixtures),
+                    "groups": [{"group_id": f"{request_id}:{candidate_id}", "fixtures": fixtures}]}
+        return {"version": "candidate-review.v3", "request_id": request_id, "candidate_id": candidate_id,
+                "validation_id": validation_id, "complete": True, "status": evidence["status"],
+                "source_count": len(request.get("source_evidence", [])), "unique_fixture_count": len(fixtures),
+                "groups": [{"group_id": f"{request_id}:{candidate_id}", "fixtures": fixtures,
+                            "source_document_ids": sorted({alias.get("document_id") for item in fixtures
+                                                             for alias in item.get("source_aliases", [])}),
+                            "semantic": [{"fixture_sha256": item.get("fixture_sha256"),
+                                          "fingerprint": item.get("semantic", {}).get("fingerprint"),
+                                          "assembly_identity": item.get("semantic", {}).get("assembly_identity"),
+                                          "mapping_required": item.get("semantic", {}).get("assembly_identity") is None}
+                                         for item in fixtures]}],
+                "evidence": {"candidate": evidence.get("candidate"), "policy_versions": evidence.get("policy_versions", [])}}

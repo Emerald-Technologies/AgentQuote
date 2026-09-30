@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .core import BlobConflictError, CANONICAL_COLUMNS
+from .candidates import unique_fixtures
 
 MAX_CODE_BYTES = 1_000_000
 MAX_SOURCE_BYTES = 50_000_000
@@ -170,6 +171,7 @@ class CandidateAuthoringService:
             raise AuthoringError("REQUEST_UNAVAILABLE") from None
         self._validate_request(request)
         evidence = request["source_evidence"][0]
+        fixtures = unique_fixtures(request["source_evidence"])
         try:
             source = self.storage.download_source(evidence["blob_path"], MAX_SOURCE_BYTES)
         except Exception:
@@ -185,7 +187,11 @@ class CandidateAuthoringService:
             rules = rules + (f"IMPORTANT REFINEMENT CONTEXT: {self.feedback}. "
                              "Regenerate the parser to avoid this failure while still "
                              "satisfying all other rules.",)
-        prompt = AuthoringPrompt(tuple(CANONICAL_COLUMNS), rules, request["profile"], analysis)
+        profile = dict(request["profile"])
+        profile["fixture_count"] = len(fixtures)
+        profile["fixtures"] = [{"sha256": item.get("sha256"), "size_bytes": item.get("size_bytes"),
+                    "source_aliases": item.get("source_aliases", [])[:32]} for item in fixtures]
+        prompt = AuthoringPrompt(tuple(CANONICAL_COLUMNS), rules, profile, analysis)
         source_subtype = request["profile"].get("source_subtype", "")
         try:
             generated = _generate(self.model, prompt, source)
@@ -215,7 +221,9 @@ class CandidateAuthoringService:
         manifest = {"version": AUTHORING_VERSION, "status": "generated_unvalidated", "request_id": self.request_id,
                     "candidate_id": candidate_id, "parser_key": request["parser_key"], "customer_key": request["customer_key"],
                     "profile_hash": request["profile_hash"], "source_sha256": evidence["sha256"], "source_size_bytes": evidence["size_bytes"],
-                    "code_sha256": code_hash, "signature_suggestion": signature, "model_version": "injected", "prompt_version": AUTHORING_VERSION}
+                    "code_sha256": code_hash, "signature_suggestion": signature, "model_version": "injected", "prompt_version": AUTHORING_VERSION,
+                    "fixtures": [{"sha256": item["sha256"], "size_bytes": item["size_bytes"],
+                                   "source_aliases": item.get("source_aliases", [])} for item in fixtures]}
         manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         try:
             _write(self.storage, f"{base}/parse.py", code, "text/x-python")
@@ -238,7 +246,7 @@ class CandidateAuthoringService:
         if not _HASH.fullmatch(value["profile_hash"]) or not isinstance(value["profile"], dict):
             raise AuthoringError("REQUEST_INVALID")
         evidence = value["source_evidence"]
-        if not isinstance(evidence, list) or len(evidence) != 1 or not isinstance(evidence[0], dict):
+        if not isinstance(evidence, list) or not evidence or any(not isinstance(item, dict) for item in evidence):
             raise AuthoringError("REQUEST_INVALID")
         item = evidence[0]
         if not isinstance(item.get("blob_path"), str) or type(item.get("size_bytes")) is not int or item["size_bytes"] < 0 or not _HASH.fullmatch(item.get("sha256", "")):

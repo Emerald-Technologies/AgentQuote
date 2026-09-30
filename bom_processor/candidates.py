@@ -10,6 +10,21 @@ from .master_registry import RegistryError, StructuralProfile, _hash
 CANDIDATE_VERSION = "candidate-request.v2"
 
 
+def unique_fixtures(source_evidence: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Collapse exact-byte duplicates while preserving deterministic aliases."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in source_evidence:
+        groups.setdefault(str(item.get("sha256", "")).lower(), []).append(dict(item))
+    fixtures = []
+    for digest in sorted(groups):
+        aliases = sorted(groups[digest], key=lambda item: (str(item.get("document_id", "")), str(item.get("blob_path", ""))))
+        fixture = dict(aliases[0])
+        fixture["source_aliases"] = [{"document_id": item.get("document_id"), "blob_path": item.get("blob_path")} for item in aliases]
+        fixture["alias_count"] = len(aliases)
+        fixtures.append(fixture)
+    return tuple(fixtures)
+
+
 class CandidateRequiredError(Exception):
     """Safe signal that an unrecognized format needs an approved candidate."""
     def __init__(self, request_id: str, parser_key: str, profile_hash: str,

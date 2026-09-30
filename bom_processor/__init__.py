@@ -22,6 +22,7 @@ from .job_orchestrator import (
 )
 from .remote import RemoteBomProcessor
 from .candidates import CandidateRequest, CandidateRequiredError, AggregateCandidateRequiredError
+from .candidates import unique_fixtures
 from .candidate_authoring import (AuthoringError, AuthoringPrompt, AuthoringResult,
                                    CandidateAuthoringService, ModelAuthor, SourceAnalysis)
 from .candidate_validation import (CandidateValidationError, CandidateValidationResult,
@@ -56,6 +57,7 @@ __all__ = [
     "SasFactory", "SasUrls", "StartResult", "StorageReader", "WorkItem", "redact_url",
     "RemoteBomProcessor",
     "CandidateRequest", "CandidateRequiredError", "AggregateCandidateRequiredError",
+    "unique_fixtures",
     "AuthoringError", "AuthoringPrompt", "AuthoringResult", "CandidateAuthoringService",
     "ModelAuthor", "SourceAnalysis",
     "CandidateValidationError", "CandidateValidationResult", "CandidateValidationService",

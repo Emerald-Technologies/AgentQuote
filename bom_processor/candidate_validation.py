@@ -15,6 +15,7 @@ from .core import BlobConflictError, OUTPUT_CONTENT_TYPE, ProcessingError, _json
 from .job_orchestrator import JobOrchestrator, WorkItem
 from .remote import _validate_xlsx_bytes
 from .master_registry import html_table_rows
+from .candidates import unique_fixtures
 from .arena_policy import is_arena_source, validate as validate_arena
 
 VALIDATION_VERSION = "candidate-validation.v3"
@@ -138,6 +139,9 @@ class CandidateValidationService:
     def validate(self) -> CandidateValidationResult:
         request = self._request()
         manifest, code = self._candidate(request)
+        fixtures = unique_fixtures(request["source_evidence"])
+        if len(fixtures) > 1 or len(fixtures[0].get("source_aliases", [])) > 1:
+            return self._validate_group(request, manifest, code, fixtures)
         source_evidence = request["source_evidence"][0]
         source = self._source(source_evidence)
         validation_id = _sha256(_json_bytes({
@@ -271,6 +275,75 @@ class CandidateValidationService:
         return CandidateValidationResult(self.request_id, self.candidate_id, validation_id,
                                          evidence_path, resulting_status)
 
+    def _validate_group(self, request: dict[str, Any], manifest: dict[str, Any], code: bytes,
+                        fixtures: tuple[dict[str, Any], ...]) -> CandidateValidationResult:
+        """Validate every unique byte fixture and persist one aggregate record."""
+        validation_id = _sha256(_json_bytes({"version": VALIDATION_VERSION, "request_id": self.request_id,
+                                             "candidate_id": self.candidate_id, "code_sha256": manifest["code_sha256"],
+                                             "fixtures": [item["sha256"].lower() for item in fixtures]}))
+        base = f"candidates/{self.request_id}/{self.candidate_id}/validation/{validation_id}"
+        evidence_path = f"{base}/evidence.json"
+        existing = self._optional_candidate(evidence_path)
+        if existing is not None:
+            return self._existing_result(_load_json(existing, "VALIDATION_EVIDENCE_INVALID"), validation_id, evidence_path)
+        parsed: list[dict[str, Any]] = []
+        all_valid = True
+        for index, source_evidence in enumerate(fixtures):
+            source = self._source(source_evidence)
+            fixture_id = _sha256(_json_bytes({"validation_id": validation_id, "fixture": source_evidence["sha256"].lower()}))
+            job_id = f"validate-{fixture_id[:32]}"
+            item = WorkItem(job_id, "boms", "parsers", "parsers", source_evidence["blob_path"],
+                            f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
+                            source_evidence["sha256"].lower(), source_evidence["size_bytes"],
+                            manifest["code_sha256"], len(code), f"{base}/worker/attempt-{int(time.time()*1000)}-{index}/{job_id}",
+                            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}", f"output-{fixture_id[:16]}.xlsx", "result.json")
+            record = {"fixture_sha256": source_evidence["sha256"].lower(), "document_id": source_evidence["document_id"],
+                      "source_aliases": source_evidence.get("source_aliases", []), "status": "failed"}
+            try:
+                started = self.orchestrator.start(item)
+                raw = self._poll(item)
+                worker = self._verify_worker_result(raw, item)
+                output = self.storage.download_candidate(item.output_blob, self.max_output_bytes)
+                schema_valid = True
+                try:
+                    _validate_xlsx_bytes(output, self.max_rows)
+                except Exception:
+                    schema_valid = False
+                semantic = _semantic_output(output, source, str(request.get("profile", {}).get("source_subtype", ""))) if schema_valid else {"valid": False, "result": "schema_invalid"}
+                policy = None
+                if schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls" and is_arena_source(source):
+                    policy = validate_arena(source, output, source_sha256=source_evidence["sha256"].lower(),
+                                            candidate_code_sha256=manifest["code_sha256"], output_sha256=_sha256(output))
+                valid = schema_valid and semantic.get("valid") is True and (policy is None or policy.get("valid") is True)
+                all_valid = all_valid and valid
+                record.update({"status": "passed" if valid else "failed", "output": {"blob_path": item.output_blob,
+                    "sha256": _sha256(output), "size_bytes": len(output), "content_type": OUTPUT_CONTENT_TYPE},
+                    "schema": {"valid": schema_valid}, "semantic": semantic, "worker": {"execution_name": started.execution_name},
+                    "arena_policy": policy})
+            except Exception as exc:
+                all_valid = False
+                record["failure"] = {"code": exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"}
+            parsed.append(record)
+        evidence = {"version": VALIDATION_VERSION, "validation_id": validation_id, "request_id": self.request_id,
+                    "candidate_id": self.candidate_id, "prior_status": "generated_unvalidated",
+                    "status": "awaiting_approval" if all_valid else "generated_unvalidated",
+                    "candidate": {"blob_path": f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
+                                   "sha256": manifest["code_sha256"], "size_bytes": len(code)},
+                    "fixtures": [dict(item) for item in parsed],
+                    "fixture_count": len(parsed), "complete": all_valid,
+                    "policy_versions": ["arena-html-policy.v1"], "outputs": parsed}
+        try:
+            self.storage.upload_candidate_immutable(evidence_path, _json_bytes(evidence), "application/json")
+            if all_valid:
+                event_path = f"candidates/events/{self.request_id}/{self.candidate_id}/validated-{validation_id}.json"
+                self.storage.upload_candidate_immutable(event_path, _json_bytes({"version": VALIDATION_VERSION,
+                    "event": "candidate.validated", "request_id": self.request_id, "candidate_id": self.candidate_id,
+                    "validation_id": validation_id, "status": "awaiting_approval", "evidence_path": evidence_path}), "application/json")
+        except BlobConflictError:
+            raise CandidateValidationError("VALIDATION_CONFLICT") from None
+        return CandidateValidationResult(self.request_id, self.candidate_id, validation_id, evidence_path,
+                                         "awaiting_approval" if all_valid else "generated_unvalidated")
+
     def _request(self) -> dict[str, Any]:
         try:
             value = _load_json(self.storage.download_registry(
@@ -281,16 +354,16 @@ class CandidateValidationService:
             raise CandidateValidationError("REQUEST_UNAVAILABLE") from None
         evidence = value.get("source_evidence")
         if (value.get("request_id") != self.request_id or value.get("status") != "requested"
-                or not isinstance(evidence, list) or len(evidence) != 1
-                or not isinstance(evidence[0], dict)):
+                or not isinstance(evidence, list) or not evidence
+                or any(not isinstance(item, dict) for item in evidence)):
             raise CandidateValidationError("REQUEST_INVALID")
-        item = evidence[0]
-        if (not isinstance(item.get("document_id"), str)
-                or not isinstance(item.get("blob_path"), str)
-                or type(item.get("size_bytes")) is not int or item["size_bytes"] < 0
-                or not isinstance(item.get("sha256"), str)
-                or not _SHA.fullmatch(item["sha256"].lower())):
-            raise CandidateValidationError("REQUEST_INVALID")
+        for item in evidence:
+            if (not isinstance(item.get("document_id"), str)
+                    or not isinstance(item.get("blob_path"), str)
+                    or type(item.get("size_bytes")) is not int or item["size_bytes"] < 0
+                    or not isinstance(item.get("sha256"), str)
+                    or not _SHA.fullmatch(item["sha256"].lower())):
+                raise CandidateValidationError("REQUEST_INVALID")
         return value
 
     def _candidate(self, request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
