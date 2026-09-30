@@ -30,6 +30,7 @@ from .admin_promotion import AdminDecisionService
 from .candidate_status import CandidateStatusError, CandidateStatusService
 from .candidate_automation import CandidateAutomationService, AzureCandidateJobStarter
 from .candidate_review import CandidateReviewError, CandidateReviewService
+from .semantic import AssemblyIdentity, BomComparison, BomSemantic, compare_boms, normalize_bom
 
 __all__ = [
     "AzureBlobStorage",
@@ -62,4 +63,5 @@ __all__ = [
     "CandidateStatusError", "CandidateStatusService",
     "CandidateAutomationService", "AzureCandidateJobStarter",
     "CandidateReviewError", "CandidateReviewService",
+    "AssemblyIdentity", "BomComparison", "BomSemantic", "compare_boms", "normalize_bom",
 ]
