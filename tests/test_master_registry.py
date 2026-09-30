@@ -38,6 +38,10 @@ def xlsx_inline(headers=("Part Number", "Description", "Quantity")) -> bytes:
     return output.getvalue()
 
 
+def arena_html(description="±25PPM/°C &amp; Â± tolerance") -> bytes:
+    return f'''<html><head><meta http-equiv="content-type" content="text/html;charset=UTF-8"><title>Report</title></head><body style="font-family:Arial"><table border="1" cellpadding="0" cellspacing="0"><tr style="font-size:10pt;background:#CCC"><th align="left" valign="bottom">item_number</th><th align="left" valign="bottom">item_name</th><th align="left" valign="bottom">quantity</th></tr><tr style="font-size:10pt; background:transparent" valign="top"><td>P1</td><td>{description}</td><td>1</td></tr></table></body></html>'''.encode("utf-8")
+
+
 def signature(extension=".csv", sheet="Sheet1"):
     return VariantSignature(frozenset({extension}), frozenset({sheet}), {sheet: frozenset({"part_number", "description", "quantity"})})
 
@@ -58,6 +62,18 @@ def test_profiles_are_deterministic_and_inline_xlsx_headers_work():
     xlsx = profile_bytes(xlsx_inline(), ".xlsx")
     assert xlsx.sheet_names == ("BOM",)
     assert xlsx.header_candidates["BOM"][0] == ("part_number", "description", "quantity")
+
+
+def test_html_xls_profile_accepts_arena_engineering_entities():
+    profile = profile_bytes(arena_html("&plusmn;25PPM/&deg;C &amp; &Acirc;&plusmn; tolerance"), ".xls")
+    assert profile.source_subtype == "html_table_xls"
+    assert profile.sheet_names == ("HTMLTable",)
+    assert profile.header_candidates["HTMLTable"][0] == ("item_number", "item_name", "quantity")
+
+
+def test_html_xls_profile_rejects_unapproved_named_entities():
+    with pytest.raises(RegistryError, match="PARSER_FORMAT_NOT_RECOGNIZED"):
+        profile_bytes(arena_html("&copy;"), ".xls")
 
 
 def test_xlsx_rejects_unsafe_relationship_and_zip_bounds():

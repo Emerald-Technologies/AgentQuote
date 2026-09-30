@@ -127,12 +127,15 @@ class _HTMLTableProfiler(HTMLParser):
     _numeric = re.compile(r"^(?:0|[1-9][0-9]{0,3})$")
     _enum = {"valign": {"top", "middle", "bottom", "baseline"}, "align": {"left", "center", "right", "justify"}}
     _style_properties = {"color", "background", "background-color", "font-family", "font-size", "font-weight", "text-align", "vertical-align", "white-space"}
+    _entities = {"amp", "lt", "gt", "quot", "apos", "nbsp", "plusmn", "deg", "Acirc"}
 
     def __init__(self):
         super().__init__(convert_charrefs=False)
         self.stack = []
         self.rows = []
+        self.raw_rows = []
         self.current_row = None
+        self.raw_current_row = None
         self.current_cell = None
         self.cell_text = []
         self.total_text = 0
@@ -197,6 +200,7 @@ class _HTMLTableProfiler(HTMLParser):
         if tag == "tr":
             if self.current_row is not None: raise ValueError("nesting")
             self.current_row = []
+            self.raw_current_row = []
         elif tag in self._cell:
             if self.current_row is None or self.current_cell is not None: raise ValueError("cell")
             if len(self.current_row) >= MAX_HTML_CELLS_PER_ROW: raise ValueError("cells")
@@ -214,10 +218,14 @@ class _HTMLTableProfiler(HTMLParser):
         if tag in self._cell:
             text = "".join(self.cell_text).strip()
             if len(text) > MAX_HTML_CELL_TEXT: raise ValueError("cell_text")
-            self.current_row.append(normalize_header(text)); self.current_cell = None; self.cell_text = []
+            if self.current_row is not None:
+                self.current_row.append(normalize_header(text))
+                self.raw_current_row.append(text)
+            self.current_cell = None; self.cell_text = []
         elif tag == "tr":
             if self.current_row is None: raise ValueError("row")
             self.rows.append(tuple(self.current_row)); self.current_row = None
+            self.raw_rows.append(tuple(self.raw_current_row)); self.raw_current_row = None
             if len(self.rows) > MAX_HTML_ROWS or sum(map(len, self.rows)) > MAX_HTML_CELLS: raise ValueError("rows")
 
     def handle_data(self, data):
@@ -235,7 +243,7 @@ class _HTMLTableProfiler(HTMLParser):
         self.handle_data(decoded)
 
     def handle_entityref(self, name):
-        if name not in {"amp", "lt", "gt", "quot", "apos", "nbsp"}: raise ValueError("entity")
+        if name not in self._entities: raise ValueError("entity")
         self._entity("&" + name + ";")
 
     def handle_charref(self, name):
@@ -273,6 +281,20 @@ def html_table_rows(data: bytes) -> tuple[tuple[str, ...], ...]:
         if parser.stack or parser.current_row is not None or parser.current_cell is not None or parser.tables != 1 or not parser.rows:
             raise ValueError("incomplete")
         return tuple(parser.rows)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "invalid_html_xls"}) from exc
+
+
+def html_table_raw_rows(data: bytes) -> tuple[tuple[str, ...], ...]:
+    """Return bounded table rows preserving cell text for semantic validation."""
+    if len(data) > MAX_HTML_BYTES:
+        raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "html_bounds"})
+    try:
+        parser = _HTMLTableProfiler()
+        parser.feed(data.decode("utf-8-sig")); parser.close()
+        if parser.stack or parser.current_row is not None or parser.current_cell is not None or parser.tables != 1 or not parser.rows:
+            raise ValueError("incomplete")
+        return tuple(parser.raw_rows)
     except (UnicodeDecodeError, ValueError) as exc:
         raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "invalid_html_xls"}) from exc
 

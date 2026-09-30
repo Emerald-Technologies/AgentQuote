@@ -10,6 +10,7 @@ from typing import Any
 
 from .core import OUTPUT_CONTENT_TYPE
 from .remote import _validate_xlsx_bytes
+from .arena_policy import verify_evidence
 
 MAX_METADATA_BYTES = 1_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -173,4 +174,14 @@ class CandidateReviewService:
             "parsed": {"blob_path": output_path, "sha256": output_meta["sha256"], "size_bytes": output_meta["size_bytes"],
                        **_parsed_counts(output)},
         }
+        if isinstance(evidence.get("arena_policy"), dict):
+            policy = evidence["arena_policy"]
+            if not verify_evidence(policy):
+                raise CandidateReviewError("REVIEW_POLICY_INVALID")
+            summary["version"] = "candidate-review.v2"
+            summary["arena_policy"] = {
+                key: policy[key] for key in ("version", "valid", "reason", "source_rows", "output_rows",
+                                            "included_count", "omitted_count", "omissions", "decision_hash")
+                if key in policy
+            }
         return summary, output

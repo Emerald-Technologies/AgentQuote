@@ -15,6 +15,7 @@ from .core import BlobConflictError, OUTPUT_CONTENT_TYPE, ProcessingError, _json
 from .job_orchestrator import JobOrchestrator, WorkItem
 from .remote import _validate_xlsx_bytes
 from .master_registry import html_table_rows
+from .arena_policy import is_arena_source, validate as validate_arena
 
 VALIDATION_VERSION = "candidate-validation.v3"
 MAX_METADATA_BYTES = 1_000_000
@@ -202,6 +203,21 @@ class CandidateValidationService:
                             "source_rows": 0, "output_rows": 0,
                             "coverage_basis": "semantic_validation_failed"}
         validation_valid = schema_valid and semantic["valid"] is True
+        arena_evidence = None
+        if (schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls"
+            and is_arena_source(source)):
+            try:
+                arena_evidence = validate_arena(
+                    source, output, source_sha256=source_evidence["sha256"].lower(),
+                    candidate_code_sha256=manifest["code_sha256"], output_sha256=_sha256(output))
+            except Exception:
+                arena_evidence = {"version": "arena-html-policy.v1", "valid": False, "reason": "policy_error"}
+            validation_valid = validation_valid and arena_evidence.get("valid") is True
+            if arena_evidence.get("valid") is not True:
+                semantic = {"valid": False, "result": "semantic_output_invalid",
+                            "source_rows": semantic.get("source_rows", 0),
+                            "output_rows": semantic.get("output_rows", 0),
+                            "coverage_basis": f"arena_policy:{arena_evidence.get('reason', 'invalid')}"}
         resulting_status = "awaiting_approval" if validation_valid else "generated_unvalidated"
         evidence = {
             "version": VALIDATION_VERSION,
@@ -225,6 +241,8 @@ class CandidateValidationService:
                        "execution_name": started.execution_name,
                        "image_reference": self.worker_image},
         }
+        if arena_evidence is not None:
+            evidence["arena_policy"] = arena_evidence
         try:
             self.storage.upload_candidate_immutable(
                 evidence_path, _json_bytes(evidence), "application/json")

@@ -91,7 +91,11 @@ class CandidateStatusService:
             validation_id = None
             if ev:
                 validation_id = ev[0].get("validation_id")
-                current = "awaiting_approval" if ev[0].get("schema", {}).get("valid") is True else "schema_invalid"
+                current = ("awaiting_approval"
+                           if ev[0].get("schema", {}).get("valid") is True
+                           and ev[0].get("semantic", {}).get("valid") is True
+                           and ev[0].get("arena_policy", {}).get("valid", True) is True
+                           else "schema_invalid")
             matching = [d for d in decisions if d.get("request_id") == request_id and d.get("candidate_id") == candidate_id]
             if len(matching) > 1:
                 raise CandidateStatusError("ambiguous decisions")

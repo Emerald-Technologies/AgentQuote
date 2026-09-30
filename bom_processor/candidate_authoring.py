@@ -34,6 +34,7 @@ HTML_XLS_RULES = (
     "for source_subtype html_table_xls, map extracted rows to the standard XLSX output format",
     "for source_subtype html_table_xls, preserve the actual source category in bom_notes when useful, but never fabricate a category or row",
     "map real source rows only; never fabricate fallback rows or substitute identity with UNKNOWN, N/A, TBD, TBC, or placeholders",
+    "for Arena HTML exports, apply arena-html-policy.v1: preserve item identities, quantities, and manufacturer pairs exactly; never coerce missing quantities to 1",
 )
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _HASH = re.compile(r"^[0-9a-fA-F]{64}$")
