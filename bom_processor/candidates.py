@@ -39,8 +39,9 @@ class CandidateRequiredError(Exception):
 
 class AggregateCandidateRequiredError(Exception):
     """Several independent source profiles need candidates before processing."""
-    def __init__(self, candidates: tuple[CandidateRequiredError, ...]):
+    def __init__(self, candidates: tuple[CandidateRequiredError, ...], plan_id: str | None = None):
         self.candidates = candidates
+        self.plan_id = plan_id
         super().__init__("candidates required")
 
 

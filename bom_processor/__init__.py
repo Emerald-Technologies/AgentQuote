@@ -31,7 +31,9 @@ from .admin_promotion import AdminDecisionService
 from .candidate_status import CandidateStatusError, CandidateStatusService
 from .candidate_automation import CandidateAutomationService, AzureCandidateJobStarter
 from .candidate_review import CandidateReviewError, CandidateReviewService
-from .semantic import AssemblyIdentity, BomComparison, BomSemantic, compare_boms, normalize_bom
+from .semantic import (AssemblyIdentity, BomComparison, BomReconciliation, BomSemantic,
+                       compare_boms, normalize_bom, reconcile_boms)
+from .package_resolution import PackageResolutionError, ParentPackageService
 
 __all__ = [
     "AzureBlobStorage",
@@ -65,5 +67,7 @@ __all__ = [
     "CandidateStatusError", "CandidateStatusService",
     "CandidateAutomationService", "AzureCandidateJobStarter",
     "CandidateReviewError", "CandidateReviewService",
-    "AssemblyIdentity", "BomComparison", "BomSemantic", "compare_boms", "normalize_bom",
+    "AssemblyIdentity", "BomComparison", "BomReconciliation", "BomSemantic",
+    "compare_boms", "normalize_bom", "reconcile_boms",
+    "PackageResolutionError", "ParentPackageService",
 ]

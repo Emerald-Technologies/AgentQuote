@@ -11,6 +11,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
@@ -19,7 +20,7 @@ _MAX_VALUE_LENGTH = 160
 
 
 def _norm(value: Any) -> str:
-    if value is None:
+    if value is None or (isinstance(value, float) and value != value):
         return ""
     text = unicodedata.normalize("NFKC", str(value)).strip()
     return " ".join(text.split()).casefold()
@@ -107,6 +108,15 @@ class BomComparison:
         return self.relation == "conflict"
 
 
+@dataclass(frozen=True)
+class BomReconciliation:
+    """Deterministic reconciliation of byte-verified parsed BOM rows."""
+
+    relation: str
+    rows: tuple[dict[str, Any], ...]
+    evidence: tuple[dict[str, Any], ...]
+
+
 def semantic_summary(rows: Iterable[Mapping[str, Any]], *, assembly: AssemblyIdentity | None = None) -> dict[str, Any]:
     """Produce bounded, deterministic semantic evidence for a parsed fixture."""
     identity = assembly or AssemblyIdentity("", "")
@@ -135,6 +145,7 @@ def _component(row: Mapping[str, Any]) -> Component:
         raise ValueError("each BOM row requires an item number")
     material = (
         ("category", _norm(_first(row, ("item_category", "category", "type")))),
+        ("unit_of_measure", _norm(_first(row, ("unit_of_measure", "uom", "unit", "units")))),
         ("quantity", _number(_first(row, ("quantity", "qty", "amount")))),
         ("refdes", _refs(_first(row, ("reference_designator", "reference_designators", "refdes", "refs")))),
         ("install", _norm(_first(row, ("install", "installation", "install_type", "mount_type")))),
@@ -183,16 +194,31 @@ def _diff(left: BomSemantic, right: BomSemantic) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     if left.assembly != right.assembly:
         evidence.append({"kind": "assembly_revision", "left": _safe(left.assembly), "right": _safe(right.assembly)})
-    left_by = {component.identity: component for component in left.components}
-    right_by = {component.identity: component for component in right.components}
+    left_by: dict[tuple[str, str], Counter[tuple[tuple[str, Any], ...]]] = {}
+    right_by: dict[tuple[str, str], Counter[tuple[tuple[str, Any], ...]]] = {}
+    for component in left.components:
+        left_by.setdefault(component.identity, Counter())[component.material] += 1
+    for component in right.components:
+        right_by.setdefault(component.identity, Counter())[component.material] += 1
     for identity in sorted(set(left_by) | set(right_by)):
         a, b = left_by.get(identity), right_by.get(identity)
-        if a is None or b is None:
+        if a is None or b is None or sum(a.values()) != sum(b.values()):
             evidence.append({"kind": "component_added_or_missing", "identity": _safe(identity)})
             continue
-        if a.material != b.material:
-            evidence.append({"kind": "material_conflict", "identity": _safe(identity), "left": _safe(a.material), "right": _safe(b.material)})
+        if a != b:
+            evidence.append({"kind": "material_conflict", "identity": _safe(identity),
+                             "left": _safe(tuple(sorted(a.elements()))),
+                             "right": _safe(tuple(sorted(b.elements())))})
     return evidence[:_MAX_EVIDENCE]
+
+
+def _component_groups(model: BomSemantic) -> dict[tuple[tuple[str, str], tuple[tuple[str, Any], ...]], list[Component]]:
+    grouped: dict[tuple[tuple[str, str], tuple[tuple[str, Any], ...]], list[Component]] = {}
+    for component in model.components:
+        grouped.setdefault((component.identity, component.material), []).append(component)
+    for values in grouped.values():
+        values.sort(key=lambda item: json.dumps(item.canonical(), sort_keys=True))
+    return grouped
 
 
 def compare_boms(left_rows: Iterable[Mapping[str, Any]], right_rows: Iterable[Mapping[str, Any]], *,
@@ -210,24 +236,87 @@ def compare_boms(left_rows: Iterable[Mapping[str, Any]], right_rows: Iterable[Ma
     conflicts = _diff(left, right)
     if conflicts:
         return BomComparison("conflict", left.fingerprint, right.fingerprint, tuple(conflicts))
-    left_by = {component.identity: component for component in left.components}
-    right_by = {component.identity: component for component in right.components}
+    left_by = _component_groups(left)
+    right_by = _component_groups(right)
     left_extra = right_extra = False
-    for identity in left_by:
-        a_pairs = dict(left_by[identity].optional).get("manufacturer_mpn", ())
-        b_pairs = dict(right_by[identity].optional).get("manufacturer_mpn", ())
-        left_extra |= not set(a_pairs) <= set(b_pairs)
-        right_extra |= not set(b_pairs) <= set(a_pairs)
+    for key in left_by:
+        for left_component, right_component in zip(left_by[key], right_by[key]):
+            a_pairs = dict(left_component.optional).get("manufacturer_mpn", ())
+            b_pairs = dict(right_component.optional).get("manufacturer_mpn", ())
+            left_extra |= not set(a_pairs) <= set(b_pairs)
+            right_extra |= not set(b_pairs) <= set(a_pairs)
     if not left_extra and not right_extra:
         relation = "equivalent"
     elif right_extra and left_extra:
-        # Incomparable optional alternatives are non-material. Neither fixture
-        # is richer, so they are equivalent for approval purposes.
-        relation = "equivalent"
+        # Disjoint optional alternatives are compatible and are merged during
+        # package reconciliation. They are not semantically equivalent.
+        relation = "compatible"
     else:
         relation = "dominates"
     evidence = []
     if relation == "dominates":
         richer = "right" if right_extra and not left_extra else "left" if left_extra and not right_extra else "both"
         evidence.append({"kind": "optional_enrichment", "side": richer, "field": "manufacturer_mpn"})
+    elif relation == "compatible":
+        evidence.append({"kind": "optional_complement", "field": "manufacturer_mpn"})
     return BomComparison(relation, left.fingerprint, right.fingerprint, tuple(evidence[:_MAX_EVIDENCE]))
+
+
+def reconcile_boms(row_sets: Iterable[Iterable[Mapping[str, Any]]], *,
+                   assembly: AssemblyIdentity) -> BomReconciliation:
+    """Reconcile compatible BOMs without losing duplicate rows or alternatives.
+
+    Every input is normalized as a multiset. Material differences block the
+    operation. Compatible manufacturer/MPN alternatives are unioned in sorted
+    order, with the output schema's eight-pair limit enforced fail closed.
+    """
+    sets = [[dict(row) for row in rows] for rows in row_sets]
+    if not sets:
+        raise ValueError("at least one BOM is required")
+    models = [normalize_bom(rows, assembly) for rows in sets]
+    baseline = models[0]
+    evidence: list[dict[str, Any]] = []
+    relation = "equivalent"
+    for model in models[1:]:
+        conflicts = _diff(baseline, model)
+        if conflicts:
+            return BomReconciliation("conflict", (), tuple(conflicts))
+    grouped_rows: list[dict[tuple[tuple[str, str], tuple[tuple[str, Any], ...]], list[tuple[Component, dict[str, Any]]]]] = []
+    for rows in sets:
+        grouped: dict[tuple[tuple[str, str], tuple[tuple[str, Any], ...]], list[tuple[Component, dict[str, Any]]]] = {}
+        for row in rows:
+            component = _component(row)
+            grouped.setdefault((component.identity, component.material), []).append((component, row))
+        for values in grouped.values():
+            values.sort(key=lambda item: json.dumps(item[0].canonical(), sort_keys=True))
+        grouped_rows.append(grouped)
+    resolved: list[dict[str, Any]] = []
+    for key in sorted(grouped_rows[0]):
+        count = len(grouped_rows[0][key])
+        for occurrence in range(count):
+            entries = [group[key][occurrence] for group in grouped_rows]
+            components = [entry[0] for entry in entries]
+            pair_sets = [set(dict(component.optional).get("manufacturer_mpn", ()))
+                         for component in components]
+            pairs = sorted(set().union(*pair_sets))
+            if len(pairs) > 8:
+                return BomReconciliation("conflict", (), ({
+                    "kind": "manufacturer_mpn_limit", "identity": _safe(key[0]),
+                    "pair_count": len(pairs), "maximum": 8,
+                },))
+            if any(values != pair_sets[0] for values in pair_sets[1:]):
+                relation = "merged"
+            # Start from a deterministic verified row so non-material fields
+            # (description and notes) are retained rather than invented. UOM is a
+            # material field above and must already agree.
+            representative = min((entry[1] for entry in entries),
+                                 key=lambda row: json.dumps(row, sort_keys=True, default=str))
+            row = dict(representative)
+            for index in range(1, 9):
+                row[f"manufacturer_{index}"] = None
+                row[f"manufacturer_item_number_{index}"] = None
+            for index, (manufacturer, mpn) in enumerate(pairs, 1):
+                row[f"manufacturer_{index}"] = manufacturer
+                row[f"manufacturer_item_number_{index}"] = mpn
+            resolved.append(row)
+    return BomReconciliation(relation, tuple(resolved), tuple(evidence))

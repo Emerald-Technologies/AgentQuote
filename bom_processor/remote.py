@@ -125,9 +125,11 @@ class RemoteBomProcessor:
                     pending.append(CandidateRequiredError(
                         candidate.request_id, request.parser_key, profile.profile_hash,
                         tuple(d.document_id for d in documents)))
-                if len(pending) == 1:
+                if (len(pending) == 1 and not selections
+                        and len(pending[0].document_ids) == 1
+                        and len(request.documents) == 1):
                     raise pending[0] from exc
-                raise AggregateCandidateRequiredError(tuple(pending)) from exc
+                self._raise_grouped(request, selections, pending, exc)
             else:
                 if exc.code != "REGISTRY_ABSENT":
                     raise ProcessingError(f"registry:{exc.code}") from exc
@@ -142,9 +144,11 @@ class RemoteBomProcessor:
                 pending.append(CandidateRequiredError(
                     candidate.request_id, request.parser_key, profile.profile_hash,
                     tuple(d.document_id for d in documents)))
-            if len(pending) == 1:
+            if (len(pending) == 1 and not selections
+                    and len(pending[0].document_ids) == 1
+                    and len(request.documents) == 1):
                 raise pending[0]
-            raise AggregateCandidateRequiredError(tuple(pending))
+            self._raise_grouped(request, selections, pending)
         if pending:
             raise AggregateCandidateRequiredError(tuple(pending))
         claim = {"version": CONTRACT_VERSION, "job_id": request.job_id,
@@ -186,10 +190,13 @@ class RemoteBomProcessor:
             _validate_xlsx_bytes(worker_bytes, self.max_rows)
             final_path = f"{prefix}/{document.document_id}-parsed.xlsx"
             self.storage.upload_output_immutable(final_path, worker_bytes, OUTPUT_CONTENT_TYPE)
-            results.append({"source": {"document_id": document.document_id, "blob_path": document.blob_path,
+            result = {"source": {"document_id": document.document_id, "blob_path": document.blob_path,
                          "size_bytes": document.size_bytes, "sha256": document.sha256.lower()},
                          "output": {"blob_path": final_path, "size_bytes": len(worker_bytes),
-                                    "sha256": _sha256(worker_bytes), "content_type": OUTPUT_CONTENT_TYPE}})
+                                    "sha256": _sha256(worker_bytes), "content_type": OUTPUT_CONTENT_TYPE}}
+            if selected is not None:
+                result["parser"] = self._result_parser_provenance(request.parser_key, selected)
+            results.append(result)
         manifest = {"version": CONTRACT_VERSION, "status": "completed", "job_id": request.job_id,
                     "request_fingerprint": fingerprint, "customer_key": request.customer_key,
                     "rfq_uuid": request.rfq_uuid.lower(), "package_version": request.package_version,
@@ -205,6 +212,42 @@ class RemoteBomProcessor:
             manifest["parser"]["selection_mode"] = "legacy"
         self.storage.upload_output_immutable(manifest_path, _json_bytes(manifest), "application/json")
         return manifest
+
+    @staticmethod
+    def _result_parser_provenance(parser_key: str, selection: Any) -> dict[str, Any]:
+        variant = selection.variant
+        return {"key": parser_key, "variant_id": variant.variant_id,
+                "version": variant.version, "approval_id": variant.approval_id,
+                "code_path": variant.code_path, "code_sha256": variant.code_sha256,
+                "signature_hash": variant.signature_hash, "rule_hash": variant.rule_hash,
+                "registry_generation": selection.generation}
+
+    @staticmethod
+    def _approved_assignments(selections: dict[str, Any]) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, str, str], list[str]] = {}
+        for document_id, selection in selections.items():
+            variant = selection.variant
+            key = (variant.variant_id, variant.version, variant.approval_id, variant.code_sha256)
+            grouped.setdefault(key, []).append(document_id)
+        return [{"document_ids": sorted(document_ids), "variant_id": key[0],
+                 "version": key[1], "approval_id": key[2], "code_sha256": key[3]}
+                for key, document_ids in sorted(grouped.items())]
+
+    def _raise_grouped(self, request: ProcessingRequest, selections: dict[str, Any],
+                       pending: list[CandidateRequiredError], cause: Exception | None = None) -> None:
+        from .package_resolution import ParentPackageService
+        plan = ParentPackageService(
+            self.storage, max_source_bytes=self.max_source_bytes,
+            max_output_bytes=self.max_output_bytes, max_rows=self.max_rows).plan(
+                request,
+                approved_assignments=self._approved_assignments(selections),
+                pending_assignments=[{"request_id": item.request_id,
+                                      "document_ids": list(item.document_ids)}
+                                     for item in pending])
+        error = AggregateCandidateRequiredError(tuple(pending), plan["plan_id"])
+        if cause is not None:
+            raise error from cause
+        raise error
 
     def _require_candidate(self, request: ProcessingRequest,
                            verified_sources: dict[str, bytes], cause: Exception) -> None:
@@ -224,9 +267,9 @@ class RemoteBomProcessor:
             errors.append(CandidateRequiredError(candidate.request_id, request.parser_key,
                                                   profile.profile_hash,
                                                   tuple(d.document_id for d in documents)))
-        if len(errors) == 1:
+        if len(errors) == 1 and len(request.documents) == 1:
             raise errors[0] from cause
-        raise AggregateCandidateRequiredError(tuple(errors)) from cause
+        self._raise_grouped(request, {}, errors, cause)
 
     def _poll(self, item: WorkItem, execution: str) -> bytes:
         deadline = self.clock() + self.timeout_seconds

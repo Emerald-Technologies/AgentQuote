@@ -12,6 +12,7 @@ from .core import OUTPUT_CONTENT_TYPE
 from .remote import _validate_xlsx_bytes
 from .arena_policy import verify_evidence
 from .semantic import AssemblyIdentity, compare_boms, normalize_bom
+from .semantic_facts import SemanticFactsError, facts_from_rows
 
 MAX_METADATA_BYTES = 1_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -271,11 +272,21 @@ class CandidateReviewService:
             try:
                 _validate_xlsx_bytes(data, self.max_rows)
                 rows_by_hash[digest] = _parsed_rows(data)
-            except Exception:
+                facts = facts_from_rows(rows_by_hash[digest], output_sha256=output["sha256"])
+            except (Exception, SemanticFactsError):
                 raise CandidateReviewError("REVIEW_OUTPUT_INVALID") from None
             semantic = item.get("semantic")
-            identity = semantic.get("assembly_identity") if isinstance(semantic, dict) else None
-            mapping_required = (not isinstance(identity, dict) or not str(identity.get("name", "")).strip())
+            claimed_identity = semantic.get("assembly_identity") if isinstance(semantic, dict) else None
+            identity = None
+            if facts.assembly is not None:
+                name, revision = facts.assembly.normalized()
+                identity = {"name": name, "revision": revision}
+            if (not isinstance(semantic, dict)
+                    or semantic.get("fingerprint") != facts.fingerprint
+                    or semantic.get("model_summary") != facts.model_summary
+                    or claimed_identity != identity):
+                raise CandidateReviewError("REVIEW_SEMANTIC_BINDING")
+            mapping_required = identity is None
             reviewed.append({
                 "fixture_sha256": digest,
                 "source_aliases": sorted(item.get("source_aliases", []),
@@ -315,6 +326,8 @@ class CandidateReviewService:
                         wins[selected] += 1
                     elif comparison.relation == "equivalent":
                         record["equivalent_aliases"] = [left["fixture_sha256"], right["fixture_sha256"]]
+                    elif comparison.relation == "compatible":
+                        record["compatible_fixtures"] = [left["fixture_sha256"], right["fixture_sha256"]]
                     else:
                         conflicts = True
                     comparisons.append(record)

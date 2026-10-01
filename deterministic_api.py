@@ -41,6 +41,8 @@ from bom_processor import (
     AzureCandidateJobStarter,
     CandidateReviewError,
     CandidateReviewService,
+    PackageResolutionError,
+    ParentPackageService,
 )
 from bom_processor.core import CONTRACT_VERSION
 from bom_processor.master_registry import RegistryError
@@ -57,6 +59,11 @@ REVIEW_FIXTURE_OUTPUT_ROUTE = re.compile(
     r"^/api/v1/parser-candidates/requests/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/"
     r"candidates/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/validations/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/fixtures/([0-9a-fA-F]{64})/output$")
+PACKAGE_ROUTE = re.compile(
+    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(status|review|approve)$")
+PACKAGE_RESOLUTION_ROUTE = re.compile(
+    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(resolve|status|manifest)$")
 
 
 @dataclass(frozen=True)
@@ -157,6 +164,20 @@ def authorize(headers: Any, config: ApiConfig) -> None:
         raise LookupError("caller not allowed")
 
 
+def authenticated_actor(headers: Any, config: ApiConfig) -> str:
+    """Return the verified Easy Auth object ID; never accept a body actor."""
+    authorize(headers, config)
+    if config.auth_mode == "local_disabled":
+        return "local-disabled"
+    object_ids = _claim_values(_decode_principal(headers.get("X-MS-CLIENT-PRINCIPAL", "")), {
+        "oid", "http://schemas.microsoft.com/identity/claims/objectidentifier",
+    })
+    allowed = sorted(object_ids & config.allowed_object_ids)
+    if len(allowed) != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", allowed[0]):
+        raise LookupError("verified actor unavailable")
+    return allowed[0]
+
+
 class ProcessingApi:
     """HTTP-neutral request adapter for deterministic processing."""
 
@@ -218,7 +239,8 @@ class ProcessingApi:
                         group["automation_error"] = "author_start_failed"
             return 202, {"version": CONTRACT_VERSION, "status": "candidates_required",
                          "job_id": request.job_id,
-                         "request_fingerprint": request.fingerprint(), "candidates": groups}
+                         "request_fingerprint": request.fingerprint(), "candidates": groups,
+                         **({"plan_id": exc.plan_id} if exc.plan_id else {})}
         except ProcessingError as exc:
             if str(exc).startswith("registry:PARSER_FORMAT_NOT_RECOGNIZED"):
                 return 422, _error("parser_format_not_recognized", "No approved parser matches the BOM.", request_id)
@@ -327,23 +349,19 @@ class CandidateReviewOutputApi:
             return 403, _error("forbidden", "Caller is not authorized.", response_id)
         except (CandidateReviewError, BlobNotFoundError):
             return 409, _error("review_unavailable", "Parsed BOM review is unavailable.", response_id)
-        except Exception as exc:
-            log.error("Unexpected review output failure; request_id=%s exception_type=%s",
-                      response_id, type(exc).__name__)
-            return 500, _error("internal_error", "An internal error occurred.", response_id)
 
     def handle_fixture(self, headers: Any, request_id: str, candidate_id: str,
                        validation_id: str, fixture_sha256: str) -> tuple[int, bytes | dict[str, Any]]:
         response_id = uuid.uuid4().hex
         try:
             authorize(headers, self.config)
-            evidence = self.service_factory().get_v3(request_id, candidate_id, validation_id)
+            service = self.service_factory()
+            evidence = service.get_v3(request_id, candidate_id, validation_id)
             for group in evidence["groups"]:
                 for fixture in group["fixtures"]:
                     if fixture.get("fixture_sha256", "").lower() == fixture_sha256.lower():
                         output = fixture.get("output", {})
-                        data = self.service_factory().storage.download_candidate(
-                            output.get("blob_path", ""), 50_000_000)
+                        data = service.storage.download_candidate(output.get("blob_path", ""), 50_000_000)
                         import hashlib
                         if (len(data) != output.get("size_bytes")
                                 or hashlib.sha256(data).hexdigest() != output.get("sha256")
@@ -358,6 +376,63 @@ class CandidateReviewOutputApi:
         except (CandidateReviewError, BlobNotFoundError):
             return 409, _error("review_unavailable", "Parsed BOM review is unavailable.", response_id)
 
+
+class PackageApi:
+    """Authenticated adapter for additive package status, approval, and output routes."""
+    def __init__(self, config: ApiConfig, service_factory: Callable[[], ParentPackageService]) -> None:
+        self.config, self.service_factory = config, service_factory
+
+    def handle_get(self, headers: Any, plan_id: str, action: str,
+                   approval_id: str | None = None) -> tuple[int, dict[str, Any]]:
+        response_id = uuid.uuid4().hex
+        try:
+            authorize(headers, self.config)
+            service = self.service_factory()
+            if action in {"status", "review"} and approval_id is None:
+                return 200, service.review(plan_id)
+            if action == "status" and approval_id is not None:
+                return 200, service.resolution_status(plan_id, approval_id)
+            if action == "manifest" and approval_id is not None:
+                return 200, service.manifest(plan_id, approval_id)
+            return 405, _error("method_not_allowed", "Method is not allowed.", response_id)
+        except PermissionError:
+            return 401, _error("unauthenticated", "Authentication is required.", response_id)
+        except LookupError:
+            return 403, _error("forbidden", "Caller is not authorized.", response_id)
+        except (PackageResolutionError, BlobNotFoundError):
+            return 409, _error("package_unavailable", "Package state is unavailable.", response_id)
+
+    def handle_post(self, headers: Any, plan_id: str, action: str, body: bytes,
+                    approval_id: str | None = None) -> tuple[int, dict[str, Any]]:
+        response_id = uuid.uuid4().hex
+        try:
+            actor = authenticated_actor(headers, self.config)
+            value = json.loads(body.decode("utf-8"))
+            if not isinstance(value, dict) or any(key in value for key in ("actor", "actor_id", "approver")):
+                raise ValueError
+            service = self.service_factory()
+            if action == "approve" and approval_id is None:
+                allowed = {"review_manifest_sha256", "assembly_mappings", "conflict_dispositions", "reason", "ticket"}
+                if set(value) - allowed or not isinstance(value.get("review_manifest_sha256"), str):
+                    raise ValueError
+                return 200, service.approve(plan_id=plan_id, approver=actor, **value)
+            if action == "resolve" and approval_id is not None and not value:
+                return 200, service.resolve(plan_id=plan_id, approval_id=approval_id)
+            raise ValueError
+        except PermissionError:
+            return 401, _error("unauthenticated", "Authentication is required.", response_id)
+        except LookupError:
+            return 403, _error("forbidden", "Caller is not authorized.", response_id)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return 400, _error("invalid_json", "Request body must be valid JSON.", response_id)
+        except ValueError:
+            return 422, _error("invalid_request", "Package request is invalid.", response_id)
+        except (PackageResolutionError, BlobNotFoundError, BlobConflictError):
+            return 409, _error("package_unavailable", "Package operation could not be completed.", response_id)
+        except Exception as exc:
+            log.error("Unexpected review output failure; request_id=%s exception_type=%s",
+                      response_id, type(exc).__name__)
+            return 500, _error("internal_error", "An internal error occurred.", response_id)
 
 def _decision_request(value: Any) -> dict[str, Any]:
     """Bind both deployed camelCase and service snake_case names, strictly."""
@@ -526,7 +601,8 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
 
 def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
                  status_api: CandidateStatusApi | None = None,
-                 review_output_api: CandidateReviewOutputApi | None = None) -> type[BaseHTTPRequestHandler]:
+                 review_output_api: CandidateReviewOutputApi | None = None,
+                 package_api: PackageApi | None = None) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "AgentQuoteDeterministicAPI/1"
 
@@ -546,6 +622,17 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             # Windows with unread bytes can reset the connection before the
             # client receives the intended HTTP error response.
             body = self.rfile.read(length)
+            package_match = PACKAGE_ROUTE.fullmatch(self.path)
+            resolution_match = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
+            if package_match and package_match.group(2) == "approve" and package_api is not None:
+                status, payload = package_api.handle_post(self.headers, package_match.group(1), "approve", body)
+                self._write(status, payload)
+                return
+            if resolution_match and resolution_match.group(3) == "resolve" and package_api is not None:
+                status, payload = package_api.handle_post(
+                    self.headers, resolution_match.group(1), "resolve", body, resolution_match.group(2))
+                self._write(status, payload)
+                return
             if self.path not in {ROUTE, DECISION_ROUTE}:
                 self._write(404, _error("not_found", "Route was not found.", uuid.uuid4().hex))
                 return
@@ -557,6 +644,17 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self._write(status, payload)
 
         def do_GET(self) -> None:  # noqa: N802
+            package_match = PACKAGE_ROUTE.fullmatch(self.path)
+            if package_match and package_match.group(2) in {"status", "review"} and package_api is not None:
+                status, payload = package_api.handle_get(self.headers, *package_match.groups())
+                self._write(status, payload)
+                return
+            resolution_match = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
+            if resolution_match and resolution_match.group(3) in {"status", "manifest"} and package_api is not None:
+                status, payload = package_api.handle_get(
+                    self.headers, resolution_match.group(1), resolution_match.group(3), resolution_match.group(2))
+                self._write(status, payload)
+                return
             fixture_match = REVIEW_FIXTURE_OUTPUT_ROUTE.fullmatch(self.path)
             if fixture_match:
                 if review_output_api is None:
@@ -630,8 +728,9 @@ def main() -> None:
                         if config.candidate_automation_enabled else None)))
     review_output_api = CandidateReviewOutputApi(
         config, lambda: CandidateReviewService(_storage_factory()))
+    package_api = PackageApi(config, lambda: ParentPackageService(_storage_factory()))
     server = ThreadingHTTPServer(
-        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api))
+        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api, package_api))
     log.info("Deterministic BOM API listening on port %d", config.port)
     server.serve_forever()
 

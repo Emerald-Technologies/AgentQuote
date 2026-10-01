@@ -17,7 +17,7 @@ from .remote import _validate_xlsx_bytes
 from .master_registry import html_table_rows
 from .candidates import unique_fixtures
 from .arena_policy import is_arena_source, validate as validate_arena
-from .semantic import AssemblyIdentity, normalize_bom
+from .semantic_facts import SemanticFactsError, facts_from_rows
 
 VALIDATION_VERSION = "candidate-validation.v3"
 MAX_METADATA_BYTES = 1_000_000
@@ -60,14 +60,13 @@ def _semantic_output(output: bytes, source: bytes, subtype: str) -> dict[str, An
             # misclassified as html_table_xls). Fall back to output-only
             # semantic validation: identity and quantity checks already passed.
                 parsed_rows = frame.to_dict(orient="records")
-                model = normalize_bom(parsed_rows, AssemblyIdentity("", ""))
-                mpn_count = sum(bool(str(row.get(f"manufacturer_item_number_{index}", "") or "").strip())
-                        for row in parsed_rows for index in range(1, 9))
+                facts = facts_from_rows(parsed_rows)
                 return {"valid": True, "result": "valid", "source_rows": 0,
                     "output_rows": output_rows, "coverage_basis": "output_only",
-                    "fingerprint": model.fingerprint, "assembly_identity": None,
-                    "mapping_required": True,
-                    "model_summary": {"component_count": len(model.components), "mpn_count": mpn_count}}
+                    "fingerprint": facts.fingerprint,
+                    "assembly_identity": _assembly_dict(facts.assembly),
+                    "mapping_required": facts.assembly is None,
+                    "model_summary": facts.model_summary}
         header_index = next((i for i, row in enumerate(rows) if sum(bool(cell.strip()) for cell in row) >= 2), None)
         if header_index is None:
             return {**base, "coverage_basis": "source_header"}
@@ -78,18 +77,23 @@ def _semantic_output(output: bytes, source: bytes, subtype: str) -> dict[str, An
             return {**base, "source_rows": source_rows, "coverage_basis": "source_rows_and_identity"}
         coverage_basis = "source_rows_and_identity"
     parsed_rows = frame.to_dict(orient="records")
-    parent = next((row for row in parsed_rows if _norm(row.get("item_category")) == "DOCUMENT"), None)
-    assembly = AssemblyIdentity(str((parent or {}).get("item_number", "")).strip(),
-                                str((parent or {}).get("revision", "")).strip())
-    model = normalize_bom(parsed_rows, assembly)
-    assembly_identity = ({"name": model.assembly[0], "revision": model.assembly[1]}
-                         if any(model.assembly) else None)
-    mpn_count = sum(bool(str(row.get(f"manufacturer_item_number_{index}", "") or "").strip())
-                    for row in parsed_rows for index in range(1, 9))
+    try:
+        facts = facts_from_rows(parsed_rows)
+    except SemanticFactsError:
+        return {**base, "source_rows": source_rows,
+                "coverage_basis": "assembly_identity_conflict"}
     return {"valid": True, "result": "valid", "source_rows": source_rows, "output_rows": output_rows,
-            "coverage_basis": coverage_basis, "fingerprint": model.fingerprint,
-            "assembly_identity": assembly_identity, "mapping_required": assembly_identity is None,
-            "model_summary": {"component_count": len(model.components), "mpn_count": mpn_count}}
+            "coverage_basis": coverage_basis, "fingerprint": facts.fingerprint,
+            "assembly_identity": _assembly_dict(facts.assembly),
+            "mapping_required": facts.assembly is None,
+            "model_summary": facts.model_summary}
+
+
+def _assembly_dict(assembly: Any) -> dict[str, str] | None:
+    if assembly is None:
+        return None
+    name, revision = assembly.normalized()
+    return {"name": name, "revision": revision}
 
 
 class CandidateValidationError(ValueError):

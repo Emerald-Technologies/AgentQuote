@@ -17,6 +17,7 @@ from bom_processor import (
 )
 from bom_processor.admin_promotion import AdminDecisionService
 from bom_processor.core import CANONICAL_COLUMNS, OUTPUT_CONTENT_TYPE
+from bom_processor.semantic_facts import facts_from_xlsx
 from deterministic_api import (
     ApiConfig,
     CandidateReviewOutputApi,
@@ -25,15 +26,22 @@ from deterministic_api import (
 )
 
 
-def workbook(*, quantity=2, extra_mpn=None):
+def workbook(*, quantity=2, extra_mpn=None, assembly="BOARD-1"):
+    rows = []
+    if assembly:
+        document = {name: None for name in CANONICAL_COLUMNS}
+        document.update(line_number=1, item_number=assembly, item_name=assembly,
+                        revision="A", item_category="Document", quantity=1)
+        rows.append(document)
     row = {name: None for name in CANONICAL_COLUMNS}
-    row.update(line_number=1, item_number="R1", item_name="Resistor",
+    row.update(line_number=len(rows) + 1, item_number="R1", item_name="Resistor",
                item_category="Part", quantity=quantity,
                manufacturer_1="Acme", manufacturer_item_number_1="100")
     if extra_mpn:
         row.update(manufacturer_2="Other", manufacturer_item_number_2=extra_mpn)
     stream = io.BytesIO()
-    pd.DataFrame([row], columns=CANONICAL_COLUMNS).to_excel(stream, index=False)
+    rows.append(row)
+    pd.DataFrame(rows, columns=CANONICAL_COLUMNS).to_excel(stream, index=False)
     return stream.getvalue()
 
 
@@ -41,7 +49,8 @@ def grouped_storage(*, second_quantity=2, second_extra_mpn=None, second_identity
     request_id, candidate_id, validation_id = "request-1", "candidate-1", "validation-1"
     code = b"# parser\n"
     code_hash = hashlib.sha256(code).hexdigest()
-    outputs = [workbook(), workbook(quantity=second_quantity, extra_mpn=second_extra_mpn)]
+    outputs = [workbook(), workbook(quantity=second_quantity, extra_mpn=second_extra_mpn,
+                                    assembly=second_identity)]
     sources = [b"source-one", b"source-two"]
     source_items = []
     fixtures = []
@@ -64,6 +73,7 @@ def grouped_storage(*, second_quantity=2, second_extra_mpn=None, second_identity
         source_blobs[source_path] = source
         candidates[output_path] = output
         identity = "BOARD-1" if index == 1 else second_identity
+        facts = facts_from_xlsx(output)
         fixtures.append({
             "fixture_sha256": digest, "document_id": f"doc-{index}",
             "source_aliases": [alias], "status": "passed",
@@ -71,11 +81,11 @@ def grouped_storage(*, second_quantity=2, second_extra_mpn=None, second_identity
                        "size_bytes": len(output), "content_type": OUTPUT_CONTENT_TYPE},
             "schema": {"valid": True},
             "semantic": {"valid": True, "result": "valid",
-                         "fingerprint": hashlib.sha256(output).hexdigest(),
-                         "assembly_identity": ({"name": identity, "revision": "A"}
+                         "fingerprint": facts.fingerprint,
+                         "assembly_identity": ({"name": identity.casefold(), "revision": "a"}
                                                if identity else None),
                          "mapping_required": not identity,
-                         "model_summary": {"component_count": 1}},
+                         "model_summary": facts.model_summary},
         })
     evidence_path = f"candidates/{request_id}/{candidate_id}/validation/{validation_id}/evidence.json"
     candidates[evidence_path] = json.dumps({
@@ -221,6 +231,20 @@ def test_aggregate_candidate_response_starts_every_group_and_reports_parent_iden
     assert automation.calls == ["request-1", "request-2"]
     assert response["job_id"] == "job1" and len(response["request_fingerprint"]) == 64
     assert response["candidates"][1]["automation_error"] == "author_start_failed"
+
+
+def test_aggregate_candidate_response_adds_parent_plan_id_when_available():
+    errors = (CandidateRequiredError("request-1", "Parser1", "a" * 64, ("doc-1",)),
+              CandidateRequiredError("request-2", "Parser1", "b" * 64, ("doc-2",)))
+    class Processor:
+        def process(self, request):
+            raise AggregateCandidateRequiredError(errors, "c" * 64)
+    value = {"job_id": "job1", "customer_key": "cust", "parser_key": "Parser1",
+             "rfq_uuid": "12345678-1234-4234-8234-123456789012", "package_version": "v1",
+             "documents": [{"document_id": "doc1", "blob_path": "cust/rfq-12345678-1234-4234-8234-123456789012/package-v1/original-boms/doc1.csv",
+                            "size_bytes": 1, "sha256": "0" * 64}]}
+    status, response = ProcessingApi(config(), Processor).handle(Message(), json.dumps(value).encode())
+    assert status == 202 and response["plan_id"] == "c" * 64
 
 
 def test_fixture_output_endpoint_rechecks_bytes_after_review():
