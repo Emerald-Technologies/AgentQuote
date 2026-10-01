@@ -121,7 +121,7 @@ def test_valid_candidate_uses_worker_and_records_immutable_transition():
     evidence = json.loads(storage.candidates[result.evidence_path])
     assert evidence["candidate"]["sha256"] == hashlib.sha256(CODE.encode()).hexdigest()
     assert evidence["fixtures"][0]["sha256"] == hashlib.sha256(SOURCE).hexdigest()
-    assert evidence["output"]["sha256"] == hashlib.sha256(workbook()).hexdigest()
+    assert evidence["output"]["sha256"] == hashlib.sha256(orchestrator.output).hexdigest()
     assert evidence["schema"] == {"valid": True, "result": "valid"}
     assert evidence["worker"]["execution_name"] == "execution-1"
     event = f"candidates/events/{request.request_id}/{candidate.candidate_id}/validated-{result.validation_id}.json"

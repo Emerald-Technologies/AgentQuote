@@ -284,6 +284,40 @@ class ParentPackageService:
             raise PackageResolutionError("RESOLVED_OUTPUT_ABSENT")
         return self._validate_resolved(raw, plan, approval, prefix)
 
+    def approval(self, plan_id: str) -> dict[str, Any]:
+        """Recover the sole immutable approval for a plan without writing state."""
+        _ids(plan_id)
+        self._plan(plan_id)
+        prefix = f"packages/{plan_id}/approvals/"
+        try:
+            # Read a bounded approval collection rather than asking the storage
+            # adapter for only two entries. The adapter intentionally raises
+            # when a prefix exceeds its limit; using the maximum supported
+            # bound ensures ordinary multi-approval states (including 3+) are
+            # classified as ambiguity rather than infrastructure failure.
+            paths = self.storage.list_registry_paths(prefix, 100)
+        except Exception as exc:
+            raise PackageResolutionError("PACKAGE_APPROVAL_LOOKUP_FAILED") from exc
+        if not paths:
+            raise PackageResolutionError("PACKAGE_APPROVAL_ABSENT")
+        if len(paths) > 1:
+            raise PackageResolutionError("PACKAGE_APPROVAL_AMBIGUOUS")
+        match = re.fullmatch(re.escape(prefix) + r"([0-9a-f]{64})\.json", paths[0])
+        if match is None:
+            raise PackageResolutionError("PACKAGE_APPROVAL_LOOKUP_INVALID")
+        return self._bound_approval(plan_id, match.group(1))
+
+    def resolved_workbook(self, plan_id: str, approval_id: str, group_id: str) -> bytes:
+        """Return one byte-verified published workbook without writing state."""
+        _ids(plan_id, approval_id, group_id)
+        manifest = self.manifest(plan_id, approval_id)
+        matches = [item for item in manifest["results"]
+                   if isinstance(item, dict) and item.get("group_id") == group_id]
+        if len(matches) != 1:
+            raise PackageResolutionError("RESOLVED_OUTPUT_GROUP_INVALID")
+        return self._output_bytes(matches[0].get("output"),
+                                  f"{self._resolved_prefix(plan_id, approval_id)}/objects/")
+
     def resolution_status(self, plan_id: str, approval_id: str) -> dict[str, Any]:
         """Read existing approval/manifest state only; never triggers resolution."""
         _ids(plan_id, approval_id)

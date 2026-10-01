@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from bom_processor import (InMemoryStorage, PackageResolutionError,
-                           ParentPackageService, ProcessingRequest,
+                           ParentPackageService, ProcessingError, ProcessingRequest,
                            CandidateStatusService, CandidateValidationService)
 from bom_processor.core import CANONICAL_COLUMNS, OUTPUT_CONTENT_TYPE
 from bom_processor.core import _json_bytes
@@ -423,6 +423,119 @@ def test_manifest_and_resolution_status_read_state_without_side_effects():
     assert unknown["status"] == "unknown" and unknown["approval"] is None
 
 
+def test_approval_lookup_is_bounded_exact_and_read_only():
+    request, store = request_and_store()
+    service = ParentPackageService(store)
+    package = plan(service, request)
+    before = (dict(store.registry), dict(store.outputs), dict(store.candidates))
+    with pytest.raises(PackageResolutionError, match="PACKAGE_APPROVAL_ABSENT"):
+        service.approval(package["plan_id"])
+    assert before == (store.registry, store.outputs, store.candidates)
+
+    _, approval = approve(service, package)
+    calls = []
+    original = store.list_registry_paths
+    def tracked(prefix, limit):
+        calls.append((prefix, limit))
+        return original(prefix, limit)
+    store.list_registry_paths = tracked
+    before = (dict(store.registry), dict(store.outputs), dict(store.candidates))
+    assert service.approval(package["plan_id"]) == approval
+    assert calls == [(f"packages/{package['plan_id']}/approvals/", 100)]
+    assert before == (store.registry, store.outputs, store.candidates)
+
+
+def test_approval_lookup_rejects_ambiguous_malformed_and_list_failure():
+    request, store = request_and_store()
+    service = ParentPackageService(store)
+    package = plan(service, request)
+    _, approval = approve(service, package)
+    prefix = f"packages/{package['plan_id']}/approvals/"
+    store.registry[prefix + "f" * 64 + ".json"] = _json_bytes(approval)
+    with pytest.raises(PackageResolutionError, match="PACKAGE_APPROVAL_AMBIGUOUS"):
+        service.approval(package["plan_id"])
+    del store.registry[prefix + "f" * 64 + ".json"]
+    path = prefix + approval["approval_id"] + ".json"
+    store.registry[prefix + "malformed.json"] = store.registry.pop(path)
+    with pytest.raises(PackageResolutionError, match="PACKAGE_APPROVAL_LOOKUP_INVALID"):
+        service.approval(package["plan_id"])
+    store.list_registry_paths = lambda *_: (_ for _ in ()).throw(ProcessingError("private"))
+    with pytest.raises(PackageResolutionError, match="PACKAGE_APPROVAL_LOOKUP_FAILED"):
+        service.approval(package["plan_id"])
+
+
+def test_approval_lookup_classifies_three_approvals_as_ambiguous():
+    request, store = request_and_store()
+    service = ParentPackageService(store)
+    package = plan(service, request)
+    _, approval = approve(service, package)
+    prefix = f"packages/{package['plan_id']}/approvals/"
+    store.registry[prefix + "e" * 64 + ".json"] = _json_bytes(approval)
+    store.registry[prefix + "f" * 64 + ".json"] = _json_bytes(approval)
+    with pytest.raises(PackageResolutionError, match="PACKAGE_APPROVAL_AMBIGUOUS"):
+        service.approval(package["plan_id"])
+
+
+def test_resolved_workbook_returns_exact_reverified_bytes_and_is_read_only():
+    request, store = request_and_store()
+    service = ParentPackageService(store)
+    package = plan(service, request)
+    _, approval = approve(service, package)
+    manifest = service.resolve(plan_id=package["plan_id"], approval_id=approval["approval_id"])
+    result = manifest["results"][0]
+    expected = store.outputs[result["output"]["blob_path"]]
+    before = (dict(store.registry), dict(store.outputs), dict(store.candidates))
+    assert service.resolved_workbook(package["plan_id"], approval["approval_id"], result["group_id"]) == expected
+    assert before == (store.registry, store.outputs, store.candidates)
+    with pytest.raises(PackageResolutionError, match="RESOLVED_OUTPUT_GROUP_INVALID"):
+        service.resolved_workbook(package["plan_id"], approval["approval_id"], "unknown")
+
+
+def test_resolved_workbook_validates_every_manifest_output_group():
+    identities = [("Board-A", "A"), ("Board-B", "A")]
+    request, store = request_and_store(
+        outputs=[package_workbook(assembly=identity) for identity in identities],
+        identities=identities,
+    )
+    service = ParentPackageService(store)
+    package = plan(service, request)
+    _, approval = approve(service, package)
+    manifest = service.resolve(plan_id=package["plan_id"], approval_id=approval["approval_id"])
+    assert len(manifest["results"]) == 2
+    requested, other = manifest["results"]
+    store.outputs[other["output"]["blob_path"]] = b"tampered"
+    with pytest.raises(PackageResolutionError, match="RESOLVED_OUTPUT_CONFLICT"):
+        service.resolved_workbook(
+            package["plan_id"], approval["approval_id"], requested["group_id"])
+
+
+@pytest.mark.parametrize("tamper", ["manifest", "output", "path", "schema"])
+def test_resolved_workbook_fails_closed_on_tampered_publication(tamper):
+    request, store = request_and_store()
+    service = ParentPackageService(store)
+    package = plan(service, request)
+    _, approval = approve(service, package)
+    manifest = service.resolve(plan_id=package["plan_id"], approval_id=approval["approval_id"])
+    result = manifest["results"][0]
+    manifest_path = (f"packages/{package['plan_id']}/resolved/{approval['approval_id']}/"
+                     "resolved-output-manifest.v1.json")
+    if tamper == "output":
+        store.outputs[result["output"]["blob_path"]] = b"tampered"
+    else:
+        if tamper == "manifest":
+            manifest["plan_sha256"] = "f" * 64
+        elif tamper == "path":
+            manifest["results"][0]["output"]["blob_path"] = "elsewhere/output.xlsx"
+        else:
+            manifest["results"][0]["output"]["extra"] = True
+        identity = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+        manifest["manifest_sha256"] = hashlib.sha256(json.dumps(
+            identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        store.outputs[manifest_path] = json.dumps(manifest).encode()
+    with pytest.raises(PackageResolutionError, match="RESOLVED_OUTPUT_CONFLICT"):
+        service.resolved_workbook(package["plan_id"], approval["approval_id"], result["group_id"])
+
+
 def api_config():
     return ApiConfig("127.0.0.1", 0, "easy_auth", frozenset(), frozenset({"admin-1"}),
                      100_000, 1, {})
@@ -462,16 +575,41 @@ def test_package_api_get_routes_are_read_only():
         def resolution_status(self, plan_id, approval_id):
             self.calls.append(("status", plan_id, approval_id))
             return {"status": "resolved"}
+        def approval(self, plan_id):
+            self.calls.append(("approval", plan_id))
+            return {"approval_id": "approval-1"}
+        def resolved_workbook(self, plan_id, approval_id, group_id):
+            self.calls.append(("output", plan_id, approval_id, group_id))
+            return b"xlsx"
     service = Service()
     api = PackageApi(api_config(), lambda: service)
     assert api.handle_get(auth_headers(), "plan-1", "status")[1]["plan_id"] == "plan-1"
     assert api.handle_get(auth_headers(), "plan-1", "review")[1]["plan_id"] == "plan-1"
     assert api.handle_get(auth_headers(), "plan-1", "manifest", "approval-1")[1]["version"] == "resolved-output-manifest.v1"
     assert api.handle_get(auth_headers(), "plan-1", "status", "approval-1")[1]["status"] == "resolved"
+    assert api.handle_get(auth_headers(), "plan-1", "approval")[1]["approval_id"] == "approval-1"
+    assert api.handle_output(auth_headers(), "plan-1", "approval-1", "group-1") == (200, b"xlsx")
     assert service.calls == [("review", "plan-1"), ("review", "plan-1"),
                              ("manifest", "plan-1", "approval-1"),
-                             ("status", "plan-1", "approval-1")]
+                             ("status", "plan-1", "approval-1"),
+                             ("approval", "plan-1"),
+                             ("output", "plan-1", "approval-1", "group-1")]
     # Unknown actions are rejected without touching the service.
     assert api.handle_get(auth_headers(), "plan-1", "output")[0] == 405
     assert api.handle_get(auth_headers(), "plan-1", "resolve")[0] == 405
-    assert len(service.calls) == 4
+    assert len(service.calls) == 6
+
+
+def test_package_api_get_auth_and_failures_are_safe():
+    class Service:
+        def approval(self, _plan_id):
+            raise PackageResolutionError("private")
+        def resolved_workbook(self, *_args):
+            raise RuntimeError("secret")
+    api = PackageApi(api_config(), Service)
+    assert api.handle_get(Message(), "plan-1", "approval")[0] == 401
+    assert api.handle_get(auth_headers("other"), "plan-1", "approval")[0] == 403
+    status, payload = api.handle_get(auth_headers(), "plan-1", "approval")
+    assert status == 409 and "private" not in json.dumps(payload)
+    status, payload = api.handle_output(auth_headers(), "plan-1", "approval-1", "group-1")
+    assert status == 500 and "secret" not in json.dumps(payload)

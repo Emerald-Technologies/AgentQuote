@@ -60,10 +60,14 @@ REVIEW_FIXTURE_OUTPUT_ROUTE = re.compile(
     r"candidates/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/validations/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/fixtures/([0-9a-fA-F]{64})/output$")
 PACKAGE_ROUTE = re.compile(
-    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(status|review|approve)$")
+    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(status|review|approve|approval)$")
 PACKAGE_RESOLUTION_ROUTE = re.compile(
     r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(resolve|status|manifest)$")
+PACKAGE_OUTPUT_ROUTE = re.compile(
+    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/groups/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/output$")
 
 
 @dataclass(frozen=True)
@@ -390,6 +394,8 @@ class PackageApi:
             service = self.service_factory()
             if action in {"status", "review"} and approval_id is None:
                 return 200, service.review(plan_id)
+            if action == "approval" and approval_id is None:
+                return 200, service.approval(plan_id)
             if action == "status" and approval_id is not None:
                 return 200, service.resolution_status(plan_id, approval_id)
             if action == "manifest" and approval_id is not None:
@@ -401,6 +407,27 @@ class PackageApi:
             return 403, _error("forbidden", "Caller is not authorized.", response_id)
         except (PackageResolutionError, BlobNotFoundError):
             return 409, _error("package_unavailable", "Package state is unavailable.", response_id)
+        except Exception as exc:
+            log.error("Unexpected package GET failure; request_id=%s exception_type=%s",
+                      response_id, type(exc).__name__)
+            return 500, _error("internal_error", "An internal error occurred.", response_id)
+
+    def handle_output(self, headers: Any, plan_id: str, approval_id: str,
+                      group_id: str) -> tuple[int, bytes | dict[str, Any]]:
+        response_id = uuid.uuid4().hex
+        try:
+            authorize(headers, self.config)
+            return 200, self.service_factory().resolved_workbook(plan_id, approval_id, group_id)
+        except PermissionError:
+            return 401, _error("unauthenticated", "Authentication is required.", response_id)
+        except LookupError:
+            return 403, _error("forbidden", "Caller is not authorized.", response_id)
+        except (PackageResolutionError, BlobNotFoundError):
+            return 409, _error("package_unavailable", "Package output is unavailable.", response_id)
+        except Exception as exc:
+            log.error("Unexpected package output failure; request_id=%s exception_type=%s",
+                      response_id, type(exc).__name__)
+            return 500, _error("internal_error", "An internal error occurred.", response_id)
 
     def handle_post(self, headers: Any, plan_id: str, action: str, body: bytes,
                     approval_id: str | None = None) -> tuple[int, dict[str, Any]]:
@@ -645,9 +672,14 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
 
         def do_GET(self) -> None:  # noqa: N802
             package_match = PACKAGE_ROUTE.fullmatch(self.path)
-            if package_match and package_match.group(2) in {"status", "review"} and package_api is not None:
+            if package_match and package_match.group(2) in {"status", "review", "approval"} and package_api is not None:
                 status, payload = package_api.handle_get(self.headers, *package_match.groups())
                 self._write(status, payload)
+                return
+            output_match = PACKAGE_OUTPUT_ROUTE.fullmatch(self.path)
+            if output_match and package_api is not None:
+                status, payload = package_api.handle_output(self.headers, *output_match.groups())
+                self._write_binary(status, payload) if isinstance(payload, bytes) else self._write(status, payload)
                 return
             resolution_match = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
             if resolution_match and resolution_match.group(3) in {"status", "manifest"} and package_api is not None:

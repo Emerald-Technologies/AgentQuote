@@ -8,6 +8,7 @@ before this module can serve as a production security boundary.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -224,17 +225,38 @@ class AzureBlobStorage:
     def download_registry(self, path: str, max_bytes: int) -> bytes:
         return self._download_bounded(self._parsers.get_blob_client(path), max_bytes)
 
-    def upload_registry_immutable(self, path: str, data: bytes, content_type: str) -> None:
+    @staticmethod
+    def _upload_immutable(container: Any, path: str, data: bytes, content_type: str,
+                          artifact: str) -> None:
+        """Create or verify an immutable blob without leaking SDK failures."""
         from azure.core.exceptions import ResourceExistsError
         from azure.storage.blob import ContentSettings
-        client = self._parsers.get_blob_client(path)
+        client = container.get_blob_client(path)
         try:
-            client.upload_blob(data, overwrite=False, content_settings=ContentSettings(content_type=content_type))
+            client.upload_blob(data, overwrite=False,
+                               content_settings=ContentSettings(content_type=content_type))
+            return
         except ResourceExistsError as exc:
-            if self._download_bounded(client, len(data) + 1) != data:
-                raise BlobConflictError("immutable registry conflict") from exc
+            conflict_cause = exc
         except Exception as exc:
-            raise ProcessingError("registry upload failed") from exc
+            raise ProcessingError(f"{artifact} upload failed") from exc
+        try:
+            properties = client.get_blob_properties()
+            if properties.size != len(data):
+                raise BlobConflictError(f"immutable {artifact} conflict") from conflict_cause
+            existing = client.download_blob(
+                offset=0, length=len(data) + 1, max_concurrency=1).readall()
+            if len(existing) > len(data):
+                raise BlobConflictError(f"immutable {artifact} conflict") from conflict_cause
+        except BlobConflictError:
+            raise
+        except Exception as exc:
+            raise ProcessingError(f"existing {artifact} verification failed") from exc
+        if existing != data:
+            raise BlobConflictError(f"immutable {artifact} conflict") from conflict_cause
+
+    def upload_registry_immutable(self, path: str, data: bytes, content_type: str) -> None:
+        self._upload_immutable(self._parsers, path, data, content_type, "registry")
 
     def download_registry_with_etag(self, path: str, max_bytes: int) -> tuple[bytes, str]:
         client = self._parsers.get_blob_client(path)
@@ -289,36 +311,13 @@ class AzureBlobStorage:
             raise
 
     def upload_output_immutable(self, path: str, data: bytes, content_type: str) -> None:
-        from azure.core.exceptions import ResourceExistsError
-        from azure.storage.blob import ContentSettings
-        client = self._sources.get_blob_client(path)
-        try:
-            client.upload_blob(data, overwrite=False, content_settings=ContentSettings(content_type=content_type))
-        except ResourceExistsError as exc:
-            try:
-                if client.get_blob_properties().size != len(data):
-                    raise BlobConflictError("immutable output conflict") from exc
-            except BlobConflictError:
-                raise
-            except Exception as compare_exc:
-                raise ProcessingError("existing output verification failed") from compare_exc
-            if self._download_bounded(client, len(data)) != data:
-                raise BlobConflictError("immutable output conflict") from exc
-        except Exception as exc:
-            raise ProcessingError("output upload failed") from exc
+        self._upload_immutable(self._sources, path, data, content_type, "output")
 
     def download_candidate(self, path: str, max_bytes: int) -> bytes:
         return self._download_bounded(self._parsers.get_blob_client(path), max_bytes)
 
     def upload_candidate_immutable(self, path: str, data: bytes, content_type: str) -> None:
-        from azure.core.exceptions import ResourceExistsError
-        from azure.storage.blob import ContentSettings
-        client = self._parsers.get_blob_client(path)
-        try:
-            client.upload_blob(data, overwrite=False, content_settings=ContentSettings(content_type=content_type))
-        except ResourceExistsError as exc:
-            if self._download_bounded(client, len(data) + 1) != data:
-                raise BlobConflictError("immutable candidate conflict") from exc
+        self._upload_immutable(self._parsers, path, data, content_type, "candidate")
 
     def list_candidate_paths(self, prefix: str, max_results: int) -> list[str]:
         if (not isinstance(prefix, str) or "\\" in prefix or not prefix.startswith("candidates/")
@@ -327,7 +326,8 @@ class AzureBlobStorage:
         if type(max_results) is not int or not 1 <= max_results <= 100:
             raise ProcessingError("invalid candidate list limit")
         try:
-            paths = [item.name for item in self._parsers.list_blobs(name_starts_with=prefix)]
+            blobs = self._parsers.list_blobs(name_starts_with=prefix)
+            paths = [item.name for item in itertools.islice(blobs, max_results + 1)]
         except Exception as exc:
             raise ProcessingError("candidate list failed") from exc
         if len(paths) > max_results:
@@ -341,7 +341,8 @@ class AzureBlobStorage:
         if type(max_results) is not int or not 1 <= max_results <= 100:
             raise ProcessingError("invalid registry list limit")
         try:
-            paths = [item.name for item in self._parsers.list_blobs(name_starts_with=prefix)]
+            blobs = self._parsers.list_blobs(name_starts_with=prefix)
+            paths = [item.name for item in itertools.islice(blobs, max_results + 1)]
         except Exception as exc:
             raise ProcessingError("registry list failed") from exc
         if len(paths) > max_results:

@@ -100,3 +100,38 @@ def test_review_output_route_returns_bound_xlsx():
             assert response.headers["Content-Disposition"] == 'attachment; filename="parsed-bom.xlsx"'
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_package_approval_and_exact_output_routes_dispatch_with_binary_headers():
+    config = ApiConfig(
+        host="127.0.0.1", port=0, auth_mode="local_disabled",
+        allowed_app_ids=frozenset(), allowed_object_ids=frozenset(),
+        max_body_bytes=4096, max_concurrent_jobs=1, processor_options={},
+    )
+    class PackageApi:
+        def handle_get(self, _headers, plan_id, action, approval_id=None):
+            assert (plan_id, action, approval_id) == ("plan-1", "approval", None)
+            return 200, {"approval_id": "a" * 64}
+        def handle_output(self, _headers, plan_id, approval_id, group_id):
+            assert (plan_id, approval_id, group_id) == ("plan-1", "a" * 64, "group-1")
+            return 200, b"resolved-xlsx"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
+        ProcessingApi(config, Processor), package_api=PackageApi()))
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    try:
+        root = f"http://127.0.0.1:{server.server_address[1]}/api/v1/bom-packages/plan-1"
+        with urlopen(root + "/approval", timeout=2) as response:
+            assert json.load(response)["approval_id"] == "a" * 64
+        with urlopen(root + "/approvals/" + "a" * 64 + "/groups/group-1/output", timeout=2) as response:
+            assert response.read() == b"resolved-xlsx"
+            assert response.headers.get_content_type() == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            assert response.headers["Content-Length"] == str(len(b"resolved-xlsx"))
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+        for malformed in (root + "/approvals/bad/group/group-1/output",
+                          root + "/approvals/" + "a" * 64 + "/groups/bad/id/output"):
+            with pytest.raises(HTTPError) as failure:
+                urlopen(malformed, timeout=2)
+            assert failure.value.code == 404
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)

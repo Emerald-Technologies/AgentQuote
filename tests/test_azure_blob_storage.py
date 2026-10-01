@@ -175,6 +175,75 @@ def test_existing_different_upload_is_conflict():
         configured_storage(client).upload_output_immutable("output.xlsx", b"data", "application/test")
 
 
+@pytest.mark.parametrize("method,artifact", [
+    ("upload_output_immutable", "output"),
+    ("upload_registry_immutable", "registry"),
+    ("upload_candidate_immutable", "candidate"),
+])
+def test_immutable_upload_adapter_parity(method, artifact):
+    data = b"data"
+    created = blob_client(data)
+    getattr(configured_storage(created), method)("path", data, "application/test")
+    assert created.upload_blob.call_args.kwargs["overwrite"] is False
+    assert created.upload_blob.call_args.kwargs["content_settings"].content_type == "application/test"
+
+    replay = blob_client(data)
+    replay.upload_blob.side_effect = ResourceExistsError("exists")
+    getattr(configured_storage(replay), method)("path", data, "application/test")
+    replay.download_blob.assert_called_once_with(offset=0, length=len(data) + 1,
+                                                 max_concurrency=1)
+
+    for existing in (b"other", b"longer"):
+        conflict = blob_client(existing)
+        conflict.upload_blob.side_effect = ResourceExistsError("exists")
+        with pytest.raises(BlobConflictError, match=f"immutable {artifact} conflict"):
+            getattr(configured_storage(conflict), method)("path", data, "application/test")
+
+
+@pytest.mark.parametrize("method,artifact", [
+    ("upload_output_immutable", "output"),
+    ("upload_registry_immutable", "registry"),
+    ("upload_candidate_immutable", "candidate"),
+])
+@pytest.mark.parametrize("failure_at", ["properties", "download"])
+def test_existing_immutable_verification_failures_are_stable(method, artifact, failure_at):
+    client = blob_client(b"data")
+    client.upload_blob.side_effect = ResourceExistsError("exists")
+    if failure_at == "properties":
+        client.get_blob_properties.side_effect = HttpResponseError("unavailable")
+    else:
+        client.download_blob.side_effect = HttpResponseError("unavailable")
+    with pytest.raises(ProcessingError, match=f"existing {artifact} verification failed") as failure:
+        getattr(configured_storage(client), method)("path", b"data", "application/test")
+    assert not isinstance(failure.value, (HttpResponseError, ResourceExistsError))
+
+
+@pytest.mark.parametrize("method,artifact", [
+    ("upload_output_immutable", "output"),
+    ("upload_registry_immutable", "registry"),
+    ("upload_candidate_immutable", "candidate"),
+])
+def test_existing_immutable_readall_failures_are_stable(method, artifact):
+    client = blob_client(b"data")
+    client.upload_blob.side_effect = ResourceExistsError("exists")
+    client.download_blob.return_value.readall.side_effect = HttpResponseError("unavailable")
+    with pytest.raises(ProcessingError, match=f"existing {artifact} verification failed"):
+        getattr(configured_storage(client), method)("path", b"data", "application/test")
+
+
+@pytest.mark.parametrize("method,artifact", [
+    ("upload_output_immutable", "output"),
+    ("upload_registry_immutable", "registry"),
+    ("upload_candidate_immutable", "candidate"),
+])
+def test_immutable_initial_upload_failures_are_stable(method, artifact):
+    client = blob_client()
+    client.upload_blob.side_effect = HttpResponseError("unavailable")
+    with pytest.raises(ProcessingError, match=f"{artifact} upload failed") as failure:
+        getattr(configured_storage(client), method)("path", b"data", "application/test")
+    assert not isinstance(failure.value, HttpResponseError)
+
+
 def test_non_conflict_upload_failure_is_processing_error_without_comparison():
     client = blob_client()
     client.upload_blob.side_effect = HttpResponseError("service unavailable")
@@ -218,3 +287,26 @@ def test_registry_update_uses_match_conditions_from_azure_core():
     assert kwargs["etag"] == "etag-old"
     assert kwargs["match_condition"] == MatchConditions.IfNotModified
     assert isinstance(kwargs["content_settings"], ContentSettings)
+
+
+@pytest.mark.parametrize("method,prefix", [
+    ("list_registry_paths", "packages/plan/approvals/"),
+    ("list_candidate_paths", "candidates/request/"),
+])
+def test_azure_path_listing_consumes_at_most_limit_plus_one_and_sorts(method, prefix):
+    storage = configured_storage(blob_client())
+    consumed = []
+    def blobs(**kwargs):
+        assert kwargs == {"name_starts_with": prefix}
+        for name in (prefix + "c", prefix + "a", prefix + "b", prefix + "never"):
+            consumed.append(name)
+            yield SimpleNamespace(name=name)
+    storage._parsers.list_blobs.side_effect = blobs
+    with pytest.raises(ProcessingError, match="list exceeds limit"):
+        getattr(storage, method)(prefix, 2)
+    assert consumed == [prefix + "c", prefix + "a", prefix + "b"]
+
+    consumed.clear()
+    storage._parsers.list_blobs.side_effect = lambda **kwargs: iter([
+        SimpleNamespace(name=prefix + "b"), SimpleNamespace(name=prefix + "a")])
+    assert getattr(storage, method)(prefix, 2) == [prefix + "a", prefix + "b"]
