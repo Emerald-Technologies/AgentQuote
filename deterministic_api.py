@@ -859,7 +859,7 @@ def main() -> None:
             starter = AzureCandidateJobStarter(subscription_id=os.environ["BOM_JOB_SUBSCRIPTION_ID"],
                 resource_group=os.environ["BOM_JOB_RESOURCE_GROUP"], job_name=os.environ["PACKAGE_EVIDENCE_JOB_NAME"],
                 credential=credential, container_name=os.environ.get("PACKAGE_EVIDENCE_JOB_CONTAINER_NAME", "evidence-worker"),
-                image=os.environ["PACKAGE_EVIDENCE_JOB_IMAGE"], resources={"cpu": 1, "memory": "4Gi"},
+                image=os.environ["PACKAGE_EVIDENCE_JOB_IMAGE"], resources={"cpu": 2, "memory": "4Gi"},
                 base_environment={key: os.environ.get(key, "") for key in (
                     "AZURE_CLIENT_ID", "BOM_STORAGE_ACCOUNT_URL", "PACKAGE_EVIDENCE_MODEL_ENABLED",
                     "PACKAGE_EVIDENCE_MODEL_DEPLOYMENT", "FOUNDRY_PROJECT_ENDPOINT")})
