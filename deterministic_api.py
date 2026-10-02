@@ -46,6 +46,7 @@ from bom_processor import (
 )
 from bom_processor.core import CONTRACT_VERSION
 from bom_processor.master_registry import RegistryError
+from bom_processor.package_system_acceptance import SystemPackageService
 
 log = logging.getLogger("agentquote.deterministic_api")
 ROUTE = "/api/v1/bom/process"
@@ -60,10 +61,10 @@ REVIEW_FIXTURE_OUTPUT_ROUTE = re.compile(
     r"candidates/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/validations/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/fixtures/([0-9a-fA-F]{64})/output$")
 PACKAGE_ROUTE = re.compile(
-    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(status|review|approve|approval)$")
+    r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(status|review|approve|approval|accept-system)$")
 PACKAGE_RESOLUTION_ROUTE = re.compile(
     r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
-    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(resolve|status|manifest)$")
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(resolve|resolve-system|status|manifest)$")
 PACKAGE_OUTPUT_ROUTE = re.compile(
     r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/groups/"
@@ -434,6 +435,35 @@ class PackageApi:
                     approval_id: str | None = None) -> tuple[int, dict[str, Any]]:
         response_id = uuid.uuid4().hex
         try:
+            if action in {"accept-system", "resolve-system"}:
+                authorize(headers, self.config)
+                if os.environ.get("PACKAGE_SYSTEM_ACCEPTANCE_ENABLED") != "true":
+                    return 403, _error("disabled", "System acceptance is disabled.", response_id)
+                # Require explicitly allowed application identity, not a human
+                # object-ID authorization substituted for system authority.
+                principal = _decode_principal(headers.get("X-MS-CLIENT-PRINCIPAL", ""))
+                applications = _claim_values(principal, {
+                    "appid", "azp", "http://schemas.microsoft.com/identity/claims/appid",
+                }) & self.config.allowed_app_ids
+                if len(applications) != 1:
+                    raise LookupError("system application required")
+                value = json.loads(body.decode("utf-8"))
+                service = self.service_factory()
+                if not isinstance(service, SystemPackageService):
+                    raise PackageResolutionError("SYSTEM_SERVICE_UNAVAILABLE")
+                if action == "resolve-system":
+                    if value != {} or approval_id is None:
+                        raise ValueError
+                    bound = service._bound_approval(plan_id, approval_id)
+                    if (bound.get("version") != "package-system-acceptance.v1"
+                            or bound.get("caller_application") != next(iter(applications))):
+                        raise LookupError("system caller mismatch")
+                    return 200, service.resolve(plan_id=plan_id, approval_id=approval_id)
+                if (not isinstance(value, dict)
+                        or set(value) != {"review_manifest_sha256", "assembly_identities"}):
+                    raise ValueError
+                return 200, service.accept_system(plan_id=plan_id,
+                    caller_application=next(iter(applications)), **value)
             actor = authenticated_actor(headers, self.config)
             value = json.loads(body.decode("utf-8"))
             if not isinstance(value, dict) or any(key in value for key in ("actor", "actor_id", "approver")):
@@ -445,6 +475,9 @@ class PackageApi:
                     raise ValueError
                 return 200, service.approve(plan_id=plan_id, approver=actor, **value)
             if action == "resolve" and approval_id is not None and not value:
+                bound = service._bound_approval(plan_id, approval_id)
+                if bound.get("version") == "package-system-acceptance.v1":
+                    raise LookupError("system resolution route required")
                 return 200, service.resolve(plan_id=plan_id, approval_id=approval_id)
             raise ValueError
         except PermissionError:
@@ -636,6 +669,31 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
         server_version = "AgentQuoteDeterministicAPI/1"
 
         def do_POST(self) -> None:  # noqa: N802
+            system_match = PACKAGE_ROUTE.fullmatch(self.path)
+            system_resolution = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
+            if package_api is not None and ((system_match and system_match.group(2) == "accept-system")
+                    or (system_resolution and system_resolution.group(3) == "resolve-system")):
+                try:
+                    authorize(self.headers, api.config)
+                except PermissionError:
+                    self._write(401, _error("unauthenticated", "Authentication is required.", uuid.uuid4().hex)); return
+                except LookupError:
+                    self._write(403, _error("forbidden", "Caller is not authorized.", uuid.uuid4().hex)); return
+                raw = self.headers.get("Content-Length", "")
+                if not raw.isdigit() or int(raw) > 65536:
+                    self._write(413, _error("request_too_large", "Invalid system acceptance body length.", uuid.uuid4().hex)); return
+                try:
+                    from bom_processor.package_evidence_api import read_evidence_body
+                    body = read_evidence_body(self.rfile, self.connection, int(raw))
+                except (OSError, ValueError):
+                    self.close_connection = True
+                    self._write(408, _error("body_timeout", "Request body could not be read.", uuid.uuid4().hex)); return
+                if system_match:
+                    status, payload = package_api.handle_post(self.headers, system_match.group(1), "accept-system", body)
+                else:
+                    status, payload = package_api.handle_post(self.headers, system_resolution.group(1),
+                        "resolve-system", body, system_resolution.group(2))
+                self._write(status, payload); return
             evidence_match = EVIDENCE_ROUTE.fullmatch(self.path)
             if evidence_match and evidence_match.group(2) in {"submit", "start"} and evidence_api is not None:
                 # Authenticate before reading evidence payloads or creating services.
@@ -787,7 +845,7 @@ def main() -> None:
                         if config.candidate_automation_enabled else None)))
     review_output_api = CandidateReviewOutputApi(
         config, lambda: CandidateReviewService(_storage_factory()))
-    package_api = PackageApi(config, lambda: ParentPackageService(_storage_factory()))
+    package_api = PackageApi(config, lambda: SystemPackageService(_storage_factory()))
     evidence_api = None
     if os.environ.get("PACKAGE_EVIDENCE_API_ENABLED") == "true":
         from bom_processor.package_evidence_api import EvidenceApi, configured_policy

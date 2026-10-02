@@ -334,12 +334,7 @@ class ParentPackageService:
                 raise PackageResolutionError("PACKAGE_ARTIFACT_INVALID") from exc
             if not isinstance(value, dict):
                 raise PackageResolutionError("PACKAGE_ARTIFACT_INVALID")
-            identity = {key: value.get(key) for key in (
-                "version", "plan_id", "review_manifest_sha256", "review", "approver", "reason", "ticket")}
-            if (value.get("version") != "package-approval.v1" or value.get("plan_id") != plan_id
-                    or value.get("approval_id") != approval_id or _hash(identity) != approval_id):
-                raise PackageResolutionError("PACKAGE_APPROVAL_BINDING")
-            approval = value
+            approval = self._bound_approval(plan_id, approval_id)
         prefix = self._resolved_prefix(plan_id, approval_id)
         resolved = self.storage.download_output(
             f"{prefix}/resolved-output-manifest.v1.json", self.max_output_bytes) is not None

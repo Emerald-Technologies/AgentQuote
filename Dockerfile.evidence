@@ -1,0 +1,13 @@
+# Evidence proposal worker only. No parser execution or model calls during build.
+# Inputs: pinned runtime configuration/REQUEST_ID; outputs: immutable proposal artifacts.
+# Build with Dockerfile.evidence; enable and run only under the approved pilot plan.
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bom_processor ./bom_processor
+COPY deterministic_api.py .
+COPY evidence_job.py .
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER 10001
+ENTRYPOINT ["python", "evidence_job.py"]
