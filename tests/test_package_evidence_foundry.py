@@ -25,11 +25,15 @@ def test_tool_free_packet_and_exact_prompt_provenance():
 
         async def run(self, packet):
             seen["packet"] = json.loads(packet)
-            return SimpleNamespace(output_text=json.dumps(AssessedModel().propose(seen["packet"])))
+            from test_package_evidence_retention import RetentionModel
+            return SimpleNamespace(output_text=json.dumps(RetentionModel().propose(seen["packet"])))
 
     model = FoundryEvidenceProposalModel(object(), model_name="explicit-deployment", agent_factory=Agent)
     context, roots, books = assessed_inputs()
-    result = model.produce(context, roots, books, run_id="test-run")
+    from test_package_evidence_inventory import root
+    from test_package_evidence_retention import source_proof
+    roots.append(root(b"original BOM source bytes", "original.xlsx", "12345678-1234-4234-8234-123456789080"))
+    result = model.produce(context, roots, books, run_id="test-run", retained_bom_sources=source_proof(roots))
     graph = result["proposal"]
     assert len(result["classification"]["classifications"]) == len(graph["occurrences"])
     assert result["manufacturingAssessment"]["proposalSha256"] == graph["proposalSha256"]

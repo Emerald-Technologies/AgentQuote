@@ -144,7 +144,8 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      max_total_text_chars: int = 2_000_000,
                      max_packet_bytes: int = 8 * 1024 * 1024,
                      include_classification: bool = False,
-                     include_manufacturing: bool = False) -> dict:
+                     include_manufacturing: bool = False,
+                     retained_bom_sources: dict | None = None) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
@@ -169,6 +170,11 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
             sources.append(source)
     require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
     inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
+    require((policy_version == "package-evidence-foundry.v4") == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
+    retained_objects = {}
+    if retained_bom_sources is not None:
+        from .package_evidence_retention import retained_inventory
+        retained_objects = retained_inventory(inventory, roots, retained_bom_sources)
     root_metadata = {item["documentId"]: {key: item[key] for key in ("documentId", "sha256", "sizeBytes")}
                      for item in inventory if not item["archiveChain"]}
     for assembly in context["assemblies"]:
@@ -207,6 +213,10 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
         packet["manufacturingSources"] = sources
         packet["manufacturingRoles"] = ["assembly_drawing", "assembly_instructions", "fabrication_drawing", "custom_drawing", "artwork", "drill"]
         packet["associationIdentityInstruction"] = "Manufacturing relationships repeat the association evidenceId, occurrenceIds, assemblyUuids and scope; code derives association IDs, never invent hashes."
+    if retained_bom_sources is not None:
+        packet["retainedProvenance"] = [{"evidenceId": identity, "kind": kind}
+            for identity, kind in sorted(retained_objects.items())]
+        packet["retentionInstruction"] = "These verified objects are structural provenance only. Do not associate them or assign manufacturing relationships. Give dispositions only for every other object; every child remains independently checked."
     require(len(json_bytes(packet)) <= max_packet_bytes, "PACKET_BYTE_BUDGET")
     try:
         hints = model.propose(detached(packet))
@@ -222,6 +232,17 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
     if include_manufacturing:
         require(type(hints) is dict and "manufacturing" in hints, "ASSESSMENT_OUTPUT_REQUIRED")
         manufacturing = hints.pop("manufacturing")
+    if retained_bom_sources is not None:
+        require(type(hints) is dict and type(hints.get("associations")) is list
+                and type(hints.get("dispositions")) is list, "INVALID_MODEL_OUTPUT")
+        # Reject attempted engineering permission rather than silently pruning it.
+        require(all(type(a) is dict and a.get("evidenceId") not in retained_objects
+                    for a in hints["associations"]), "RETAINED_MANUFACTURING_ASSOCIATION")
+        require(all(type(d) is dict and d.get("evidenceId") not in retained_objects
+                    for d in hints["dispositions"]), "MODEL_RETENTION_AUTHORITY")
+        hints["dispositions"].extend({"evidenceId": identity, "state": "unrelated",
+            "replacementEvidenceId": None, "rationale": "Retained verified provenance, not a manufacturing deliverable: " + kind,
+            "citations": []} for identity, kind in sorted(retained_objects.items()))
     categories, associations, dispositions = _hints(hints, inventory, rows["occurrences"],
                                                    context["assemblies"])
     body = {"version": "package-evidence-graph.v1",
