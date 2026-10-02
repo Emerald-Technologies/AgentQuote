@@ -68,6 +68,7 @@ PACKAGE_OUTPUT_ROUTE = re.compile(
     r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/groups/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/output$")
+EVIDENCE_ROUTE = re.compile(r"^/api/v1/package-evidence/([0-9a-f]{64})/(submit|start|status)$")
 
 
 @dataclass(frozen=True)
@@ -629,11 +630,33 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
 def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
                  status_api: CandidateStatusApi | None = None,
                  review_output_api: CandidateReviewOutputApi | None = None,
-                 package_api: PackageApi | None = None) -> type[BaseHTTPRequestHandler]:
+                 package_api: PackageApi | None = None,
+                 evidence_api=None) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "AgentQuoteDeterministicAPI/1"
 
         def do_POST(self) -> None:  # noqa: N802
+            evidence_match = EVIDENCE_ROUTE.fullmatch(self.path)
+            if evidence_match and evidence_match.group(2) in {"submit", "start"} and evidence_api is not None:
+                # Authenticate before reading evidence payloads or creating services.
+                try:
+                    authorize(self.headers, api.config)
+                except PermissionError:
+                    self._write(401, _error("unauthenticated", "Authentication is required.", uuid.uuid4().hex)); return
+                except LookupError:
+                    self._write(403, _error("forbidden", "Caller is not authorized.", uuid.uuid4().hex)); return
+                from bom_processor.package_evidence_jobs import MAX_METADATA
+                raw = self.headers.get("Content-Length", "")
+                if not raw.isdigit() or int(raw) > MAX_METADATA:
+                    self._write(413, _error("request_too_large", "Invalid evidence body length.", uuid.uuid4().hex)); return
+                try:
+                    from bom_processor.package_evidence_api import read_evidence_body
+                    body = read_evidence_body(self.rfile, self.connection, int(raw))
+                except (OSError, ValueError):
+                    self.close_connection = True
+                    self._write(408, _error("body_timeout", "Evidence body could not be read.", uuid.uuid4().hex)); return
+                status, payload = evidence_api.handle(self.headers, *evidence_match.groups(), body)
+                self._write(status, payload); return
             raw_length = self.headers.get("Content-Length")
             try:
                 length = int(raw_length) if raw_length is not None else -1
@@ -671,6 +694,10 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self._write(status, payload)
 
         def do_GET(self) -> None:  # noqa: N802
+            evidence_match = EVIDENCE_ROUTE.fullmatch(self.path)
+            if evidence_match and evidence_match.group(2) == "status" and evidence_api is not None:
+                status, payload = evidence_api.handle(self.headers, *evidence_match.groups())
+                self._write(status, payload); return
             package_match = PACKAGE_ROUTE.fullmatch(self.path)
             if package_match and package_match.group(2) in {"status", "review", "approval"} and package_api is not None:
                 status, payload = package_api.handle_get(self.headers, *package_match.groups())
@@ -761,8 +788,28 @@ def main() -> None:
     review_output_api = CandidateReviewOutputApi(
         config, lambda: CandidateReviewService(_storage_factory()))
     package_api = PackageApi(config, lambda: ParentPackageService(_storage_factory()))
+    evidence_api = None
+    if os.environ.get("PACKAGE_EVIDENCE_API_ENABLED") == "true":
+        from bom_processor.package_evidence_api import EvidenceApi, configured_policy
+        from bom_processor.package_evidence_jobs import EvidenceJobService
+        def evidence_service():
+            from azure.identity import ManagedIdentityCredential
+            required = ("BOM_JOB_SUBSCRIPTION_ID", "BOM_JOB_RESOURCE_GROUP", "PACKAGE_EVIDENCE_JOB_NAME", "PACKAGE_EVIDENCE_JOB_IMAGE")
+            if any(not os.environ.get(name, "").strip() for name in required):
+                raise RuntimeError("evidence job settings unavailable")
+            credential = ManagedIdentityCredential(client_id=os.environ.get("BOM_JOB_MANAGED_IDENTITY_CLIENT_ID") or None)
+            starter = AzureCandidateJobStarter(subscription_id=os.environ["BOM_JOB_SUBSCRIPTION_ID"],
+                resource_group=os.environ["BOM_JOB_RESOURCE_GROUP"], job_name=os.environ["PACKAGE_EVIDENCE_JOB_NAME"],
+                credential=credential, container_name=os.environ.get("PACKAGE_EVIDENCE_JOB_CONTAINER_NAME", "evidence-worker"),
+                image=os.environ["PACKAGE_EVIDENCE_JOB_IMAGE"], resources={"cpu": 1, "memory": "4Gi"},
+                base_environment={key: os.environ.get(key, "") for key in (
+                    "AZURE_CLIENT_ID", "BOM_STORAGE_ACCOUNT_URL", "PACKAGE_EVIDENCE_MODEL_ENABLED",
+                    "PACKAGE_EVIDENCE_MODEL_DEPLOYMENT", "FOUNDRY_PROJECT_ENDPOINT")})
+            return EvidenceJobService(_storage_factory(), starter)
+        evidence_api = EvidenceApi(authorize=lambda headers: authorize(headers, config),
+            service_factory=evidence_service, policy=configured_policy(), enabled=True)
     server = ThreadingHTTPServer(
-        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api, package_api))
+        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api, package_api, evidence_api))
     log.info("Deterministic BOM API listening on port %d", config.port)
     server.serve_forever()
 

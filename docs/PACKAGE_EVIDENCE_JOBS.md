@@ -45,3 +45,28 @@ No dependencies, existing runtime changes, live data, permissions or deployment.
 Next: approved authenticated HTTP/job entrypoint + QuickQuote staging/retrieval;
 server-owned model/policy binding; native adapter/SDK budget checks; actual producer
 through QuickQuote byte verifier; explicit live migration/model/pilot action gates.
+
+## Authenticated API / worker source checkpoint
+
+Explicitly enabled `PACKAGE_EVIDENCE_API_ENABLED=true` adds
+`/api/v1/package-evidence/<requestId>/{submit,start,status}`. POST submit/start and
+GET status reuse existing caller allowlists; no new permissions or live setting changes.
+Evidence POST authenticates before body read, caps metadata2MB and total elapsed
+read10sec. Policy matches actual server deployment/policy/prompt constants. HTTP does
+not instantiate/invoke a model. Status only reads artifacts but currently factory
+configuration still requires job-start settings; markers are not execution-health proof.
+
+`evidence_job.py` is a separate worker entrypoint, explicit model enablement and
+REQUEST_ID only. It verifies request policy and actual adapter model name, uses
+managed-identity storage and the Government adapter. No Job image/Dockerfile deployment
+is configured yet. API factory reuses existing Azure starter, forwarding a fixed list
+of nonsecret configuration keys; live values/identities/resources remain unverified.
+Worker configuration failures before claims remain started until explicit reconciliation.
+
+Independent review found an enabled-image import defect and resettable socket timeout;
+shared policy moved into packaged bom_processor module and total-read deadline added.
+39 focused tests pass; final full suite483 passed. One preceding full run failed an
+untouched workbook deterministic-serialization test; isolated rerun1/1 and full rerun
+passed without changing that code. Native image startup/serving canary is not claimed.
+No second independent review. No live jobs/storage/model/settings/deployment.
+QuickQuote staging/retrieval remains next, not completed by this partial checkpoint.
