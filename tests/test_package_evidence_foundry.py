@@ -13,6 +13,7 @@ from bom_processor.package_evidence_foundry import (
 )
 from test_package_evidence_proposal import inputs, FakeModel
 from test_package_part_classification import ClassifiedModel
+from test_package_manufacturing_assessment import AssessedModel, assessed_inputs
 
 
 def test_tool_free_packet_and_exact_prompt_provenance():
@@ -24,13 +25,14 @@ def test_tool_free_packet_and_exact_prompt_provenance():
 
         async def run(self, packet):
             seen["packet"] = json.loads(packet)
-            return SimpleNamespace(output_text=json.dumps(ClassifiedModel().propose(seen["packet"])))
+            return SimpleNamespace(output_text=json.dumps(AssessedModel().propose(seen["packet"])))
 
     model = FoundryEvidenceProposalModel(object(), model_name="explicit-deployment", agent_factory=Agent)
-    context, roots, books = inputs()
+    context, roots, books = assessed_inputs()
     result = model.produce(context, roots, books, run_id="test-run")
     graph = result["proposal"]
     assert len(result["classification"]["classifications"]) == len(graph["occurrences"])
+    assert result["manufacturingAssessment"]["proposalSha256"] == graph["proposalSha256"]
     assert seen["tools"] == []
     assert seen["instructions"] == SYSTEM_INSTRUCTION
     assert graph["provenance"]["promptSha256"] == PROMPT_SHA256 == digest(SYSTEM_INSTRUCTION.encode())

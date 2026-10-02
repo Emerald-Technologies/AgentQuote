@@ -143,7 +143,8 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      max_text_chars_per_file: int = 2000,
                      max_total_text_chars: int = 2_000_000,
                      max_packet_bytes: int = 8 * 1024 * 1024,
-                     include_classification: bool = False) -> dict:
+                     include_classification: bool = False,
+                     include_manufacturing: bool = False) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
@@ -156,7 +157,18 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
     integer(max_text_chars_per_file, 1, 2000)
     integer(max_total_text_chars, 1, 2_000_000)
     integer(max_packet_bytes, 1, 8 * 1024 * 1024)
-    inventory = build_inventory(roots, limits=inventory_limits)
+    sources = []
+    retained = 0
+    def observe(identity, payload, file_name):
+        nonlocal retained
+        from .package_manufacturing_assessment import complete_source
+        source = complete_source(identity, payload, file_name)
+        if source is not None:
+            retained += len(payload)
+            require(retained <= 8_000_000, "ASSESSMENT_SOURCE_LIMIT")
+            sources.append(source)
+    require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
+    inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
     root_metadata = {item["documentId"]: {key: item[key] for key in ("documentId", "sha256", "sizeBytes")}
                      for item in inventory if not item["archiveChain"]}
     for assembly in context["assemblies"]:
@@ -191,6 +203,10 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
         packet["advisoryClassificationSignals"] = [
             {"occurrenceId": row["occurrenceId"], "signals": advisory_signals(row)}
             for row in rows["verifiedRows"]]
+    if include_manufacturing:
+        packet["manufacturingSources"] = sources
+        packet["manufacturingRoles"] = ["assembly_drawing", "assembly_instructions", "fabrication_drawing", "custom_drawing", "artwork", "drill"]
+        packet["associationIdentityInstruction"] = "Manufacturing relationships repeat the association evidenceId, occurrenceIds, assemblyUuids and scope; code derives association IDs, never invent hashes."
     require(len(json_bytes(packet)) <= max_packet_bytes, "PACKET_BYTE_BUDGET")
     try:
         hints = model.propose(detached(packet))
@@ -198,10 +214,14 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
         raise PackageEvidenceError("MODEL_PROPOSAL_FAILED") from exc
     require(len(json_bytes(hints)) <= 8 * 1024 * 1024, "MODEL_OUTPUT_LIMIT")
     classifications = None
+    manufacturing = None
     if include_classification:
         require(type(hints) is dict and "classifications" in hints, "CLASSIFICATION_OUTPUT_REQUIRED")
         hints = detached(hints)
         classifications = hints.pop("classifications")
+    if include_manufacturing:
+        require(type(hints) is dict and "manufacturing" in hints, "ASSESSMENT_OUTPUT_REQUIRED")
+        manufacturing = hints.pop("manufacturing")
     categories, associations, dispositions = _hints(hints, inventory, rows["occurrences"],
                                                    context["assemblies"])
     body = {"version": "package-evidence-graph.v1",
@@ -219,5 +239,9 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
         from .package_part_classification import classification_artifact
         classification = classification_artifact(graph, rows["verifiedRows"], classifications)
         require(len(json_bytes(classification)) <= 8 * 1024 * 1024, "CLASSIFICATION_BYTE_LIMIT")
-        return {"proposal": detached(graph), "classification": classification}
+        result = {"proposal": detached(graph), "classification": classification}
+        if include_manufacturing:
+            from .package_manufacturing_assessment import assessment_artifact
+            result["manufacturingAssessment"] = assessment_artifact(graph, classification, sources, manufacturing)
+        return result
     return detached(graph)

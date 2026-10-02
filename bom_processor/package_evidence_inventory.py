@@ -146,7 +146,7 @@ def describe(file_name: str, data: bytes, limits: InventoryLimits,
     return {"fileName": file_name, "format": kind, "excerpt": excerpt}
 
 
-def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None) -> list[dict]:
+def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None, observe=None) -> list[dict]:
     """Roots: documentId/sha256/sizeBytes/fileName/data. Return identity + description.
 
     Raw bytes never enter the returned inventory or the model packet.
@@ -169,6 +169,8 @@ def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None)
         require(len(chain) <= limits.depth, "ARCHIVE_DEPTH_LIMIT")
         identity = {**metadata, "archiveChain": chain}
         description = describe(file_name, payload, limits, budget)
+        if observe is not None:
+            observe(detached(identity), payload, file_name)
         result.append({"evidenceId": evidence_id(identity), **identity,
                        "category": description["format"], **description})
         require(len(result) <= limits.evidence, "EVIDENCE_LIMIT")
