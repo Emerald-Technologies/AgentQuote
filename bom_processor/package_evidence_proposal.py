@@ -142,7 +142,8 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      inventory_limits: InventoryLimits | None = None,
                      max_text_chars_per_file: int = 2000,
                      max_total_text_chars: int = 2_000_000,
-                     max_packet_bytes: int = 8 * 1024 * 1024) -> dict:
+                     max_packet_bytes: int = 8 * 1024 * 1024,
+                     include_classification: bool = False) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
@@ -185,11 +186,22 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
               "requires an explicit disposition; unknown formats do not imply unrelated evidence.",
               "coverage": "complete_inventory", "context": context, **rows,
               "evidence": packet_evidence}
+    if include_classification:
+        from .package_part_classification import advisory_signals
+        packet["advisoryClassificationSignals"] = [
+            {"occurrenceId": row["occurrenceId"], "signals": advisory_signals(row)}
+            for row in rows["verifiedRows"]]
     require(len(json_bytes(packet)) <= max_packet_bytes, "PACKET_BYTE_BUDGET")
     try:
         hints = model.propose(detached(packet))
     except Exception as exc:
         raise PackageEvidenceError("MODEL_PROPOSAL_FAILED") from exc
+    require(len(json_bytes(hints)) <= 8 * 1024 * 1024, "MODEL_OUTPUT_LIMIT")
+    classifications = None
+    if include_classification:
+        require(type(hints) is dict and "classifications" in hints, "CLASSIFICATION_OUTPUT_REQUIRED")
+        hints = detached(hints)
+        classifications = hints.pop("classifications")
     categories, associations, dispositions = _hints(hints, inventory, rows["occurrences"],
                                                    context["assemblies"])
     body = {"version": "package-evidence-graph.v1",
@@ -203,4 +215,9 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
     graph = {**body, "proposalSha256": object_hash(body)}
     require(graph["parentProposalSha256"] != graph["proposalSha256"], "SELF_PREDECESSOR")
     require(len(json_bytes(graph)) <= 8 * 1024 * 1024, "GRAPH_BYTE_LIMIT")
+    if include_classification:
+        from .package_part_classification import classification_artifact
+        classification = classification_artifact(graph, rows["verifiedRows"], classifications)
+        require(len(json_bytes(classification)) <= 8 * 1024 * 1024, "CLASSIFICATION_BYTE_LIMIT")
+        return {"proposal": detached(graph), "classification": classification}
     return detached(graph)

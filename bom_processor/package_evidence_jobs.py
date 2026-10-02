@@ -154,7 +154,9 @@ class EvidenceJobService:
         request = self.request(request_id)
         completed = self._read(request_id, "completed")
         if completed is not None:
-            strict(completed, {"requestId", "proposalSha256", "artifactSha256"})
+            classified = request["policy"]["policyVersion"] == "package-evidence-foundry.v2"
+            strict(completed, {"requestId", "proposalSha256", "artifactSha256"}
+                   | ({"classificationArtifactSha256"} if classified else set()))
             graph = self._read(request_id, "proposal", MAX_GRAPH)
             require(graph is not None and completed["requestId"] == request_id
                     and digest(json_bytes(graph)) == completed["artifactSha256"], "RESULT_CORRUPT")
@@ -164,7 +166,13 @@ class EvidenceJobService:
                     and graph.get("assemblies") == request["context"]["assemblies"]
                     and graph.get("parentProposalSha256") is None
                     and graph.get("provenance") == {"kind": "agent", **request["policy"], "runId": request_id}, "RESULT_BINDING")
-            return {"requestId": request_id, "status": "completed", "proposal": graph}
+            result = {"requestId": request_id, "status": "completed", "proposal": graph}
+            if classified:
+                classification = self._classification(request_id, graph)
+                require(digest(json_bytes(classification)) == completed["classificationArtifactSha256"],
+                        "CLASSIFICATION_RESULT_CORRUPT")
+                result["classification"] = classification
+            return result
         for artifact, state in (("failed", "failed"), ("worker-claim", "running"),
                                 ("start-unknown", "start_unknown"), ("started", "started"),
                                 ("start-claim", "start_unknown")):
@@ -199,15 +207,40 @@ class EvidenceJobService:
                 and graph.get("assemblies") == request["context"]["assemblies"]
                 and graph.get("parentProposalSha256") is None
                 and graph.get("provenance") == {"kind": "agent", **request["policy"], "runId": request_id}, "RESULT_BINDING")
-        self._write(request_id, "completed", {"requestId": request_id,
-            "proposalSha256": graph["proposalSha256"], "artifactSha256": digest(json_bytes(graph))})
+        completed = {"requestId": request_id, "proposalSha256": graph["proposalSha256"],
+                     "artifactSha256": digest(json_bytes(graph))}
+        if request["policy"]["policyVersion"] == "package-evidence-foundry.v2":
+            classification = self._classification(request_id, graph)
+            completed["classificationArtifactSha256"] = digest(json_bytes(classification))
+        self._write(request_id, "completed", completed)
         return self.status(request_id)
+
+    def _classification(self, request_id: str, graph: dict) -> dict:
+        """Publication integrity only; consumer independently rereads workbook rows."""
+        value = self._read(request_id, "classification", MAX_GRAPH)
+        require(value is not None, "CLASSIFICATION_RESULT_MISSING")
+        strict(value, {"version", "policyVersion", "proposalSha256", "rowObservationsSha256",
+                       "producer", "model", "promptSha256", "runId", "classifications", "classificationSha256"})
+        require(value["version"] == "package-part-classification.v1"
+                and value["policyVersion"] == "agent-inferred-part-type.v1"
+                and object_hash({k: v for k, v in value.items() if k != "classificationSha256"})
+                    == value["classificationSha256"]
+                and value["proposalSha256"] == graph["proposalSha256"]
+                and all(value[k] == graph["provenance"][k]
+                        for k in ("producer", "model", "promptSha256", "runId")),
+                "CLASSIFICATION_RESULT_BINDING")
+        return value
 
     def run(self, request_id: str, model: Any) -> dict:
         request = self.request(request_id)
         existing = self.status(request_id)
         if existing["status"] in {"completed", "failed", "running"}:
             return existing
+        # Never execute a historical request under a newer adapter/prompt while
+        # recording its old attribution. This check precedes the worker claim.
+        for attribute, key in (("policy_version", "policyVersion"), ("prompt_sha256", "promptSha256")):
+            if hasattr(model, attribute):
+                require(getattr(model, attribute) == request["policy"][key], "MODEL_POLICY_BINDING")
         import uuid
         try:
             self._write(request_id, "worker-claim", {"requestId": request_id, "claimId": uuid.uuid4().hex})
@@ -224,10 +257,13 @@ class EvidenceJobService:
                 cache[item["documentId"]] = data
             roots = [{k: r[k] for k in ("documentId", "sha256", "sizeBytes", "fileName")} | {"data": cache[r["documentId"]]} for r in request["roots"]]
             policy = request["policy"]
-            graph = produce_proposal(request["context"], roots,
+            classified = policy["policyVersion"] == "package-evidence-foundry.v2"
+            produced = produce_proposal(request["context"], roots,
                 {w["documentId"]: cache[w["documentId"]] for w in request["workbooks"]}, model=model,
                 producer=policy["producer"], model_name=policy["model"], policy_version=policy["policyVersion"],
-                prompt_sha256=policy["promptSha256"], run_id=request_id)
+                prompt_sha256=policy["promptSha256"], run_id=request_id,
+                include_classification=classified)
+            graph = produced["proposal"] if classified else produced
         except Exception as exc:
             self._write(request_id, "failed", {"requestId": request_id, "code": "EVIDENCE_JOB_FAILED"})
             raise PackageEvidenceError("EVIDENCE_JOB_FAILED") from exc
@@ -236,6 +272,8 @@ class EvidenceJobService:
         # another model run. A missing proposal cannot be fabricated/reexecuted.
         try:
             self._write(request_id, "proposal", graph)
+            if classified:
+                self._write(request_id, "classification", produced["classification"])
             return self.reconcile_publication(request_id)
         except Exception as exc:
             raise PackageEvidenceError("PUBLICATION_UNKNOWN") from exc

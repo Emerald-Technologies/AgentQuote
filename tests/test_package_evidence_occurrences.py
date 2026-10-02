@@ -140,7 +140,7 @@ def test_same_workbook_two_assemblies_and_missing_bom_is_explicit():
     missing = assembly(data)
     missing["canonicalBom"] = None
     assert read_occurrences([missing], {}) == {"occurrences": [], "documentRows": [],
-                                              "rowObservations": []}
+                                              "rowObservations": [], "verifiedRows": []}
 
 
 @pytest.mark.parametrize("old,new", [(b'r="A1"', b'r="XFD1"'),

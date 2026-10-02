@@ -212,7 +212,8 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                                        "revision", "reference_designator", "item_category"}:
                             nullable_text(row[key], 2000, controls=True)
                     row["quantity"] = quantity_text(row["quantity"])
-                    output.append({"sheet": sheet.title, "row": row_number, **row})
+                    output.append({"sheet": sheet.title, "row": row_number, **row,
+                                   "_source_cells": values})
             require(bool(output), "WORKBOOK_EMPTY")
             parsed[document_id] = output
         except PackageEvidenceError:
@@ -222,7 +223,7 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
         finally:
             if workbook is not None:
                 workbook.close()
-    occurrences, documents, observations = [], [], []
+    occurrences, documents, observations, verified_rows = [], [], [], []
     total_rows = 0
     for assembly in assemblies:
         bom = assembly["canonicalBom"]
@@ -235,6 +236,11 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                       "bomSha256": bom["sha256"], "sheet": row["sheet"], "row": row["row"],
                       "partNumber": row["item_number"], "revision": row["revision"],
                       "quantity": row["quantity"], "referenceDesignators": row["reference_designator"]}
+            verified_rows.append({**{key: common[key] for key in (
+                "assemblyUuid", "bomDocumentId", "bomSha256", "sheet", "row")},
+                "occurrenceId": occurrence_id(assembly["assemblyUuid"], bom["sha256"],
+                    row["sheet"], row["row"]) if row["item_category"] == "Part" else None,
+                "cells": row["_source_cells"]})
             observations.append({
                 **{key: common[key] for key in ("assemblyUuid", "bomDocumentId", "bomSha256",
                                                "sheet", "row", "partNumber", "revision")},
@@ -251,4 +257,5 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                     bom["sha256"], row["sheet"], row["row"]),
                     "semanticKey": semantic_key(row["item_number"], row["revision"]), **common})
     return detached({"occurrences": sorted(occurrences, key=lambda item: item["occurrenceId"]),
-                     "documentRows": documents, "rowObservations": observations})
+                     "documentRows": documents, "rowObservations": observations,
+                     "verifiedRows": verified_rows})
