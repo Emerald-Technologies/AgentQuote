@@ -59,6 +59,9 @@ SYSTEM_INSTRUCTION = (
 PROMPT_SHA256 = digest(SYSTEM_INSTRUCTION.encode("utf-8"))
 MAX_PACKET_BYTES = 2_000_000
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_MODEL_INPUT_BYTES = 32 * 1024
+MAX_OUTPUT_TOKENS = 8192
+MODEL_DEADLINE_SECONDS = 120
 
 
 def _pairs(items: list[tuple[str, Any]]) -> dict:
@@ -96,16 +99,20 @@ class FoundryEvidenceProposalModel:
     prompt_sha256 = PROMPT_SHA256
 
     def __init__(self, client: Any, *, model_name: str,
-                 agent_factory: Callable[..., Any] | None = None, timeout_seconds: int = 120):
+                 agent_factory: Callable[..., Any] | None = None, timeout_seconds: int = MODEL_DEADLINE_SECONDS):
         self.client = client
         self.model_name = text(model_name)
-        require(type(timeout_seconds) is int and 1 <= timeout_seconds <= 300, "MODEL_TIMEOUT_INVALID")
+        require(type(timeout_seconds) is int and 1 <= timeout_seconds <= MODEL_DEADLINE_SECONDS, "MODEL_TIMEOUT_INVALID")
         self.timeout_seconds = timeout_seconds
         self.agent_factory = agent_factory
 
     def propose(self, packet: dict) -> dict:
         encoded = json_bytes(packet)
         require(len(encoded) <= MAX_PACKET_BYTES, "MODEL_PACKET_LIMIT")
+        # The fixed instructions are part of the billable input. This is a
+        # provable byte ceiling, not a tokenizer/pricing claim; never truncate.
+        require(len(encoded) + len(SYSTEM_INSTRUCTION.encode("utf-8")) <= MAX_MODEL_INPUT_BYTES,
+            "MODEL_INPUT_BYTE_LIMIT")
 
         async def invoke() -> dict:
             factory = self.agent_factory
@@ -113,7 +120,9 @@ class FoundryEvidenceProposalModel:
                 from agent_framework import Agent
                 factory = Agent
             agent = factory(client=self.client, instructions=SYSTEM_INSTRUCTION, tools=[])
-            response = await asyncio.wait_for(agent.run(encoded.decode("utf-8")), self.timeout_seconds)
+            response = await asyncio.wait_for(agent.run(encoded.decode("utf-8"), options={
+                "max_tokens": MAX_OUTPUT_TOKENS, "store": False,
+            }), self.timeout_seconds)
             # No str(object) fallback that could expose response internals or accept tool output.
             content = getattr(response, "output_text", None)
             if not isinstance(content, str):
@@ -168,4 +177,14 @@ def create_foundry_evidence_model() -> FoundryEvidenceProposalModel:
     credential = GovCredential(ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None))
     client = FoundryChatClient(project_endpoint=endpoint, model=deployment,
                                credential=credential, instruction_role="system")
+    # Verified against agent-framework-foundry1.2.2/OpenAI2.54.0 in the pinned
+    # image: public AsyncOpenAI request settings control its retry/timeout path.
+    # Fail closed on incompatible SDK surfaces; no implicit unbounded fallback.
+    inner = getattr(client, "client", None)
+    require(inner is not None and hasattr(inner, "max_retries") and hasattr(inner, "timeout"),
+            "MODEL_CLIENT_LIMITS_UNSUPPORTED")
+    inner.max_retries = 0
+    inner.timeout = float(MODEL_DEADLINE_SECONDS)
+    require(inner.max_retries == 0 and inner.timeout == float(MODEL_DEADLINE_SECONDS),
+            "MODEL_CLIENT_LIMITS_UNSUPPORTED")
     return FoundryEvidenceProposalModel(client, model_name=deployment)

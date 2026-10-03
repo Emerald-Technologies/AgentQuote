@@ -10,6 +10,7 @@ from bom_processor.package_evidence_contracts import PackageEvidenceError, diges
 from bom_processor.package_evidence_foundry import (
     FoundryEvidenceProposalModel, SYSTEM_INSTRUCTION, PROMPT_SHA256,
     MAX_PACKET_BYTES, MAX_RESPONSE_BYTES, parse_response, create_foundry_evidence_model,
+    MAX_MODEL_INPUT_BYTES, MAX_OUTPUT_TOKENS, MODEL_DEADLINE_SECONDS,
 )
 from test_package_evidence_proposal import inputs, FakeModel
 from test_package_part_classification import ClassifiedModel
@@ -23,7 +24,8 @@ def test_tool_free_packet_and_exact_prompt_provenance():
         def __init__(self, **kwargs):
             seen.update(kwargs)
 
-        async def run(self, packet):
+        async def run(self, packet, *, options):
+            seen["options"] = options
             seen["packet"] = json.loads(packet)
             from test_package_evidence_retention import RetentionModel
             return SimpleNamespace(output_text=json.dumps(RetentionModel().propose(seen["packet"])))
@@ -38,6 +40,7 @@ def test_tool_free_packet_and_exact_prompt_provenance():
     assert len(result["classification"]["classifications"]) == len(graph["occurrences"])
     assert result["manufacturingAssessment"]["proposalSha256"] == graph["proposalSha256"]
     assert seen["tools"] == []
+    assert seen["options"] == {"max_tokens": MAX_OUTPUT_TOKENS, "store": False}
     assert seen["instructions"] == SYSTEM_INSTRUCTION
     assert graph["provenance"]["promptSha256"] == PROMPT_SHA256 == digest(SYSTEM_INSTRUCTION.encode())
     assert graph["provenance"]["model"] == "explicit-deployment"
@@ -66,6 +69,14 @@ def test_response_and_input_limits_before_invocation():
     assert calls == []
 
 
+def test_combined_instructions_and_packet_bytes_fail_before_agent_creation():
+    calls = []
+    model = FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=lambda **kwargs: calls.append(kwargs))
+    with pytest.raises(PackageEvidenceError, match="MODEL_INPUT_BYTE_LIMIT"):
+        model.propose({"text": "x" * MAX_MODEL_INPUT_BYTES})
+    assert calls == []
+
+
 def test_timeout_and_provider_failure_do_not_retry_or_expose_details():
     calls = []
 
@@ -73,7 +84,7 @@ def test_timeout_and_provider_failure_do_not_retry_or_expose_details():
         def __init__(self, **kwargs):
             pass
 
-        async def run(self, text):
+        async def run(self, text, *, options):
             calls.append(text)
             raise RuntimeError("private-provider-body")
 
@@ -83,14 +94,14 @@ def test_timeout_and_provider_failure_do_not_retry_or_expose_details():
     assert len(calls) == 1
 
     class TimedAgent(Agent):
-        async def run(self, text):
+        async def run(self, text, *, options):
             raise asyncio.TimeoutError()
 
     with pytest.raises(PackageEvidenceError, match="MODEL_TIMEOUT"):
         FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=TimedAgent).propose({})
 
 
-@pytest.mark.parametrize("seconds", [True, 0, 301, 1.5])
+@pytest.mark.parametrize("seconds", [True, 0, 121, 301, 1.5])
 def test_invalid_deadline(seconds):
     with pytest.raises(PackageEvidenceError):
         FoundryEvidenceProposalModel(object(), model_name="test", timeout_seconds=seconds)
@@ -133,7 +144,9 @@ def test_factory_uses_explicit_deployment_managed_identity_and_government_scope(
 
     def client(**kwargs):
         seen["client"] = kwargs
-        return object()
+        value = SimpleNamespace(client=SimpleNamespace(max_retries=2, timeout=600.0))
+        seen["inner"] = value.client
+        return value
 
     monkeypatch.setitem(sys.modules, "agent_framework_foundry", SimpleNamespace(FoundryChatClient=client))
     monkeypatch.setitem(sys.modules, "azure.identity", SimpleNamespace(ManagedIdentityCredential=Credential))
@@ -147,3 +160,5 @@ def test_factory_uses_explicit_deployment_managed_identity_and_government_scope(
     assert seen["client"]["model"] == "explicit-test-model"
     seen["client"]["credential"].get_token("https://ai.azure.com/.default")
     assert seen["scopes"] == ("https://ai.azure.us/.default",)
+    assert seen["inner"].max_retries == 0
+    assert seen["inner"].timeout == float(MODEL_DEADLINE_SECONDS)
