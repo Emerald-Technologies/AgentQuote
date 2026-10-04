@@ -131,6 +131,8 @@ class CandidateReviewService:
         request = _json(self.storage, f"candidates/requests/{request_id}.json")
         evidence = _json(self.storage, (f"candidates/{request_id}/{candidate_id}/validation/"
                                         f"{validation_id}/evidence.json"), candidate=True)
+        if evidence.get("version") == "candidate-validation.v4":
+            raise CandidateReviewError("REVIEW_ASSOCIATION_AWARE_CONTRACT_REQUIRED")
         if (request.get("request_id") != request_id or evidence.get("request_id") != request_id
                 or evidence.get("candidate_id") != candidate_id
                 or evidence.get("validation_id") != validation_id
@@ -223,6 +225,8 @@ class CandidateReviewService:
             legacy.setdefault("output", evidence.get("output"))
             legacy.setdefault("status", "passed")
             legacy.setdefault("semantic", evidence.get("semantic", {}))
+            if evidence.get("version") == "candidate-validation.v4":
+                legacy["assembly_association"] = evidence.get("assembly_association")
             fixtures = [legacy]
         expected: dict[str, list[dict[str, Any]]] = {}
         for source in sources:
@@ -272,7 +276,8 @@ class CandidateReviewService:
             try:
                 _validate_xlsx_bytes(data, self.max_rows)
                 rows_by_hash[digest] = _parsed_rows(data)
-                facts = facts_from_rows(rows_by_hash[digest], output_sha256=output["sha256"])
+                facts = facts_from_rows(rows_by_hash[digest], output_sha256=output["sha256"],
+                    infer_document_assembly=evidence.get("version") != "candidate-validation.v4")
             except (Exception, SemanticFactsError):
                 raise CandidateReviewError("REVIEW_OUTPUT_INVALID") from None
             semantic = item.get("semantic")
@@ -287,6 +292,23 @@ class CandidateReviewService:
                     or claimed_identity != identity):
                 raise CandidateReviewError("REVIEW_SEMANTIC_BINDING")
             mapping_required = identity is None
+            association = None
+            if evidence.get("version") == "candidate-validation.v4":
+                from .assembly_association import verify_association
+                source = expected[digest][0]
+                try:
+                    source_bytes = self.storage.download_source(source["blob_path"], self.max_source_bytes)
+                    if (len(source_bytes) != source["size_bytes"]
+                            or hashlib.sha256(source_bytes).hexdigest() != digest):
+                        raise ValueError("source binding")
+                    association = verify_association(source_bytes, PurePosixPath(source["blob_path"]).suffix.lower(),
+                                                     item["assembly_association"]["proposal"])
+                    if association != item["assembly_association"] or association["has_blocking_findings"]:
+                        raise ValueError("association binding")
+                except Exception:
+                    raise CandidateReviewError("REVIEW_ASSOCIATION_BINDING") from None
+                identity = association["assembly_identity"]
+                mapping_required = False
             reviewed.append({
                 "fixture_sha256": digest,
                 "source_aliases": sorted(item.get("source_aliases", []),
@@ -296,6 +318,7 @@ class CandidateReviewService:
                 "mapping_required": mapping_required,
                 "fingerprint": semantic.get("fingerprint") if isinstance(semantic, dict) else None,
                 "model_summary": semantic.get("model_summary", {}) if isinstance(semantic, dict) else {},
+                **({"assembly_association": association} if association is not None else {}),
             })
 
         grouped: dict[tuple[str, str] | None, list[dict[str, Any]]] = {}

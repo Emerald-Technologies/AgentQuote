@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import json
 import re
 from html.parser import HTMLParser
 from typing import Any, Callable
@@ -147,6 +148,29 @@ def _response_text(response: Any) -> str:
     return "\n".join(chunks)
 
 
+def build_complete_inventory(source: bytes, extension: str) -> str:
+    """Send every supported cell with coordinates, or fail before a model call.
+
+    This bounded path never disguises truncation as full source visibility.
+    The existing preview remains available to legacy authoring requests.
+    """
+    from .interpretation_inventory import extract_inventory
+    inventory = extract_inventory(source, "." + extension.lower().lstrip("."))
+    if any(_SECRET.search(sheet) for sheet in inventory.sheets):
+        raise ValueError("AUTHORING_SOURCE_REDACTION_REQUIRES_REVIEW")
+    cells = []
+    for (sheet, row, column), value in sorted(inventory.cells.items()):
+        if isinstance(value, str) and _SECRET.search(value):
+            raise ValueError("AUTHORING_SOURCE_REDACTION_REQUIRES_REVIEW")
+        cells.append({"sheet": sheet, "row": row, "column": column, "value": value})
+    text = json.dumps({"version": "authoring-source-inventory.v1", "source_sha256": inventory.sha256,
+                       "sheets": inventory.sheets, "merged_ranges": inventory.merged_ranges,
+                       "coverage": "complete", "cells": cells}, ensure_ascii=False)
+    if len(text) > 120_000:
+        raise ValueError("AUTHORING_SOURCE_CONTEXT_LIMIT")
+    return text
+
+
 def strip_code_fences(text: str) -> str:
     match = re.fullmatch(r"\s*```(?:python|py)?\s*\n?(.*?)\n?```\s*", text, re.I | re.S)
     return match.group(1) if match else text
@@ -159,6 +183,9 @@ class FoundryModelAuthor:
 
     def generate(self, prompt: Any, source_bytes: bytes, prior_code: str | None = None,
                  failed_rule_id: str | None = None) -> str:
+        complete = getattr(prompt, "structural_profile", {}).get("source_visibility") == "complete-inventory.v1"
+        source_context = (build_complete_inventory(source_bytes, prompt.source_analysis.extension)
+                  if complete else build_preview(source_bytes, prompt.source_analysis.extension))
         async def invoke() -> str:
             factory = self.agent_factory
             if factory is None:
@@ -169,7 +196,7 @@ class FoundryModelAuthor:
             user_text = (f"Canonical columns in exact required order: {', '.join(prompt.canonical_columns)}\n"
                          f"Canonical output rules:\n{rules}\n"
                          f"Source format: {prompt.source_analysis.extension}\n"
-                         f"Workbook preview:\n{build_preview(source_bytes, prompt.source_analysis.extension)}")
+                         f"Workbook {'complete cell inventory' if complete else 'preview'}:\n{source_context}")
             if prior_code is not None:
                 user_text += (
                     "\nA previous candidate failed static policy rule "

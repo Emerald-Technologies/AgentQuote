@@ -636,7 +636,33 @@ class ParentPackageService:
             for fixture in group.get("fixtures", []):
                 key = fixture["fixture_sha256"]
                 data = self._candidate_bytes(fixture.get("output"), candidate_prefix)
-                facts = self._fixture_semantics(data)
+                association = fixture.get("assembly_association")
+                if association is not None:
+                    from pathlib import PurePosixPath
+                    from .assembly_association import verify_association
+                    from .semantic_facts import facts_from_rows
+                    request = _json(self.storage, f"candidates/requests/{request_id}.json")
+                    sources = [source for source in request.get("source_evidence", [])
+                               if source.get("sha256") == key]
+                    try:
+                        source = sources[0]
+                        original = self.storage.download_source(source["blob_path"], self.max_source_bytes)
+                        if len(original) != source["size_bytes"] or hashlib.sha256(original).hexdigest() != key:
+                            raise ValueError("source binding")
+                        verified = verify_association(original, PurePosixPath(source["blob_path"]).suffix.lower(),
+                                                      association["proposal"])
+                        if verified != association or verified["has_blocking_findings"]:
+                            raise ValueError("association binding")
+                    except Exception:
+                        raise PackageResolutionError("PACKAGE_ASSOCIATION_BINDING") from None
+                    parsed = facts_from_rows(self._rows(data), output_sha256=hashlib.sha256(data).hexdigest(),
+                                             infer_document_assembly=False)
+                    identity_value = verified["assembly_identity"]
+                    facts = {"assembly": AssemblyIdentity(identity_value["name"], identity_value["revision"]),
+                             "output_sha256": parsed.output_sha256, "semantic_fingerprint": parsed.fingerprint,
+                             "model_summary": parsed.model_summary}
+                else:
+                    facts = self._fixture_semantics(data)
                 claimed = fixture.get("assembly_identity")
                 if facts["assembly"] is None:
                     # Bytes carry no assembly identity: a stored claim is never
@@ -665,7 +691,8 @@ class ParentPackageService:
                         "prefix": candidate_prefix,
                     "output_sha256": facts["output_sha256"],
                     "semantic_fingerprint": facts["semantic_fingerprint"],
-                    "model_summary": facts["model_summary"]})
+                    "model_summary": facts["model_summary"],
+                    **({"assembly_association": association} if association is not None else {})})
         result = []
         for identity, fixtures in sorted(grouped.items()):
             evidence = {"request_id": request_id, "candidate_id": candidate_id,

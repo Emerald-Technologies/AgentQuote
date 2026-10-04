@@ -81,15 +81,20 @@ class AdminDecisionService:
             raise RegistryError("CANDIDATE_BINDING")
         evidence_path = f"{base}/validation/{validation_id}/evidence.json"
         evidence = _read(self.storage, evidence_path, True)
-        grouped_v3 = (evidence.get("version") == "candidate-validation.v3"
+        grouped_v3 = (evidence.get("version") == "candidate-validation.v4" or
+                 (evidence.get("version") == "candidate-validation.v3"
                   and isinstance(evidence.get("fixtures"), list)
                   and any(isinstance(item, dict) and "fixture_sha256" in item
-                      for item in evidence["fixtures"]))
+                      for item in evidence["fixtures"])))
         singleton_valid = (evidence.get("schema", {}).get("valid") is True)
         grouped_valid = (evidence.get("complete") is True
                  and evidence.get("fixture_count") == len(evidence.get("fixtures", []))
                  and all(isinstance(item, dict) and item.get("status") == "passed"
                      for item in evidence.get("fixtures", [])))
+        if (evidence.get("version") == "candidate-validation.v4"
+                and len(evidence.get("fixtures", [])) == 1
+                and "fixture_sha256" not in evidence["fixtures"][0]):
+            grouped_valid = singleton_valid
         if (evidence.get("request_id") != request_id or evidence.get("candidate_id") != candidate_id
                 or evidence.get("validation_id") != validation_id or evidence.get("status") != "awaiting_approval"
                 or evidence.get("candidate", {}).get("sha256") != _sha(code)

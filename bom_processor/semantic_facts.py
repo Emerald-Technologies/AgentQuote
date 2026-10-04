@@ -57,8 +57,9 @@ def document_assembly(rows: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -
     return AssemblyIdentity(name, revision)
 
 
-def facts_from_rows(rows: list[dict[str, Any]], *, output_sha256: str = "") -> SemanticFacts:
-    assembly = document_assembly(rows)
+def facts_from_rows(rows: list[dict[str, Any]], *, output_sha256: str = "",
+                    infer_document_assembly: bool = True) -> SemanticFacts:
+    assembly = document_assembly(rows) if infer_document_assembly else None
     model = normalize_bom(rows, assembly or AssemblyIdentity("", ""))
     mpn_count = sum(
         1

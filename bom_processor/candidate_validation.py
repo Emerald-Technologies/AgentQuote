@@ -30,7 +30,8 @@ def _norm(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
 
 
-def _semantic_output(output: bytes, source: bytes, subtype: str) -> dict[str, Any]:
+def _semantic_output(output: bytes, source: bytes, subtype: str, *,
+                     infer_document_assembly: bool = True) -> dict[str, Any]:
     import pandas as pd
     with tempfile.TemporaryDirectory(prefix="agentquote-semantic-") as directory:
         from pathlib import Path
@@ -61,7 +62,7 @@ def _semantic_output(output: bytes, source: bytes, subtype: str) -> dict[str, An
             # misclassified as html_table_xls). Fall back to output-only
             # semantic validation: identity and quantity checks already passed.
                 parsed_rows = frame.to_dict(orient="records")
-                facts = facts_from_rows(parsed_rows)
+                facts = facts_from_rows(parsed_rows, infer_document_assembly=infer_document_assembly)
                 return {"valid": True, "result": "valid", "source_rows": 0,
                     "output_rows": output_rows, "coverage_basis": "output_only",
                     "fingerprint": facts.fingerprint,
@@ -79,7 +80,7 @@ def _semantic_output(output: bytes, source: bytes, subtype: str) -> dict[str, An
         coverage_basis = "source_rows_and_identity"
     parsed_rows = frame.to_dict(orient="records")
     try:
-        facts = facts_from_rows(parsed_rows)
+        facts = facts_from_rows(parsed_rows, infer_document_assembly=infer_document_assembly)
     except SemanticFactsError:
         return {**base, "source_rows": source_rows,
                 "coverage_basis": "assembly_identity_conflict"}
@@ -147,7 +148,8 @@ class CandidateValidationService:
                  max_parser_bytes: int = 1_000_000, max_output_bytes: int = 50_000_000,
                  max_rows: int = 100_000, job_resource: str = "",
                  worker_image: str = "", clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 assembly_associations: dict[str, dict[str, Any]] | None = None) -> None:
         self.request_id = _identifier(request_id, "INVALID_REQUEST_ID")
         self.candidate_id = _identifier(candidate_id, "INVALID_CANDIDATE_ID")
         limits = (timeout_seconds, poll_interval_seconds, max_source_bytes,
@@ -160,21 +162,42 @@ class CandidateValidationService:
         self.max_output_bytes, self.max_rows = max_output_bytes, max_rows
         self.job_resource, self.worker_image = job_resource, worker_image
         self.clock, self.sleep = clock, sleep
+        self.assembly_associations = assembly_associations
+        self.validation_version = ("candidate-validation.v4" if assembly_associations is not None
+                                   else VALIDATION_VERSION)
+
+    def _association(self, source: bytes, evidence: dict[str, Any]) -> dict[str, Any] | None:
+        if self.assembly_associations is None:
+            return None
+        from .assembly_association import verify_association
+        try:
+            result = verify_association(source, PurePosixPath(evidence["blob_path"]).suffix.lower(),
+                                        self.assembly_associations[evidence["sha256"].lower()])
+        except Exception:
+            raise CandidateValidationError("ASSEMBLY_ASSOCIATION_INVALID") from None
+        if result["has_blocking_findings"]:
+            raise CandidateValidationError("ASSEMBLY_ASSOCIATION_REVIEW_REQUIRED")
+        return result
 
     def validate(self) -> CandidateValidationResult:
         request = self._request()
         manifest, code = self._candidate(request)
         fixtures = unique_fixtures(request["source_evidence"])
+        if self.assembly_associations is not None and set(self.assembly_associations) != {
+                item["sha256"].lower() for item in fixtures}:
+            raise CandidateValidationError("ASSEMBLY_ASSOCIATION_COVERAGE_INVALID")
         if len(fixtures) > 1 or len(fixtures[0].get("source_aliases", [])) > 1:
             return self._validate_group(request, manifest, code, fixtures)
         source_evidence = request["source_evidence"][0]
         source = self._source(source_evidence)
+        association = self._association(source, source_evidence)
         validation_id = _sha256(_json_bytes({
-            "version": VALIDATION_VERSION,
+            "version": self.validation_version,
             "request_id": self.request_id,
             "candidate_id": self.candidate_id,
             "code_sha256": manifest["code_sha256"],
             "fixture_sha256": source_evidence["sha256"].lower(),
+            **({"assembly_association": association} if association is not None else {}),
         }))
         base = f"candidates/{self.request_id}/{self.candidate_id}/validation/{validation_id}"
         evidence_path = f"{base}/evidence.json"
@@ -226,7 +249,8 @@ class CandidateValidationService:
             try:
                 semantic = _semantic_output(
                     output, source,
-                    str(request.get("profile", {}).get("source_subtype", "")))
+                    str(request.get("profile", {}).get("source_subtype", "")),
+                    infer_document_assembly=association is None)
             except Exception:
                 semantic = {"valid": False, "result": "semantic_output_invalid",
                             "source_rows": 0, "output_rows": 0,
@@ -249,7 +273,7 @@ class CandidateValidationService:
                             "coverage_basis": f"arena_policy:{arena_evidence.get('reason', 'invalid')}"}
         resulting_status = "awaiting_approval" if validation_valid else "generated_unvalidated"
         evidence = {
-            "version": VALIDATION_VERSION,
+            "version": self.validation_version,
             "validation_id": validation_id,
             "request_id": self.request_id,
             "candidate_id": self.candidate_id,
@@ -270,6 +294,8 @@ class CandidateValidationService:
                        "execution_name": started.execution_name,
                        "image_reference": self.worker_image},
         }
+        if association is not None:
+            evidence["assembly_association"] = association
         if arena_evidence is not None:
             evidence["arena_policy"] = arena_evidence
         try:
@@ -278,7 +304,7 @@ class CandidateValidationService:
             if validation_valid:
                 event_path = (f"candidates/events/{self.request_id}/{self.candidate_id}/"
                               f"validated-{validation_id}.json")
-                event = {"version": VALIDATION_VERSION, "event": "candidate.validated",
+                event = {"version": self.validation_version, "event": "candidate.validated",
                          "request_id": self.request_id, "candidate_id": self.candidate_id,
                          "validation_id": validation_id, "prior_status": "generated_unvalidated",
                          "status": "awaiting_approval", "evidence_path": evidence_path,
@@ -303,9 +329,11 @@ class CandidateValidationService:
     def _validate_group(self, request: dict[str, Any], manifest: dict[str, Any], code: bytes,
                         fixtures: tuple[dict[str, Any], ...]) -> CandidateValidationResult:
         """Validate every unique byte fixture and persist one aggregate record."""
-        validation_id = _sha256(_json_bytes({"version": VALIDATION_VERSION, "request_id": self.request_id,
+        validation_id = _sha256(_json_bytes({"version": self.validation_version, "request_id": self.request_id,
                                              "candidate_id": self.candidate_id, "code_sha256": manifest["code_sha256"],
-                                             "fixtures": [item["sha256"].lower() for item in fixtures]}))
+                                                            "fixtures": [item["sha256"].lower() for item in fixtures],
+                                                            **({"assembly_associations": self.assembly_associations}
+                                                                if self.assembly_associations is not None else {})}))
         base = f"candidates/{self.request_id}/{self.candidate_id}/validation/{validation_id}"
         evidence_path = f"{base}/evidence.json"
         existing = self._optional_candidate(evidence_path)
@@ -315,6 +343,7 @@ class CandidateValidationService:
         all_valid = True
         for index, source_evidence in enumerate(fixtures):
             source = self._source(source_evidence)
+            association = self._association(source, source_evidence)
             fixture_id = _sha256(_json_bytes({"validation_id": validation_id, "fixture": source_evidence["sha256"].lower()}))
             job_id = f"validate-{fixture_id[:32]}"
             item = WorkItem(job_id, "boms", "parsers", "parsers", source_evidence["blob_path"],
@@ -334,7 +363,8 @@ class CandidateValidationService:
                     _validate_xlsx_bytes(output, self.max_rows)
                 except Exception:
                     schema_valid = False
-                semantic = _semantic_output(output, source, str(request.get("profile", {}).get("source_subtype", ""))) if schema_valid else {"valid": False, "result": "schema_invalid"}
+                semantic = _semantic_output(output, source, str(request.get("profile", {}).get("source_subtype", "")),
+                    infer_document_assembly=association is None) if schema_valid else {"valid": False, "result": "schema_invalid"}
                 policy = None
                 if schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls" and is_arena_source(source):
                     policy = validate_arena(source, output, source_sha256=source_evidence["sha256"].lower(),
@@ -345,11 +375,13 @@ class CandidateValidationService:
                     "sha256": _sha256(output), "size_bytes": len(output), "content_type": OUTPUT_CONTENT_TYPE},
                     "schema": {"valid": schema_valid}, "semantic": semantic, "worker": {"execution_name": started.execution_name},
                     "arena_policy": policy})
+                if association is not None:
+                    record["assembly_association"] = association
             except Exception as exc:
                 all_valid = False
                 record["failure"] = {"code": exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"}
             parsed.append(record)
-        evidence = {"version": VALIDATION_VERSION, "validation_id": validation_id, "request_id": self.request_id,
+        evidence = {"version": self.validation_version, "validation_id": validation_id, "request_id": self.request_id,
                     "candidate_id": self.candidate_id, "prior_status": "generated_unvalidated",
                     "status": "awaiting_approval" if all_valid else "generated_unvalidated",
                     "candidate": {"blob_path": f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
@@ -361,7 +393,7 @@ class CandidateValidationService:
             self.storage.upload_candidate_immutable(evidence_path, _json_bytes(evidence), "application/json")
             if all_valid:
                 event_path = f"candidates/events/{self.request_id}/{self.candidate_id}/validated-{validation_id}.json"
-                self.storage.upload_candidate_immutable(event_path, _json_bytes({"version": VALIDATION_VERSION,
+                self.storage.upload_candidate_immutable(event_path, _json_bytes({"version": self.validation_version,
                     "event": "candidate.validated", "request_id": self.request_id, "candidate_id": self.candidate_id,
                     "validation_id": validation_id, "status": "awaiting_approval", "evidence_path": evidence_path}), "application/json")
         except BlobConflictError:
@@ -446,7 +478,8 @@ class CandidateValidationService:
 
     def _verify_worker_result(self, raw: bytes, item: WorkItem) -> dict[str, Any]:
         value = _load_json(raw, "WORKER_RESULT_INVALID")
-        if (value.get("contract_version") != "remote-worker.v1"
+        expected_contract = "remote-worker.v2" if item.interpretation_name else "remote-worker.v1"
+        if (value.get("contract_version") != expected_contract
                 or value.get("job") != item.job_id or value.get("status") != "completed"):
             raise CandidateValidationError("WORKER_RESULT_INVALID")
         for section, expected_hash, expected_size in (
@@ -468,11 +501,40 @@ class CandidateValidationService:
             raise CandidateValidationError("WORKER_OUTPUT_MISSING") from None
         if len(data) != output["size"] or _sha256(data) != output["sha256"].lower():
             raise CandidateValidationError("WORKER_OUTPUT_INTEGRITY")
+        if item.interpretation_name:
+            interpretation = value.get("interpretation")
+            if (not isinstance(interpretation, dict) or interpretation.get("content_type") != "application/json"
+                    or type(interpretation.get("size")) is not int or not 0 < interpretation["size"] <= 1024 * 1024
+                    or not isinstance(interpretation.get("sha256"), str)
+                    or not _SHA.fullmatch(interpretation["sha256"])):
+                raise CandidateValidationError("WORKER_INTERPRETATION_INVALID")
+            try:
+                sidecar = self.storage.download_candidate(item.interpretation_blob, 1024 * 1024)
+                if len(sidecar) != interpretation["size"] or _sha256(sidecar) != interpretation["sha256"]:
+                    raise CandidateValidationError("WORKER_INTERPRETATION_INTEGRITY")
+                source = self.storage.download_source(item.source_blob, self.max_source_bytes)
+                if len(source) != item.input_size or _sha256(source) != item.input_sha256:
+                    raise CandidateValidationError("WORKER_SOURCE_INTEGRITY")
+                from .interpretation_coverage import verify_coverage
+                verified = verify_coverage(source, PurePosixPath(item.input_name).suffix, data, sidecar)
+            except CandidateValidationError:
+                raise
+            except Exception:
+                raise CandidateValidationError("WORKER_INTERPRETATION_VERIFICATION_FAILED") from None
+            if interpretation.get("verification") != verified:
+                raise CandidateValidationError("WORKER_INTERPRETATION_CLAIM_MISMATCH")
+            if verified["has_blocking_findings"]:
+                raise CandidateValidationError("WORKER_INTERPRETATION_REVIEW_REQUIRED")
+            # Return independently bound evidence, never trust an arbitrary
+            # worker-supplied path or promote provenance to semantic authority.
+            value["interpretation"] = {"blob_path": item.interpretation_blob,
+                                       "sha256": _sha256(sidecar), "size": len(sidecar),
+                                       "content_type": "application/json", "verification": verified}
         return value
 
     def _existing_result(self, evidence: dict[str, Any], validation_id: str,
                          evidence_path: str) -> CandidateValidationResult:
-        if (evidence.get("version") != VALIDATION_VERSION
+        if (evidence.get("version") != self.validation_version
                 or evidence.get("validation_id") != validation_id
                 or evidence.get("request_id") != self.request_id
                 or evidence.get("candidate_id") != self.candidate_id):

@@ -92,7 +92,7 @@ class CandidateStatusService:
             if ev:
                 validation_id = ev[0].get("validation_id")
                 fixtures = ev[0].get("fixtures")
-                if (ev[0].get("version") == "candidate-validation.v3"
+                if (ev[0].get("version") in {"candidate-validation.v3", "candidate-validation.v4"}
                         and isinstance(fixtures, list) and fixtures
                         and any(isinstance(item, dict) and "fixture_sha256" in item for item in fixtures)):
                     complete = (ev[0].get("complete") is True
