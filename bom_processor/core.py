@@ -647,7 +647,10 @@ def _validate_xlsx(path: Path, max_rows: int) -> None:
                 raise ProcessingError("string value invalid")
     if not frame["item_category"].isin(["Part", "Document"]).all():
         raise ProcessingError("item category invalid")
-    quantities = pd.to_numeric(frame["quantity"], errors="coerce")
+    # Documents carry evidence, not priced quantities. Preserve blanks rather
+    # than manufacturing a quantity; supplied numeric cells retain validation.
+    required_quantity = (frame["item_category"] != "Document") | frame["quantity"].map(_is_present)
+    quantities = pd.to_numeric(frame.loc[required_quantity, "quantity"], errors="coerce")
     if quantities.isna().any() or not quantities.map(math.isfinite).all():
         raise ProcessingError("quantity invalid")
     for index in range(1, 9):

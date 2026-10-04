@@ -15,7 +15,7 @@ MAX_CODE_BYTES = 1_000_000
 MAX_SOURCE_BYTES = 50_000_000
 # Version changes are identity changes: a replacement cannot reuse a
 # contained candidate produced by an older authoring policy.
-AUTHORING_VERSION = "candidate-authoring.v4"
+AUTHORING_VERSION = "candidate-authoring.v5"
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
     "write exactly the supplied canonical columns in the supplied order and at least one data row",
@@ -23,7 +23,7 @@ CANONICAL_OUTPUT_RULES = (
     "item_number, item_name, and item_category must be non-empty trimmed strings",
     "map source component taxonomy such as Capacitor, Resistor, or PCB assembly to canonical item_category='Part'; reserve item_category='Document' for document, drawing, or specification rows; do not require the source category to already be Part or Document",
     "item_category must be exactly Part or Document after applying the source taxonomy mapping",
-    "quantity must be a finite number",
+    "Part quantity must be a finite number; Document quantity is not priced, preserve supplied numeric values or None when absent, never invent a quantity",
     "all populated strings must be trimmed; use None for unavailable optional values",
     "manufacturer_N and manufacturer_item_number_N must either both be populated or both be empty for N 1 through 8",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
@@ -35,7 +35,7 @@ HTML_XLS_RULES = (
     "for source_subtype html_table_xls, map extracted rows to the standard XLSX output format",
     "for source_subtype html_table_xls, preserve the actual source category in bom_notes when useful, but never fabricate a category or row",
     "map real source rows only; never fabricate fallback rows or substitute identity with UNKNOWN, N/A, TBD, TBC, or placeholders",
-    "for Arena HTML exports, apply arena-html-policy.v1: preserve item identities, quantities, and manufacturer pairs exactly; never coerce missing quantities to 1",
+    "for Arena HTML exports, apply arena-html-policy.v2: preserve item identities and manufacturer pairs; retain Drawing, Procedure, Document and Specification rows as Document regardless of quantity, preserve supplied numeric quantities or None when absent; never coerce missing quantities to 1",
 )
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _HASH = re.compile(r"^[0-9a-fA-F]{64}$")

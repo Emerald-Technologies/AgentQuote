@@ -143,10 +143,11 @@ def _component(row: Mapping[str, Any]) -> Component:
     revision = _norm(_first(row, ("revision", "component_revision", "component revision", "rev")))
     if not item:
         raise ValueError("each BOM row requires an item number")
+    category = _norm(_first(row, ("item_category", "category", "type")))
     material = (
-        ("category", _norm(_first(row, ("item_category", "category", "type")))),
+        ("category", category),
         ("unit_of_measure", _norm(_first(row, ("unit_of_measure", "uom", "unit", "units")))),
-        ("quantity", _number(_first(row, ("quantity", "qty", "amount")))),
+        ("quantity", "" if category == "document" else _number(_first(row, ("quantity", "qty", "amount")))),
         ("refdes", _refs(_first(row, ("reference_designator", "reference_designators", "refdes", "refs")))),
         ("install", _norm(_first(row, ("install", "installation", "install_type", "mount_type")))),
     )

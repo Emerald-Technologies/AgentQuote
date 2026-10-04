@@ -53,26 +53,29 @@ def validate_fixture(source: bytes, parsed_bytes: bytes):
                     candidate_code_sha256="c" * 64, output_sha256=sha(parsed_bytes))
 
 
-def test_omits_only_parent_and_zero_quantity_reference_rows():
+def test_retains_reference_rows_and_omits_only_existing_parent_case():
     source = arena([
         ["ASM-1", "Assembly", "A", "Printed Circuit Board Assembly", "EA", "", "", ""],
         ["PROC-1", "Programming", "A", "Procedure", "EA", "0", "", "Reference"],
         ["DRAW-1", "Schematic", "A", "Drawing", "EA", "0", "", "Reference"],
         ["P1", "Component", "A", "Resistor", "EA", "2", "R1", "SMT", "Maker", "MPN-1"],
     ])
-    parsed_bytes = output([parsed("P1", 2)])
+    documents = [parsed("PROC-1", 0, "", ""), parsed("DRAW-1", 0, "", "")]
+    for row in documents:
+        row["item_category"] = "Document"
+    parsed_bytes = output(documents + [parsed("P1", 2)])
     evidence = validate_fixture(source, parsed_bytes)
     assert evidence["valid"] is True
-    assert evidence["included_count"] == 1
-    assert evidence["omitted_count"] == 3
-    assert [item["item_number"] for item in evidence["omissions"]] == ["ASM-1", "PROC-1", "DRAW-1"]
+    assert evidence["included_count"] == 3
+    assert evidence["omitted_count"] == 1
+    assert [item["item_number"] for item in evidence["omissions"]] == ["ASM-1"]
     assert verify_evidence(evidence) is True
     evidence["omissions"][0]["item_number"] = "CHANGED"
     assert verify_evidence(evidence) is False
     assert [decision["decision"] for decision in evidence["decisions"]] == [
         "omitted_parent_blank_quantity",
-        "omitted_procedure_zero_quantity",
-        "omitted_drawing_zero_quantity",
+        "include",
+        "include",
         "include",
     ]
 

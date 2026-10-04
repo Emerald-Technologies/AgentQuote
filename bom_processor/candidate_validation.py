@@ -48,7 +48,8 @@ def _semantic_output(output: bytes, source: bytes, subtype: str) -> dict[str, An
         if not item or not name or item in placeholders or name in placeholders:
             return {**base, "coverage_basis": "identity"}
         quantity = row.get("quantity")
-        if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(float(quantity)) or quantity <= 0:
+        document = _norm(row.get("item_category")) == "DOCUMENT"
+        if not document and (isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(float(quantity)) or quantity <= 0):
             return {**base, "coverage_basis": "quantity"}
         identities.append({item, name})
     source_rows, coverage_basis = 0, "not_applicable"

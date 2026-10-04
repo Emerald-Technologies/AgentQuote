@@ -72,7 +72,7 @@ def test_job_reports_safe_authoring_error_code(monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output == {"error": "candidate_authoring_failed", "error_code": "CANDIDATE_CODE_POLICY",
                       "request_id": "request-1", "rule_id": "banned_import", "status": "error"}
-    marker_path = ("candidate-automation/request-1/author/candidate-authoring.v4/"
+    marker_path = ("candidate-automation/request-1/author/candidate-authoring.v5/"
                    "attempt-1.failed.json")
     marker = json.loads(storage.registry[marker_path])
     assert marker["error_code"] == "CANDIDATE_CODE_POLICY"
@@ -110,6 +110,6 @@ def test_job_success_records_completed_attempt(monkeypatch, capsys):
 
     assert candidate_job.main() == 0
     assert json.loads(capsys.readouterr().out)["candidate_id"] == "candidate-1"
-    marker_path = ("candidate-automation/request-1/author-refinement/candidate-authoring.v4/"
+    marker_path = ("candidate-automation/request-1/author-refinement/candidate-authoring.v5/"
                    "attempt-2.completed.json")
     assert json.loads(storage.registry[marker_path])["candidate_id"] == "candidate-1"

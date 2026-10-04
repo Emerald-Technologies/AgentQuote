@@ -13,7 +13,8 @@ import pandas as pd
 from .core import CANONICAL_COLUMNS
 from .master_registry import html_table_raw_rows
 
-POLICY_VERSION = "arena-html-policy.v1"
+POLICY_VERSION = "arena-html-policy.v2"
+_DOCUMENT_CATEGORIES = {"document", "drawing", "procedure", "specification"}
 _PAIR = re.compile(r"^(?:manufacturer|manufacturer_name)_(\d+)$")
 _MPN = re.compile(r"^(?:manufacturer_item_number|manufacturer_part_number)_(\d+)$")
 
@@ -92,22 +93,20 @@ def validate(source: bytes, output: bytes, *, source_sha256: str, candidate_code
         populated = [(index, name, mpn) for index, name, mpn in pair_values if name or mpn]
         if not item:
             return {**base, "valid": False, "reason": "blank_item_number", "decisions": decisions}
-        if quantity is None:
+        document = category.casefold() in _DOCUMENT_CATEGORIES
+        if not document and quantity is None:
             parent = (row_number == header_index + 2 and category == "Printed Circuit Board Assembly"
                       and not refdes and not populated)
             if parent:
                 decisions.append({"row": row_number, "item_number": item, "decision": "omitted_parent_blank_quantity"})
                 continue
             return {**base, "valid": False, "reason": "blank_quantity", "row": row_number, "decisions": decisions}
-        if math.isnan(quantity) or quantity < 0:
+        if not document and (math.isnan(quantity) or quantity < 0):
             return {**base, "valid": False, "reason": "invalid_quantity", "row": row_number, "decisions": decisions}
-        if quantity == 0:
-            if category in {"Procedure", "Drawing"}:
-                decisions.append({"row": row_number, "item_number": item,
-                                  "decision": f"omitted_{category.lower()}_zero_quantity"})
-                continue
+        if not document and quantity == 0:
             return {**base, "valid": False, "reason": "zero_quantity", "row": row_number, "decisions": decisions}
-        source_items.append({"item_number": item, "quantity": quantity, "pairs": populated})
+        source_items.append({"item_number": item, "quantity": quantity, "pairs": populated,
+                             "document": document})
         decisions.append({"row": row_number, "item_number": item, "decision": "include"})
         for index, name, mpn in populated:
             if index > 8 and name and mpn:
@@ -134,6 +133,15 @@ def validate(source: bytes, output: bytes, *, source_sha256: str, candidate_code
         return {**base, "valid": False, "reason": "identity_coverage", "decisions": decisions}
     for item in source_items:
         row = output_items[item["item_number"]]
+        if item["document"] and _text(row.get("item_category")).casefold() != "document":
+            return {**base, "valid": False, "reason": "document_category_mismatch",
+                    "item_number": item["item_number"], "decisions": decisions}
+        if item["document"]:
+            supplied = row.get("quantity")
+            actual = None if pd.isna(supplied) else _number(supplied)
+            if actual != item["quantity"]:
+                return {**base, "valid": False, "reason": "document_quantity_changed",
+                        "item_number": item["item_number"], "decisions": decisions}
         for index, name, mpn in item["pairs"]:
             if index > 8:
                 continue
