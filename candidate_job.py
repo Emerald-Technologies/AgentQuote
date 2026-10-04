@@ -62,6 +62,13 @@ def main() -> int:
         credential = (ManagedIdentityCredential(client_id=client_id)
                   if client_id else ManagedIdentityCredential())
         storage = AzureBlobStorage.from_account_url(os.environ["BOM_STORAGE_ACCOUNT_URL"], credential)
+        budget_values = [os.environ.get(key, "") for key in
+                         ("AUTHOR_BUDGET_GROUP", "AUTHOR_BUDGET_SLOT", "AUTHOR_BUDGET_RESERVATION")]
+        if any(budget_values):
+            from bom_processor.author_budget import begin_execution
+            if not all(budget_values):
+                raise ValueError("invalid author budget environment")
+            budget_owner = begin_execution(storage, budget_values[0], int(budget_values[1]), request_id, budget_values[2])
         feedback = os.environ.get("AUTHOR_FEEDBACK", "") or None
         # Only pass the feedback keyword when present so older injected doubles
         # that do not accept it continue to work unchanged.
@@ -72,6 +79,10 @@ def main() -> int:
         if attempt_context:
             _write_attempt_marker(storage, request_id, attempt_context, "completed",
                                   {"candidate_id": result.candidate_id})
+        if any(budget_values):
+            from bom_processor.author_budget import complete
+            complete(storage, budget_values[0], int(budget_values[1]), request_id,
+                     budget_values[2], "completed", result.candidate_id, execution_owner=budget_owner)
         print(json.dumps({"status": result.status, "request_id": result.request_id,
                           "candidate_id": result.candidate_id, "manifest_path": result.manifest_path}, sort_keys=True))
         return 0
@@ -94,6 +105,13 @@ def main() -> int:
             if rule_id: marker["rule_id"] = rule_id
             try:
                 _write_attempt_marker(storage, request_id, attempt_context, "failed", marker)
+            except Exception:
+                pass
+        if storage is not None and 'budget_owner' in locals() and all(budget_values):
+            try:
+                from bom_processor.author_budget import complete
+                complete(storage, budget_values[0], int(budget_values[1]), request_id,
+                         budget_values[2], "failed", execution_owner=budget_owner)
             except Exception:
                 pass
         payload = {"status": "error", "request_id": request_id, "error": error}

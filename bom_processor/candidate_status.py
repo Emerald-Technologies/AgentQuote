@@ -81,6 +81,28 @@ class CandidateStatusService:
                     raise CandidateStatusError("candidate namespace violation")
                 evidence.setdefault(candidate_id, []).append(item)
         records = []
+        budget_candidate = None
+        budget_state = None
+        from .core import BlobNotFoundError
+        def has_budget_record(path: str) -> bool:
+            try:
+                self.storage.download_registry(path, 100_000)
+                return True
+            except (BlobNotFoundError, FileNotFoundError):
+                return False
+        budget_paths = has_budget_record(f"author-budget/v1/members/{request_id}.json")
+        required_paths = has_budget_record(f"author-budget/v1/required/{request_id}.json")
+        if (budget_paths or required_paths
+            or self.automation and getattr(self.automation, "author_budget_enabled", False)):
+            from .author_budget import Budget
+            options = {"clock": self.automation.budget_clock} if self.automation and getattr(self.automation, "author_budget_enabled", False) else {}
+            budget = Budget(self.storage, request_id, **options)
+            budget_state = budget.inspect()
+            if budget_state["status"] != "legacy":
+                try:
+                    budget_candidate = budget.selected_candidate()
+                except Exception:
+                    budget_state = {"status": "hold", "reason": "budget_invalid"}
         for candidate_id, manifest in manifests.items():
             if manifest.get("status") not in {"generated_unvalidated"}:
                 raise CandidateStatusError("invalid candidate artifact")
@@ -123,6 +145,10 @@ class CandidateStatusService:
         else:
             top = max(row[0] for row in records)
             choices = [row for row in records if row[0] == top]
+            if budget_candidate is not None:
+                choices = [row for row in records if row[2] == budget_candidate]
+                if len(choices) != 1:
+                    raise CandidateStatusError("invalid budget candidate lineage")
             if len(choices) != 1:
                 # A refinement re-authors a candidate at the same authoring
                 # version, so the superseded (refined) candidate must not tie
@@ -137,10 +163,16 @@ class CandidateStatusService:
             selected = (candidate_id, status, validation_id, manifest, decision)
         result = {"request_id": request_id, "parser_key": request["parser_key"], "customer_key": request["customer_key"],
                   "status": status, "profile_hash": request["profile_hash"], "source_document_count": len(source)}
-        if self.automation and not selected and status == "requested":
+        budget_held = bool(budget_state and budget_state["status"] == "hold")
+        if budget_held and status not in {"awaiting_approval", "approved", "rejected"}:
+            result["automation_error"] = budget_state["reason"]
+        if self.automation and not budget_held and not selected and status == "requested":
             try:
-                if self.automation.start_author(request_id) == "exhausted":
+                outcome = self.automation.start_author(request_id)
+                if outcome == "exhausted":
                     result["automation_error"] = "author_attempts_exhausted"
+                elif isinstance(outcome, str) and outcome.startswith("budget_"):
+                    result["automation_error"] = outcome
             except Exception:
                 result["automation_error"] = "author_start_failed"
         if selected:
@@ -172,7 +204,7 @@ class CandidateStatusService:
                     self.automation.start_validator(request_id, candidate_id)
                 except Exception:
                     result["automation_error"] = "validator_start_failed"
-            if self.automation and status in {"generated_unvalidated", "schema_invalid"}:
+            if self.automation and not budget_held and status in {"generated_unvalidated", "schema_invalid"}:
                 # Refinement loop: if validation already failed for this
                 # candidate, re-author with the failure feedback. Attempt
                 # markers inside the automation bound the number of retries.
@@ -190,7 +222,9 @@ class CandidateStatusService:
                         failure_event = {"failure": "SchemaError",
                                          "failure_message": "canonical_schema_invalid"}
                     if failure_event is not None and failure_event.get("repairable") is not False:
-                        self.automation.start_author_refinement(request_id, candidate_id, failure_event)
+                        outcome = self.automation.start_author_refinement(request_id, candidate_id, failure_event)
+                        if isinstance(outcome, str) and outcome.startswith("budget_"):
+                            result["automation_error"] = outcome
                     elif failure_event is not None:
                         result["automation_error"] = "validation_failure_requires_review"
                 except Exception:

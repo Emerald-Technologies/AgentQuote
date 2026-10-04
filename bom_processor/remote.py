@@ -32,6 +32,7 @@ class RemoteBomProcessor:
                  max_output_bytes=50_000_000, max_rows=100_000,
                  registry_reader: BlobRegistryReader | None = None,
                  candidate_clock=None,
+                 author_budget_enabled: bool = False,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         limits = (timeout_seconds, poll_interval_seconds, max_source_bytes, max_total_source_bytes,
@@ -44,6 +45,7 @@ class RemoteBomProcessor:
         self.max_parser_bytes, self.max_output_bytes, self.max_rows = max_parser_bytes, max_output_bytes, max_rows
         self.clock, self.sleep = clock, sleep
         self.candidate_clock = candidate_clock
+        self.author_budget_enabled = author_budget_enabled
         reader = getattr(storage, "download_registry", None)
         self.registry_reader = registry_reader or (BlobRegistryReader(reader, max_bytes=max_parser_bytes) if reader else None)
 
@@ -121,14 +123,15 @@ class RemoteBomProcessor:
                                      for d in documents)
                     candidate = persist_candidate(self.storage, request.parser_key,
                                                   request.customer_key, profile, evidence,
-                                                  self.candidate_clock)
+                                                self.candidate_clock, stable_order=self.author_budget_enabled)
                     pending.append(CandidateRequiredError(
                         candidate.request_id, request.parser_key, profile.profile_hash,
                         tuple(d.document_id for d in documents)))
                 if (len(pending) == 1 and not selections
                         and len(pending[0].document_ids) == 1
                         and len(request.documents) == 1):
-                    raise pending[0] from exc
+                    if not self.author_budget_enabled:
+                        raise pending[0] from exc
                 self._raise_grouped(request, selections, pending, exc)
             else:
                 if exc.code != "REGISTRY_ABSENT":
@@ -140,14 +143,15 @@ class RemoteBomProcessor:
                                  for d in documents)
                 candidate = persist_candidate(self.storage, request.parser_key,
                                               request.customer_key, profile, evidence,
-                                              self.candidate_clock)
+                                            self.candidate_clock, stable_order=self.author_budget_enabled)
                 pending.append(CandidateRequiredError(
                     candidate.request_id, request.parser_key, profile.profile_hash,
                     tuple(d.document_id for d in documents)))
             if (len(pending) == 1 and not selections
                     and len(pending[0].document_ids) == 1
                     and len(request.documents) == 1):
-                raise pending[0]
+                if not self.author_budget_enabled:
+                    raise pending[0]
             self._raise_grouped(request, selections, pending)
         if pending:
             raise AggregateCandidateRequiredError(tuple(pending))
@@ -244,6 +248,12 @@ class RemoteBomProcessor:
                 pending_assignments=[{"request_id": item.request_id,
                                       "document_ids": list(item.document_ids)}
                                      for item in pending])
+        if self.author_budget_enabled:
+            from .author_budget import Budget, enroll
+            for item in pending:
+                if Budget(self.storage, item.request_id).inspect()["status"] == "legacy":
+                    continue  # Existing opt-out requests are never backfilled.
+                enroll(self.storage, plan, item.request_id)
         error = AggregateCandidateRequiredError(tuple(pending), plan["plan_id"])
         if cause is not None:
             raise error from cause
@@ -263,11 +273,11 @@ class RemoteBomProcessor:
                              for d in documents)
             candidate = persist_candidate(self.storage, request.parser_key,
                                           request.customer_key, profile, evidence,
-                                          self.candidate_clock)
+                                          self.candidate_clock, stable_order=self.author_budget_enabled)
             errors.append(CandidateRequiredError(candidate.request_id, request.parser_key,
                                                   profile.profile_hash,
                                                   tuple(d.document_id for d in documents)))
-        if len(errors) == 1 and len(request.documents) == 1:
+        if len(errors) == 1 and len(request.documents) == 1 and not self.author_budget_enabled:
             raise errors[0] from cause
         self._raise_grouped(request, {}, errors, cause)
 

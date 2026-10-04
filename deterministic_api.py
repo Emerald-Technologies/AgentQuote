@@ -239,8 +239,11 @@ class ProcessingApi:
                 automation = self.automation_factory()
                 for group, item in zip(groups, exc.candidates):
                     try:
-                        if automation.start_author(item.request_id) == "exhausted":
+                        outcome = automation.start_author(item.request_id)
+                        if outcome == "exhausted":
                             group["automation_error"] = "author_attempts_exhausted"
+                        elif isinstance(outcome, str) and outcome.startswith("budget_"):
+                            group["automation_error"] = outcome
                     except Exception:
                         group["automation_error"] = "author_start_failed"
             return 202, {"version": CONTRACT_VERSION, "status": "candidates_required",
@@ -604,7 +607,11 @@ def _processor_factory(config: ApiConfig) -> BomProcessor:
             },
         },
     )
+    budget_policy = os.environ.get("BOM_AUTHOR_GROUP_BUDGET", "false")
+    if budget_policy not in {"true", "false"}:
+        raise RuntimeError("invalid author budget policy")
     return RemoteBomProcessor(storage, JobOrchestrator(Reader(), sas, starter),
+                               author_budget_enabled=budget_policy == "true",
                                registry_reader=BlobRegistryReader(storage.download_registry,
                                                                    max_bytes=config.processor_options["max_parser_bytes"]),
                                **config.processor_options)
@@ -662,7 +669,15 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
                                  container_name=os.environ.get("BOM_CANDIDATE_VALIDATOR_CONTAINER_NAME", "candidate-validator"),
                                  image=os.environ.get("BOM_CANDIDATE_VALIDATOR_IMAGE", ""),
                                  base_environment=validator_environment, resources=resources),
-        max_author_attempts=max_author_attempts)
+        max_author_attempts=max_author_attempts,
+        author_budget_enabled=_author_budget_enabled())
+
+
+def _author_budget_enabled() -> bool:
+    value = os.environ.get("BOM_AUTHOR_GROUP_BUDGET", "false")
+    if value not in {"true", "false"}:
+        raise RuntimeError("invalid author budget policy")
+    return value == "true"
 
 
 def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,

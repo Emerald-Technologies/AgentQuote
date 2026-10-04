@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
@@ -47,8 +48,11 @@ class CandidateAutomationService:
     MAX_ATTEMPTS = 3
 
     def __init__(self, storage: Any, author_starter: Any = None, validator_starter: Any = None,
-                 max_author_attempts: int | None = None):
+                 max_author_attempts: int | None = None, *, author_budget_enabled: bool = False,
+                 budget_clock=None):
         self.storage, self.author_starter, self.validator_starter = storage, author_starter, validator_starter
+        self.author_budget_enabled = author_budget_enabled
+        self.budget_clock = budget_clock or (lambda: datetime.now(timezone.utc))
         policy = getattr(author_starter, "base_environment", {}).get("BOM_SOURCE_ASSOCIATIONS", "false")
         if policy not in {"true", "false"}:
             raise ValueError("invalid association policy")
@@ -162,6 +166,15 @@ class CandidateAutomationService:
     def start_author(self, request_id: str) -> str | None:
         if self.author_starter is None:
             return None
+        if self.author_budget_enabled:
+            from .author_budget import Budget
+            budget = Budget(self.storage, request_id, clock=self.budget_clock)
+            state = budget.inspect()
+            if state["status"] != "legacy":
+                root = f"candidates/{request_id}/"
+                if any(path.endswith("/candidate-manifest.json") for path in self._paths(root)):
+                    return None
+                return self._budget_start(request_id, "author")
         root = f"candidates/{request_id}/"
         for path in self._paths(root):
             if not path.endswith("/candidate-manifest.json"):
@@ -229,6 +242,11 @@ class CandidateAutomationService:
         """
         if self.author_starter is None:
             return None
+        if self.author_budget_enabled:
+            from .author_budget import Budget
+            state = Budget(self.storage, request_id, clock=self.budget_clock).inspect()
+            if state["status"] != "legacy":
+                return self._budget_start(request_id, "author-refinement", candidate_id, failure_event)
 
         # Check if a newer candidate already exists (avoid duplicate refinement).
         # A candidate that a started refinement marker names as its source is
@@ -283,3 +301,40 @@ class CandidateAutomationService:
             # remains in flight and must not fan out concurrent refinements.
             author_attempt_kind="author-refinement")
         return result
+
+    def _budget_start(self, request_id: str, phase: str, candidate_id: str | None = None,
+                      failure_event: dict[str, Any] | None = None) -> str:
+        from .author_budget import Budget
+        from .core import _json_bytes, _sha256
+        budget = Budget(self.storage, request_id, clock=self.budget_clock)
+        if phase == "author-refinement":
+            try:
+                if budget.selected_candidate() not in (None, candidate_id):
+                    return "budget_no_progress"
+            except Exception:
+                return "budget_invalid"
+        failure_hash = _sha256(_json_bytes(failure_event)) if phase == "author-refinement" else None
+        reservation = budget.reserve(phase, candidate_id, failure_hash)
+        if reservation["status"] != "reserved":
+            return reservation["reason"]
+        values = {"REQUEST_ID": request_id, **self.author_environment,
+                  "AUTHOR_BUDGET_GROUP": reservation["group_id"],
+                  "AUTHOR_BUDGET_SLOT": str(reservation["slot"]),
+                  "AUTHOR_BUDGET_RESERVATION": reservation["reservation_hash"]}
+        if failure_event:
+            values["AUTHOR_FEEDBACK"] = (f"Previous parser failed with {failure_event.get('failure') or failure_event.get('error_code')}: "
+                                        f"{failure_event.get('failure_message') or ''}")[:1000]
+        try:
+            budget.mark_dispatch(reservation)
+        except Exception:
+            return "budget_invalid"
+        try:
+            execution = self.author_starter.start(values)
+            budget.mark_started(reservation, execution)
+        except Exception:
+            try:
+                budget.mark_unknown(reservation)
+            except Exception:
+                pass  # Existing claim still blocks another dispatch.
+            return "budget_start_unknown"
+        return "started"

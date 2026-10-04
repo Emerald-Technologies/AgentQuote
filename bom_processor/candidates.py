@@ -59,7 +59,10 @@ class CandidateRequest:
 
     @classmethod
     def build(cls, parser_key: str, customer_key: str, profile: StructuralProfile,
-              source_evidence: tuple[dict[str, Any], ...], created_at: str) -> "CandidateRequest":
+              source_evidence: tuple[dict[str, Any], ...], created_at: str,
+              *, stable_order: bool = False) -> "CandidateRequest":
+        if stable_order:
+            source_evidence = tuple(sorted(source_evidence, key=lambda item: (item["document_id"], item["blob_path"])))
         request_id = _hash({"version": CANDIDATE_VERSION, "parser_key": parser_key,
                         "customer_key": customer_key, "profile_hash": profile.profile_hash,
                         "source_evidence": list(source_evidence)})
@@ -79,7 +82,9 @@ def request_path(request_id: str) -> str:
 
 def persist_candidate(storage: Any, parser_key: str, customer_key: str,
                       profile: StructuralProfile, source_evidence: tuple[dict[str, Any], ...],
-                      clock: Callable[[], datetime] | None = None) -> CandidateRequest:
+                      clock: Callable[[], datetime] | None = None, *, stable_order: bool = False) -> CandidateRequest:
+    if stable_order:
+        source_evidence = tuple(sorted(source_evidence, key=lambda item: (item["document_id"], item["blob_path"])))
     now = (clock or (lambda: datetime.now(timezone.utc)))()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -88,6 +93,13 @@ def persist_candidate(storage: Any, parser_key: str, customer_key: str,
     import json
     data = json.dumps(request.to_dict(), sort_keys=True, separators=(",", ":")).encode()
     path = request_path(request.request_id)
+    if stable_order:
+        from .core import BlobNotFoundError
+        try:
+            storage.download_registry(path, 1_000_000)
+        except BlobNotFoundError:
+            from .author_budget import require_budget
+            require_budget(storage, request.request_id)
     try:
         storage.upload_registry_immutable(path, data, "application/json")
     except Exception as exc:
