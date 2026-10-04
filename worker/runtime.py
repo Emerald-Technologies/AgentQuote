@@ -124,9 +124,13 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
             input_bytes: bytes | None = None, limits: Limits | None = None,
     return_output: bool = False, input_name: str = "input.csv",
     output_name: str = "output.json",
-        output_policy: str = "synthetic_json") -> tuple[dict, int] | tuple[dict, int, bytes | None]:
+        output_policy: str = "synthetic_json", interpretation_name: str | None = None):
     """Run an approved parser with either deterministic JSON or opaque output."""
     limits = limits or Limits()
+    if interpretation_name is not None and (interpretation_name != "interpretation.json"
+                                            or not return_output or output_policy != "opaque"
+                                            or interpretation_name in (input_name, output_name)):
+        raise ValueError("invalid interpretation configuration")
     parser_bytes = parser_bytes if parser_bytes is not None else (DEFAULT_FIXTURES / "synthetic_parser.py").read_bytes()
     input_bytes = input_bytes if input_bytes is not None else (DEFAULT_FIXTURES / "synthetic_input.csv").read_bytes()
     started = time.monotonic()
@@ -146,6 +150,7 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
     with tempfile.TemporaryDirectory(prefix="agentquote-worker-") as temp:
         root = Path(temp).resolve()
         parser = root / "parser.py"; source = root / input_name; output = root / output_name
+        interpretation = root / interpretation_name if interpretation_name else None
         stdout = root / "stdout.log"; stderr = root / "stderr.log"
         parser.write_bytes(parser_bytes); source.write_bytes(input_bytes)
         for path in (parser, source):
@@ -169,7 +174,10 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                     kwargs["start_new_session"] = True
                 elif os.name == "nt":
                     kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                proc = subprocess.Popen([sys.executable, str(parser), "--input", str(source), "--output", str(output)], **kwargs)
+                command = [sys.executable, str(parser), "--input", str(source), "--output", str(output)]
+                if interpretation is not None:
+                    command.extend(["--interpretation", str(interpretation)])
+                proc = subprocess.Popen(command, **kwargs)
                 failure = None
                 while proc.poll() is None:
                     if time.monotonic() - started > limits.timeout_seconds:
@@ -178,6 +186,8 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                         failure = "log_limit"; break
                     if output.exists() and output.stat().st_size > limits.output_bytes:
                         failure = "output_limit"; break
+                    if interpretation is not None and interpretation.exists() and interpretation.stat().st_size > 1024 * 1024:
+                        failure = "interpretation_limit"; break
                     time.sleep(0.01)
                 if failure:
                     _terminate_tree(proc)
@@ -209,6 +219,18 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                 if raw != canonical:
                     raise ValueError("nondeterministic")
             base["output"] = {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+            if interpretation is not None:
+                if not _regular(interpretation, root) or not 0 < interpretation.stat().st_size <= 1024 * 1024:
+                    return _result(job, "failed", "invalid_interpretation", **base), 5, None
+                sidecar = interpretation.read_bytes()
+                from bom_processor.interpretation_coverage import verify_coverage
+                try:
+                    verification = verify_coverage(input_bytes, Path(input_name).suffix, raw, sidecar)
+                except ValueError:
+                    return _result(job, "failed", "interpretation_verification_failed", **base), 5, None
+                base["interpretation"] = {"sha256": hashlib.sha256(sidecar).hexdigest(), "size": len(sidecar),
+                                          "verification": verification}
+                return _result(job, "completed", None, exit_code=0, **base), 0, raw, sidecar
             value = (_result(job, "completed", None, exit_code=0, **base), 0, raw)
             return value if return_output else value[:2]
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):

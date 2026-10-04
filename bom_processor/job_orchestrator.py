@@ -47,8 +47,13 @@ class WorkItem:
     input_name: str = "input.csv"
     output_name: str = "output.json"
     result_name: str = "result.json"
+    interpretation_name: str | None = None
 
     def __post_init__(self) -> None:
+        if self.interpretation_name not in (None, "interpretation.json"):
+            raise ValueError("invalid interpretation_name")
+        if self.interpretation_name and self.interpretation_name in (self.input_name, self.output_name, self.result_name):
+            raise ValueError("interpretation destination collision")
         for name, value in (("job_id", self.job_id), ("source_container", self.source_container),
                             ("parser_container", self.parser_container), ("output_container", self.output_container)):
             if not isinstance(value, str) or not _ID.fullmatch(value):
@@ -78,6 +83,10 @@ class WorkItem:
     def result_blob(self) -> str:
         return f"{self.output_prefix.rstrip('/')}/{self.result_name}"
 
+    @property
+    def interpretation_blob(self) -> str | None:
+        return f"{self.output_prefix.rstrip('/')}/{self.interpretation_name}" if self.interpretation_name else None
+
 
 @dataclass(frozen=True)
 class SasUrls:
@@ -86,6 +95,7 @@ class SasUrls:
     output_url: str
     result_url: str
     expires_on: datetime
+    interpretation_url: str | None = None
 
     def __repr__(self) -> str:
         return f"SasUrls(expires_on={self.expires_on!r})"
@@ -130,6 +140,7 @@ class AzureSasFactory:
             make(item.output_container, item.output_blob, write=True),
             make(item.output_container, item.result_blob, write=True),
             expiry,
+            make(item.output_container, item.interpretation_blob, write=True) if item.interpretation_blob else None,
         )
 
 
@@ -150,6 +161,11 @@ class AzureJobStarter:
             ("WORKER_OUTPUT_NAME", item.output_name),
             ("WORKER_OUTPUT_CONTENT_TYPE", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         )]
+        if item.interpretation_name:
+            if not urls.interpretation_url:
+                raise ValueError("interpretation URL missing")
+            env.extend([{"name": "WORKER_INTERPRETATION_NAME", "value": item.interpretation_name},
+                        {"name": "INTERPRETATION_URL", "value": urls.interpretation_url}])
         container: dict[str, Any] = dict(self.template or {})
         container["name"] = self.container_name
         container["env"] = env

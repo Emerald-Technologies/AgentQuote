@@ -10,11 +10,17 @@ import os
 def main() -> int:
     worker_keys = {key for key in os.environ if key.startswith("WORKER_")}
     configured = [key for key in REQUIRED if os.environ.get(key)]
+    interpretation_requested = "WORKER_INTERPRETATION_NAME" in os.environ or "INTERPRETATION_URL" in os.environ
     expected_worker_keys = {
         "WORKER_JOB_ID", "WORKER_INPUT_NAME", "WORKER_OUTPUT_NAME",
         "WORKER_OUTPUT_CONTENT_TYPE",
     }
-    if configured and (worker_keys != expected_worker_keys or len(configured) != len(REQUIRED)):
+    if interpretation_requested:
+        expected_worker_keys.add("WORKER_INTERPRETATION_NAME")
+    interpretation_invalid = interpretation_requested and (
+        os.environ.get("WORKER_INTERPRETATION_NAME") != "interpretation.json" or not os.environ.get("INTERPRETATION_URL"))
+    if (configured or interpretation_requested) and (worker_keys != expected_worker_keys
+            or len(configured) != len(REQUIRED) or interpretation_invalid):
         missing = sorted(key for key in REQUIRED if not os.environ.get(key))
         unknown = sorted(worker_keys - expected_worker_keys)
         result, code = {

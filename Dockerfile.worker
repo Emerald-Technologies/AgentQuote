@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.worker.txt /app/requirements.worker.txt
 RUN pip install --no-cache-dir -r /app/requirements.worker.txt
 COPY worker /app/worker
+COPY bom_processor /app/bom_processor
 RUN addgroup --system --gid 10002 worker && adduser --system --uid 10002 --gid 10002 worker
 USER 10002:10002
 ENTRYPOINT ["python", "-m", "worker"]

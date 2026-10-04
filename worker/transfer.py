@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 REQUIRED = ("WORKER_JOB_ID", "INPUT_URL", "PARSER_URL", "OUTPUT_URL", "RESULT_URL",
             "INPUT_SHA256", "INPUT_SIZE", "PARSER_SHA256", "PARSER_SIZE", "WORKER_INPUT_NAME",
             "WORKER_OUTPUT_NAME", "WORKER_OUTPUT_CONTENT_TYPE")
-ALLOWED_WORKER = {"WORKER_JOB_ID", "WORKER_INPUT_NAME", "WORKER_OUTPUT_NAME", "WORKER_OUTPUT_CONTENT_TYPE"}
+ALLOWED_WORKER = {"WORKER_JOB_ID", "WORKER_INPUT_NAME", "WORKER_OUTPUT_NAME", "WORKER_OUTPUT_CONTENT_TYPE", "WORKER_INTERPRETATION_NAME"}
 OUTPUT_CONTENT_TYPES = {
     "output.xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
@@ -134,6 +134,11 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
     if OUTPUT_CONTENT_TYPES.get(output_name) != content_type:
         raise ValueError("invalid worker output policy")
     urls = {k: _url(env[k]) for k in ("INPUT_URL", "PARSER_URL", "OUTPUT_URL", "RESULT_URL")}
+    interpretation_enabled = bool(env.get("WORKER_INTERPRETATION_NAME") or env.get("INTERPRETATION_URL"))
+    if interpretation_enabled:
+        if env.get("WORKER_INTERPRETATION_NAME") != "interpretation.json" or not env.get("INTERPRETATION_URL"):
+            raise ValueError("incomplete interpretation configuration")
+        urls["INTERPRETATION_URL"] = _url(env["INTERPRETATION_URL"])
     input_size = _expected(env, "INPUT", True); parser_size = _expected(env, "PARSER", True)
     input_hash = _expected(env, "INPUT"); parser_hash = _expected(env, "PARSER")
     transport = transport or UrllibTransport()
@@ -141,6 +146,8 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
     result: dict = {"contract_version": "remote-worker.v1", "job": env["WORKER_JOB_ID"], "status": "failed",
                     "failure": None, "input": {}, "parser": {},
                     "output": {"sha256": None, "size": 0, "content_type": content_type}}
+    if interpretation_enabled:
+        result["contract_version"] = "remote-worker.v2"
     try:
         parser = transport.get(urls["PARSER_URL"], max_bytes=parser_size, timeout=timeout)
         source = transport.get(urls["INPUT_URL"], max_bytes=input_size, timeout=timeout)
@@ -151,16 +158,26 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         input_name = env["WORKER_INPUT_NAME"]
         if input_name not in ("input.csv", "input.xls", "input.xlsx"):
             raise ValueError("invalid input name")
+        options = {"interpretation_name": "interpretation.json"} if interpretation_enabled else {}
         ran = run(job=env["WORKER_JOB_ID"], parser_bytes=parser, input_bytes=source,
-                  input_name=input_name,
-              output_name=output_name, output_policy="opaque", return_output=True)
-        run_result, code, output = ran
+                  input_name=input_name, output_name=output_name,
+                  output_policy="opaque", return_output=True, **options)
+        run_result, code, output = ran[:3]
         run_result.pop("logs", None)
         if code != 0 or output is None:
             stderr_tail = str(run_result.get("stderr_tail") or "")
             format_hint = _input_format_hint(source, input_name)
             detail = " ".join(part for part in (format_hint, stderr_tail) if part)
             raise RuntimeError(f"parser failed{(' | ' + detail) if detail else ''}")
+        sidecar = None
+        if interpretation_enabled:
+            if len(ran) != 4 or not isinstance(ran[3], bytes) or not 0 < len(ran[3]) <= 1024 * 1024:
+                raise ValueError("interpretation artifact missing")
+            sidecar = ran[3]
+            from bom_processor.interpretation_coverage import verify_coverage
+            verification = verify_coverage(source, os.path.splitext(input_name)[1], output, sidecar)
+            result["interpretation"] = {"sha256": hashlib.sha256(sidecar).hexdigest(), "size": len(sidecar),
+                                        "content_type": "application/json", "verification": verification}
         result["output"] = {"sha256": hashlib.sha256(output).hexdigest(), "size": len(output),
                      "content_type": content_type}
         result["parser"] = _evidence(parser, parser_hash, parser_size)
@@ -168,6 +185,12 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         headers = {"x-ms-blob-type": "BlockBlob", "If-None-Match": "*", "Content-Type": content_type, "Content-Length": str(len(output))}
         if transport.put(urls["OUTPUT_URL"], output, headers=headers, timeout=timeout) != 201:
             raise RuntimeError("output transfer failed")
+        if sidecar is not None:
+            if transport.put(urls["INTERPRETATION_URL"], sidecar,
+                             headers={"x-ms-blob-type": "BlockBlob", "If-None-Match": "*",
+                                      "Content-Type": "application/json", "Content-Length": str(len(sidecar))},
+                             timeout=timeout) != 201:
+                raise RuntimeError("interpretation transfer failed")
         result["status"] = "completed"; result["failure"] = None
         body = json.dumps(result, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
         result_headers = {"x-ms-blob-type": "BlockBlob", "If-None-Match": "*", "Content-Type": "application/json", "Content-Length": str(len(body))}

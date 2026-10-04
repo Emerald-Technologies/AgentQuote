@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
-from .master_registry import html_table_raw_rows
+from .master_registry import html_table_raw_rows, RegistryError
 
 EXTRACTION_VERSION = "bom-source-inventory.v1"
 MAX_BYTES = 32 * 1024 * 1024
@@ -127,7 +127,10 @@ def extract_inventory(data: bytes, extension: str) -> SourceInventory:
         # are not sufficient formula provenance in this first slice.
         raise InventoryError("BINARY_XLS_FORMULA_PROVENANCE_UNSUPPORTED")
     elif extension == ".xls":
-        rows = html_table_raw_rows(data)
+        try:
+            rows = html_table_raw_rows(data)
+        except RegistryError as exc:
+            raise InventoryError("SOURCE_HTML_INVALID") from exc
         add_sheet("HTML_TABLE_1", rows, len(rows), max(map(len, rows), default=0))
     else:
         raise InventoryError("SOURCE_FORMAT_UNSUPPORTED")
