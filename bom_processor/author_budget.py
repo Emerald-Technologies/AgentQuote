@@ -348,7 +348,7 @@ class Budget:
     def _hold(reason: str, used: int = 0, group_id: str | None = None) -> dict[str, Any]:
         return {"status": "hold", "reason": reason, "used": used, "group_id": group_id}
 
-    def _inspect(self) -> dict[str, Any]:
+    def _inspect(self, snapshot: list[tuple[dict[str, Any], dict[str, Any] | None]] | None = None) -> dict[str, Any]:
         binding = _membership(self.storage, self.request_id)
         if binding is None:
             if _read(self.storage, f"{_ROOT}/required/{self.request_id}.json") is not None:
@@ -399,6 +399,8 @@ class Budget:
                     else:
                         _require(candidate is None)
             _require(claim["claimed_at"] <= now)
+            if snapshot is not None:
+                snapshot.append((claim, markers["terminal"]))
             dispatch_pending = (markers["dispatch"] is not None
                                 and markers["started"] is None)
             if markers["unknown"] is not None or dispatch_pending:
@@ -446,18 +448,29 @@ class Budget:
                 _digest(failure_hash)
             else:
                 _require(source_candidate is None and failure_hash is None)
-            projection = self._inspect()
-            if projection["group_id"] is not None and phase == "author-refinement":
-                for slot in range(1, LIMIT + 1):
-                    prior = _read(self.storage, _slot_path(projection["group_id"], slot, "claim"))
-                    if (prior is not None and prior.get("request_id") == self.request_id
-                            and prior.get("phase") == phase and prior.get("source_candidate") == source_candidate
-                            and prior.get("failure_hash") == failure_hash):
-                        return self._hold("budget_no_progress", projection["used"], projection["group_id"])
+            # Eligibility and next-slot selection use the SAME validated scan.
+            # A concurrent append must claim that same next slot; we lose the
+            # immutable conflict, never rescan/advance without rechecking.
+            snapshot: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+            projection = self._inspect(snapshot)
             if projection["status"] == "hold":
                 return projection
             if projection["status"] != "available":
                 return self._hold("budget_invalid")
+            selected = None
+            repeated_intent = False
+            for prior, terminal in snapshot:
+                if prior["request_id"] != self.request_id:
+                    continue
+                if terminal is not None and terminal["state"] == "completed":
+                    selected = terminal["candidate_id"]
+                repeated_intent |= (phase == "author-refinement" and prior["phase"] == phase
+                                    and prior["source_candidate"] == source_candidate
+                                    and prior["failure_hash"] == failure_hash)
+            if ((phase == "author" and selected is not None)
+                    or (phase == "author-refinement" and selected != source_candidate)
+                    or repeated_intent):
+                return self._hold("budget_no_progress", projection["used"], projection["group_id"])
             group_id, slot = projection["group_id"], projection["used"] + 1
             binding = _membership(self.storage, self.request_id)
             _require(binding is not None)

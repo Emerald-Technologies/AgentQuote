@@ -138,15 +138,19 @@ def test_enroll_publishes_literal_policy_and_own_request_is_not_history():
 
 def test_six_mixed_starts_do_not_reset_with_author_versions_or_failures():
     storage, budget, _ = ready()
+    selected = None
     for index, version in enumerate(["v3", "v6", "v2", "v7", "v6", "v8"], 1):
         # Version is deliberately absent from budget identity and reserve API.
-        phase = "author" if index % 2 else "author-refinement"
-        reservation = budget.reserve(phase, **({"source_candidate": f"candidate-{index}",
-                                              "failure_hash": "b" * 64} if index % 2 == 0 else {}))
+        phase = "author" if selected is None else "author-refinement"
+        reservation = budget.reserve(phase, **({"source_candidate": selected,
+                                              "failure_hash": str(index) * 64} if selected else {}))
         assert reservation["status"] == "reserved" and reservation["slot"] == index
         budget.mark_started(reservation, f"execution-{version}-{index}")
-        finish(storage, reservation, "completed" if index % 2 else "failed",
-               f"new-{index}" if index % 2 else None)
+        succeeded = index % 2 == 0
+        finish(storage, reservation, "completed" if succeeded else "failed",
+               f"new-{index}" if succeeded else None)
+        if succeeded:
+            selected = f"new-{index}"
     assert budget.reserve("author")["reason"] == "budget_exhausted"
     assert budget.status()["used"] == 6
 
@@ -189,6 +193,7 @@ def test_unknown_immediate_and_permanent_even_if_terminal_later(terminal):
 
 def test_repeated_source_candidate_is_no_progress_forever():
     storage, budget, _ = ready()
+    finish(storage, budget.reserve("author"), "completed", "candidate-1")
     reservation = budget.reserve("author-refinement", "candidate-1", "b" * 64)
     finish(storage, reservation, "completed", "candidate-1")
     assert budget.reserve("author")["reason"] == "budget_no_progress"
@@ -197,7 +202,9 @@ def test_repeated_source_candidate_is_no_progress_forever():
 def test_repeated_prior_candidate_identity_is_no_progress():
     storage, budget, _ = ready()
     finish(storage, budget.reserve("author"), "completed", "candidate-1")
-    reservation = budget.reserve("author-refinement", "candidate-2", "b" * 64)
+    reservation = budget.reserve("author-refinement", "candidate-1", "b" * 64)
+    finish(storage, reservation, "completed", "candidate-2")
+    reservation = budget.reserve("author-refinement", "candidate-2", "c" * 64)
     finish(storage, reservation, "completed", "candidate-1")
     assert budget.inspect()["reason"] == "budget_no_progress"
 
@@ -463,9 +470,7 @@ def test_same_profile_split_requests_collectively_exhaust_six_slots():
     for slot in range(1, 7):
         request = ["request-1", "r1", "r2"][(slot - 1) % 3]
         budget = Budget(storage, request, clock=lambda: NOW)
-        reservation = budget.reserve("author" if slot % 2 else "author-refinement",
-                                     None if slot % 2 else f"candidate-{slot}",
-                                     None if slot % 2 else "b" * 64)
+        reservation = budget.reserve("author")
         assert reservation["slot"] == slot
         finish(storage, reservation)
     for request in ("request-1", "r1", "r2"):

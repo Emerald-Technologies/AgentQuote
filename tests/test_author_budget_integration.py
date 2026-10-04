@@ -164,3 +164,39 @@ def test_delayed_refinement_intent_does_not_dispatch_after_successor():
     finish(storage, starter.calls[-1], "completed", "candidate-B")
     assert automation.start_author_refinement(request_id, "candidate-A", event) == "budget_no_progress"
     assert len(starter.calls) == 2
+
+
+@pytest.mark.parametrize("phase", ["author", "author-refinement"])
+def test_completion_between_controller_check_and_reservation_prevents_dispatch(monkeypatch, phase):
+    storage, _, request_id, _ = planned()
+    starter = Starter()
+    automation = CandidateAutomationService(storage, starter, author_budget_enabled=True, budget_clock=lambda: NOW)
+    if phase == "author-refinement":
+        assert automation.start_author(request_id) == "started"
+        finish(storage, starter.calls[-1], "completed", "candidate-A")
+    original = Budget.reserve
+    intervened = False
+
+    def paused(self, requested_phase, source_candidate=None, failure_hash=None):
+        nonlocal intervened
+        if not intervened:
+            intervened = True
+            # Other controller completes after the caller's eligibility check.
+            rival = Budget(storage, request_id, clock=lambda: NOW)
+            reservation = original(rival, requested_phase, source_candidate,
+                                   "c" * 64 if requested_phase == "author-refinement" else None)
+            assert reservation["status"] == "reserved"
+            from bom_processor.author_budget import begin_execution
+            rival.mark_started(reservation, "competing-execution")
+            owner = begin_execution(storage, reservation["group_id"], reservation["slot"], request_id,
+                                    reservation["reservation_hash"])
+            complete(storage, reservation["group_id"], reservation["slot"], request_id,
+                     reservation["reservation_hash"], "completed", "candidate-B", execution_owner=owner)
+        return original(self, requested_phase, source_candidate, failure_hash)
+
+    monkeypatch.setattr(Budget, "reserve", paused)
+    before = len(starter.calls)
+    result = (automation.start_author(request_id) if phase == "author" else
+              automation.start_author_refinement(request_id, "candidate-A", {"failure_message": "different failure"}))
+    assert result == "budget_no_progress"
+    assert len(starter.calls) == before
