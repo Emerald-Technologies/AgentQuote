@@ -179,13 +179,20 @@ class CandidateStatusService:
                 try:
                     failure_event = self._latest_validation_failure(request_id, candidate_id)
                     if failure_event is None and status == "schema_invalid":
+                        selected_evidence = evidence.get(candidate_id, [])
+                        if any(item.get("failure_feedback_policy") == "candidate-failure-feedback.v1"
+                               for item in selected_evidence):
+                            result["automation_error"] = "validation_failure_requires_review"
+                            return result
                         # Older validators did not write failure events for
                         # schema/semantic rejections. Synthesize one so the
                         # refinement loop can still proceed.
                         failure_event = {"failure": "SchemaError",
                                          "failure_message": "canonical_schema_invalid"}
-                    if failure_event is not None:
+                    if failure_event is not None and failure_event.get("repairable") is not False:
                         self.automation.start_author_refinement(request_id, candidate_id, failure_event)
+                    elif failure_event is not None:
+                        result["automation_error"] = "validation_failure_requires_review"
                 except Exception:
                     result.setdefault("automation_error", "author_refinement_start_failed")
         return result

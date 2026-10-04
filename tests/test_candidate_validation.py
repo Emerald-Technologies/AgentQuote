@@ -270,3 +270,154 @@ def test_grouped_validation_fails_aggregate_when_one_fixture_fails():
     assert evidence["complete"] is True
     assert [item["status"] for item in evidence["fixtures"]] == ["passed", "failed"]
     assert not any("validated-" in path for path in storage.candidates)
+
+
+def failed_worker(item, *, message="parser failed | ValueError: no supported source rows found",
+                  failure="transfer_failed"):
+    return {"contract_version": "remote-worker.v1", "job": item.job_id, "status": "failed",
+            "input": {"verified": True, "sha256": item.input_sha256, "size": item.input_size},
+            "parser": {"verified": True, "sha256": item.parser_sha256, "size": item.parser_size},
+            "output": {"sha256": None, "size": 0}, "failure": failure,
+            "failure_classification": {"error_type": "RuntimeError", "error_message": message}}
+
+
+def test_verified_failed_worker_does_not_require_output_and_preserves_feedback():
+    service, storage, orchestrator, _, _ = setup_validation()
+    def start(item):
+        orchestrator.calls.append(item)
+        storage.candidates[item.result_blob] = json.dumps(failed_worker(item)).encode()
+        return StartResult(item.job_id, "execution-failed", datetime.now(timezone.utc))
+    orchestrator.start = start
+    with pytest.raises(CandidateValidationError, match="WORKER_PARSER_FAILED"):
+        service.validate()
+    event = json.loads(next(data for path, data in storage.candidates.items() if "validation-failed-" in path))
+    assert event["repairable"] is True
+    assert "no supported source rows found" in event["failure_message"]
+    assert not any(path.endswith("/output.xlsx") for path in storage.candidates)
+
+
+@pytest.mark.parametrize("mutation,code", [
+    ({"job": "wrong"}, "WORKER_RESULT_INVALID"),
+    ({"status": "unknown"}, "WORKER_RESULT_INVALID"),
+    ({"input": {"verified": False}}, "WORKER_EVIDENCE_INVALID"),
+    ({"parser": {"verified": True, "sha256": "0" * 64, "size": 1}}, "WORKER_EVIDENCE_INVALID"),
+])
+def test_failed_worker_unverified_identity_cannot_supply_repair_feedback(mutation, code):
+    service, storage, orchestrator, _, _ = setup_validation()
+    def start(item):
+        value = failed_worker(item)
+        value.update(mutation)
+        storage.candidates[item.result_blob] = json.dumps(value).encode()
+        return StartResult(item.job_id, "execution", datetime.now(timezone.utc))
+    orchestrator.start = start
+    with pytest.raises(CandidateValidationError, match=code):
+        service.validate()
+    event = json.loads(next(data for path, data in storage.candidates.items() if "validation-failed-" in path))
+    assert event["repairable"] is False
+    assert event["failure_message"] is None
+
+
+def test_grouped_three_fixture_failure_event_reaches_refinement_once():
+    from bom_processor.candidate_automation import CandidateAutomationService
+    from bom_processor.candidate_status import CandidateStatusService
+    evidence = []
+    storage = InMemoryStorage()
+    for index, data in enumerate((SOURCE, b"mystery,qty\nY,3\n", b"mystery,qty\nZ,4\n")):
+        path = f"customer/rfq-id/package-1/original-boms/doc-{index}.csv"
+        storage.sources[path] = data
+        evidence.append({"document_id": f"doc{index}", "blob_path": path,
+                         "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    evidence.append({**evidence[0], "document_id": "duplicate"})
+    request = persist_candidate(storage, "Customer1", "customer-key", profile_bytes(SOURCE, ".csv"), tuple(evidence))
+    candidate = CandidateAuthoringService(request.request_id, storage, Model()).author()
+    class FailedOrchestrator:
+        calls = []
+        def start(self, item):
+            self.calls.append(item)
+            storage.candidates[item.result_blob] = json.dumps(failed_worker(item)).encode()
+            return StartResult(item.job_id, "failed-execution", datetime.now(timezone.utc))
+    orchestrator = FailedOrchestrator()
+    service = CandidateValidationService(request.request_id, candidate.candidate_id, storage, orchestrator)
+    result = service.validate()
+    assert service.validate() == result and len(orchestrator.calls) == 3
+    aggregate = json.loads(storage.candidates[result.evidence_path])
+    assert sorted(len(f["source_aliases"]) for f in aggregate["fixtures"]) == [1, 1, 2]
+    events = [json.loads(data) for path, data in storage.candidates.items() if "validation-failed-" in path]
+    assert len(events) == 1 and events[0]["repairable"] is True
+    assert events[0]["evidence_sha256"] == hashlib.sha256(storage.candidates[result.evidence_path]).hexdigest()
+    assert len(events[0]["fixtures"]) == 3
+    event_path = next(path for path in storage.candidates if "validation-failed-" in path)
+    saved_event = storage.candidates.pop(event_path)
+    assert service.validate() == result
+    assert storage.candidates[event_path] == saved_event
+    class Starter:
+        calls = []
+        def start(self, values):
+            self.calls.append(values)
+            return "refinement-execution"
+    starter = Starter()
+    status = CandidateStatusService(storage, automation=CandidateAutomationService(storage, author_starter=starter))
+    status.get(request.request_id)
+    status.get(request.request_id)
+    assert len(starter.calls) == 1
+    assert "no supported source rows found" in starter.calls[0]["AUTHOR_FEEDBACK"]
+
+
+def test_grouped_infrastructure_failure_holds_without_author_start():
+    from bom_processor.candidate_status import CandidateStatusService
+    service, storage, orchestrator, request, _ = setup_validation()
+    payload = json.loads(storage.registry[f"candidates/requests/{request.request_id}.json"])
+    payload["source_evidence"].append({**payload["source_evidence"][0], "document_id": "alias"})
+    storage.registry[f"candidates/requests/{request.request_id}.json"] = json.dumps(payload).encode()
+    def start(item):
+        storage.candidates[item.result_blob] = json.dumps(failed_worker(item, message="output transfer failed")).encode()
+        return StartResult(item.job_id, "failed", datetime.now(timezone.utc))
+    orchestrator.start = start
+    service.validate()
+    class Automation:
+        def start_author_refinement(self, *args):
+            pytest.fail("infrastructure failure must not call author")
+    result = CandidateStatusService(storage, automation=Automation()).get(request.request_id)
+    assert result["automation_error"] == "validation_failure_requires_review"
+    # Interrupted/unavailable event publication must not invoke the old fallback.
+    event_path = next(path for path in storage.candidates if "validation-failed-" in path)
+    storage.candidates.pop(event_path)
+    assert CandidateStatusService(storage, automation=Automation()).get(request.request_id)["automation_error"] == "validation_failure_requires_review"
+
+
+def test_failure_feedback_redacts_credentials_urls_and_paths():
+    value = {"failure_classification": {"error_type": "RuntimeError",
+        "error_message": "parser failed | https://example.test/a?sig=hidden C:\\private\\file token=hidden password=hidden"}}
+    classification = CandidateValidationService._extract_failure_classification(json.dumps(value).encode())
+    assert "hidden" not in classification["error_message"]
+    assert "example.test" not in classification["error_message"]
+    assert len(classification["error_message"]) <= 500
+
+
+@pytest.mark.parametrize("message", ["Authorization: Bearer secretvalue", 'password="two word secretvalue"',
+                                   "Bearer secretvalue", "{'password': 'two word secretvalue'}",
+                                   '{"token": "secretvalue"}'])
+def test_credential_feedback_is_withheld_completely(message):
+    value = {"failure_classification": {"error_type": "RuntimeError", "error_message": message}}
+    result = CandidateValidationService._extract_failure_classification(json.dumps(value).encode())
+    assert result["error_message"] == "sensitive feedback withheld"
+
+
+def test_detail_free_parser_failure_is_repairable():
+    service, storage, orchestrator, _, _ = setup_validation()
+    def start(item):
+        storage.candidates[item.result_blob] = json.dumps(failed_worker(item, message="parser failed")).encode()
+        return StartResult(item.job_id, "failed", datetime.now(timezone.utc))
+    orchestrator.start = start
+    with pytest.raises(CandidateValidationError, match="WORKER_PARSER_FAILED"):
+        service.validate()
+
+
+def test_legacy_singleton_evidence_replays_without_new_identity():
+    service, storage, orchestrator, _, _ = setup_validation()
+    result = service.validate()
+    payload = json.loads(storage.candidates[result.evidence_path])
+    payload.pop("failure_feedback_policy")
+    storage.candidates[result.evidence_path] = json.dumps(payload).encode()
+    assert service.validate() == result
+    assert len(orchestrator.calls) == 1

@@ -20,6 +20,7 @@ from .arena_policy import is_arena_source, validate as validate_arena
 from .semantic_facts import SemanticFactsError, facts_from_rows
 
 VALIDATION_VERSION = "candidate-validation.v3"
+FAILURE_FEEDBACK_POLICY = "candidate-failure-feedback.v1"
 MAX_METADATA_BYTES = 1_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -101,8 +102,9 @@ def _assembly_dict(assembly: Any) -> dict[str, str] | None:
 class CandidateValidationError(ValueError):
     """Safe, stable failure raised by candidate validation."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, classification: dict[str, str] | None = None):
         self.code = code
+        self.classification = classification
         super().__init__(code)
 
 
@@ -228,7 +230,7 @@ class CandidateValidationService:
             worker = self._verify_worker_result(raw_result, item)
             output = self.storage.download_candidate(item.output_blob, self.max_output_bytes)
         except CandidateValidationError as exc:
-            classification = self._extract_failure_classification(raw_result)
+            classification = exc.classification
             self._write_validation_failed_event(validation_id, item, exc.code, classification)
             raise
         except Exception:
@@ -274,6 +276,7 @@ class CandidateValidationService:
         resulting_status = "awaiting_approval" if validation_valid else "generated_unvalidated"
         evidence = {
             "version": self.validation_version,
+            "failure_feedback_policy": FAILURE_FEEDBACK_POLICY,
             "validation_id": validation_id,
             "request_id": self.request_id,
             "candidate_id": self.candidate_id,
@@ -380,11 +383,20 @@ class CandidateValidationService:
                     "arena_policy": policy})
                 if association is not None:
                     record["assembly_association"] = association
+                if not valid:
+                    record["failure"] = {"code": "SCHEMA_INVALID" if not schema_valid else "SEMANTIC_INVALID",
+                                         "repairable": True,
+                                         "classification": {"error_type": "ValidationError",
+                                             "error_message": "output schema invalid" if not schema_valid else "output semantic checks failed"}}
             except Exception as exc:
                 all_valid = False
-                record["failure"] = {"code": exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"}
+                code_value = exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"
+                record["failure"] = {"code": code_value, "repairable": code_value == "WORKER_PARSER_FAILED"}
+                if isinstance(exc, CandidateValidationError) and exc.classification is not None:
+                    record["failure"]["classification"] = exc.classification
             parsed.append(record)
         evidence = {"version": self.validation_version, "validation_id": validation_id, "request_id": self.request_id,
+                    "failure_feedback_policy": FAILURE_FEEDBACK_POLICY,
                     "candidate_id": self.candidate_id, "prior_status": "generated_unvalidated",
                     "status": "awaiting_approval" if all_valid else "generated_unvalidated",
                     "candidate": {"blob_path": f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
@@ -399,6 +411,8 @@ class CandidateValidationService:
                 self.storage.upload_candidate_immutable(event_path, _json_bytes({"version": self.validation_version,
                     "event": "candidate.validated", "request_id": self.request_id, "candidate_id": self.candidate_id,
                     "validation_id": validation_id, "status": "awaiting_approval", "evidence_path": evidence_path}), "application/json")
+            else:
+                self._write_group_failed_event(validation_id, evidence_path, evidence)
         except BlobConflictError:
             raise CandidateValidationError("VALIDATION_CONFLICT") from None
         return CandidateValidationResult(self.request_id, self.candidate_id, validation_id, evidence_path,
@@ -499,7 +513,7 @@ class CandidateValidationService:
         value = _load_json(raw, "WORKER_RESULT_INVALID")
         expected_contract = "remote-worker.v2" if item.interpretation_name else "remote-worker.v1"
         if (value.get("contract_version") != expected_contract
-                or value.get("job") != item.job_id or value.get("status") != "completed"):
+            or value.get("job") != item.job_id or value.get("status") not in {"completed", "failed"}):
             raise CandidateValidationError("WORKER_RESULT_INVALID")
         for section, expected_hash, expected_size in (
                 ("input", item.input_sha256, item.input_size),
@@ -509,6 +523,16 @@ class CandidateValidationService:
                     or str(item_evidence.get("sha256", "")).lower() != expected_hash
                     or item_evidence.get("size") != expected_size):
                 raise CandidateValidationError("WORKER_EVIDENCE_INVALID")
+        if value["status"] == "failed":
+            classification = self._extract_failure_classification(raw)
+            # The existing transfer wrapper labels parser exits transfer_failed.
+            # Recognize only its fixed prefix after pinned inputs were verified.
+            parser_failed = (value.get("failure") == "transfer_failed" and classification is not None
+                             and classification["error_type"] == "RuntimeError"
+                                and (classification["error_message"] == "parser failed"
+                                    or classification["error_message"].startswith("parser failed | ")))
+            raise CandidateValidationError("WORKER_PARSER_FAILED" if parser_failed else "WORKER_EXECUTION_FAILED",
+                                           classification)
         output = value.get("output")
         if (not isinstance(output, dict) or output.get("content_type") != OUTPUT_CONTENT_TYPE
                 or type(output.get("size")) is not int or not 0 < output["size"] <= self.max_output_bytes
@@ -568,6 +592,9 @@ class CandidateValidationService:
             expected_status = "awaiting_approval" if passed else "generated_unvalidated"
             if status != expected_status:
                 raise CandidateValidationError("VALIDATION_EVIDENCE_INVALID")
+            if (status == "generated_unvalidated"
+                    and evidence.get("failure_feedback_policy") == FAILURE_FEEDBACK_POLICY):
+                self._write_group_failed_event(validation_id, evidence_path, evidence)
             return CandidateValidationResult(self.request_id, self.candidate_id, validation_id,
                                              evidence_path, status)
         semantic = evidence.get("semantic")
@@ -589,10 +616,35 @@ class CandidateValidationService:
         if not isinstance(value, dict):
             return None
         classification = value.get("failure_classification")
-        if isinstance(classification, dict) and isinstance(classification.get("error_type"), str):
-            return {"error_type": classification["error_type"][:100],
-                    "error_message": str(classification.get("error_message", ""))[:500]}
+        if (isinstance(classification, dict) and isinstance(classification.get("error_type"), str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,99}", classification["error_type"])
+            and isinstance(classification.get("error_message"), str)):
+            message = classification["error_message"][:4000]
+            message = re.sub(r"(?:https?://|[A-Za-z]:[\\/]|\\\\|/(?:tmp|home|Users|var|private)/)[^\s\"<>]*", "<path>", message)
+            # Arbitrary stderr is untrusted. Withhold the entire message rather
+            # than partially redact credentials with spaces or quoted values.
+            if re.search(r"(?i)\b(?:authorization|bearer|password|secret|token|api[_-]?key|sig)[\"']?\s*(?::|=|\s)", message):
+                message = "sensitive feedback withheld"
+            message = " ".join(message.split())
+            return {"error_type": classification["error_type"], "error_message": message[:500]}
         return None
+
+    def _write_group_failed_event(self, validation_id: str, evidence_path: str,
+                                  evidence: dict[str, Any]) -> None:
+        failures = [{"fixture_sha256": fixture["fixture_sha256"], **fixture["failure"]}
+                for fixture in evidence["fixtures"] if "failure" in fixture]
+        repairable = bool(failures) and all(failure["repairable"] for failure in failures)
+        messages = sorted({failure.get("classification", {}).get("error_message", failure["code"])
+                   for failure in failures})
+        event = {"version": self.validation_version, "event": "candidate.validation_failed",
+             "failure_feedback_policy": FAILURE_FEEDBACK_POLICY, "request_id": self.request_id,
+             "candidate_id": self.candidate_id, "validation_id": validation_id,
+             "evidence_path": evidence_path, "evidence_sha256": _sha256(_json_bytes(evidence)),
+             "error_code": "GROUP_VALIDATION_FAILED", "failure": "GroupedValidationError",
+             "failure_message": " | ".join(messages)[:500], "repairable": repairable,
+             "fixtures": failures}
+        path = f"candidates/events/{self.request_id}/{self.candidate_id}/validation-failed-{validation_id}.json"
+        self.storage.upload_candidate_immutable(path, _json_bytes(event), "application/json")
 
     def _write_validation_failed_event(self, validation_id: str, item: WorkItem,
                                        error_code: str,
@@ -605,6 +657,8 @@ class CandidateValidationService:
         try:
             event = {
                 "version": VALIDATION_VERSION,
+                "failure_feedback_policy": FAILURE_FEEDBACK_POLICY,
+                "repairable": error_code in {"WORKER_PARSER_FAILED", "SCHEMA_INVALID", "SEMANTIC_INVALID"},
                 "event": "candidate.validation_failed",
                 "request_id": self.request_id,
                 "candidate_id": self.candidate_id,
