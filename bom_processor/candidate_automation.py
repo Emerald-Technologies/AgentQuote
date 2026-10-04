@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from datetime import datetime, timezone
 import urllib.error
 import urllib.request
@@ -49,9 +50,13 @@ class CandidateAutomationService:
 
     def __init__(self, storage: Any, author_starter: Any = None, validator_starter: Any = None,
                  max_author_attempts: int | None = None, *, author_budget_enabled: bool = False,
+                 association_quote_ids: frozenset[str] = frozenset(),
                  budget_clock=None):
         self.storage, self.author_starter, self.validator_starter = storage, author_starter, validator_starter
         self.author_budget_enabled = author_budget_enabled
+        from .quote_budget_scope import parse_quote_scope
+        self.association_quote_ids = parse_quote_scope(",".join(sorted(association_quote_ids)))
+        self._request_policy_resolved = False
         self.budget_clock = budget_clock or (lambda: datetime.now(timezone.utc))
         policy = getattr(author_starter, "base_environment", {}).get("BOM_SOURCE_ASSOCIATIONS", "false")
         if policy not in {"true", "false"}:
@@ -164,6 +169,9 @@ class CandidateAutomationService:
         return "exhausted"
 
     def start_author(self, request_id: str) -> str | None:
+        scoped = self._request_policy(request_id)
+        if scoped is not self:
+            return scoped.start_author(request_id)
         if self.author_starter is None:
             return None
         if self._budget_required(request_id):
@@ -232,6 +240,9 @@ class CandidateAutomationService:
 
     def start_author_refinement(self, request_id: str, candidate_id: str,
                                 failure_event: dict[str, Any] | None = None) -> str | None:
+        scoped = self._request_policy(request_id)
+        if scoped is not self:
+            return scoped.start_author_refinement(request_id, candidate_id, failure_event)
         """Re-trigger authoring with feedback after a validation failure.
 
         Uses a separate attempt namespace from the initial authoring so the
@@ -301,6 +312,29 @@ class CandidateAutomationService:
             # remains in flight and must not fan out concurrent refinements.
             author_attempt_kind="author-refinement")
         return result
+
+    def _request_policy(self, request_id: str):
+        """Resolve from trusted membership, never mutate shared dispatcher state."""
+        if self._request_policy_resolved:
+            return self
+        from .core import BlobNotFoundError
+        try:
+            self.storage.download_registry(f"author-budget/v1/members/{request_id}.json", 100_000)
+        except (BlobNotFoundError, FileNotFoundError):
+            return self
+        from .author_budget import _membership
+        binding = _membership(self.storage, request_id)
+        if binding is None:
+            return self  # Unenrolled requests cannot opt in via an untrusted path.
+        selected = (self.authoring_version == "candidate-authoring.v6"
+                    or binding[1]["identity"]["rfq_uuid"] in self.association_quote_ids)
+        from .author_policy import resolve
+        policy = resolve(self.storage, request_id, selected)
+        scoped = copy.copy(self)
+        scoped._request_policy_resolved = True
+        scoped.authoring_version = policy["authoring_version"]
+        scoped.author_environment = {"BOM_SOURCE_ASSOCIATIONS": "true" if policy["source_associations"] else "false"}
+        return scoped
 
     def _budget_required(self, request_id: str) -> bool:
         if self.author_budget_enabled:

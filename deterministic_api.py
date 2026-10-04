@@ -671,12 +671,24 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
                                  image=os.environ.get("BOM_CANDIDATE_VALIDATOR_IMAGE", ""),
                                  base_environment=validator_environment, resources=resources),
         max_author_attempts=max_author_attempts,
+        association_quote_ids=_association_quote_ids(),
         author_budget_enabled=_author_budget_enabled() or bool(_author_budget_quote_ids()))
 
 
 def _author_budget_quote_ids() -> frozenset[str]:
     from bom_processor.quote_budget_scope import parse_quote_scope
     return parse_quote_scope(os.environ.get("BOM_AUTHOR_GROUP_BUDGET_QUOTE_UUIDS", ""))
+
+
+def _association_quote_ids() -> frozenset[str]:
+    from bom_processor.quote_budget_scope import parse_quote_scope
+    scope = parse_quote_scope(os.environ.get("BOM_SOURCE_ASSOCIATIONS_QUOTE_UUIDS", ""))
+    policy = os.environ.get("BOM_SOURCE_ASSOCIATIONS", "false")
+    if policy not in {"true", "false"}:
+        raise RuntimeError("invalid association policy")
+    if scope and not _author_budget_enabled() and not scope <= _author_budget_quote_ids():
+        raise RuntimeError("association quote scope requires budget enrollment")
+    return scope
 
 
 def _author_budget_enabled() -> bool:
@@ -860,6 +872,7 @@ def main() -> None:
     # Reject both selectors before clients, routes or the listening server exist.
     _author_budget_enabled()
     _author_budget_quote_ids()
+    _association_quote_ids()
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     config = ApiConfig.from_env()
     api = ProcessingApi(config, lambda: _processor_factory(config),
