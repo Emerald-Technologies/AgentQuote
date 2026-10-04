@@ -617,6 +617,9 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
                 "BOM_CANDIDATE_AUTHOR_JOB_NAME", "BOM_CANDIDATE_VALIDATOR_JOB_NAME")
     if any(not os.environ.get(name, "").strip() for name in required):
         raise RuntimeError("candidate automation configuration is not set")
+    association_policy = os.environ.get("BOM_SOURCE_ASSOCIATIONS", "false")
+    if association_policy not in {"true", "false"}:
+        raise RuntimeError("invalid association policy")
     from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
     client_id = os.environ.get("BOM_JOB_MANAGED_IDENTITY_CLIENT_ID", "").strip()
     credential = ManagedIdentityCredential(client_id=client_id) if client_id else DefaultAzureCredential()
@@ -630,6 +633,8 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
         "FOUNDRY_PROJECT_ENDPOINT": os.environ.get("BOM_CANDIDATE_FOUNDRY_PROJECT_ENDPOINT", ""),
         "AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH": os.environ.get("BOM_CANDIDATE_MODEL_DEPLOYMENT", "gpt-5.6-luna"),
     }
+    if association_policy == "true":
+        author_environment["BOM_SOURCE_ASSOCIATIONS"] = "true"
     validator_environment = {
         "AZURE_CLIENT_ID": os.environ.get("BOM_CANDIDATE_IDENTITY_CLIENT_ID", ""),
         "BOM_STORAGE_ACCOUNT_URL": os.environ.get("BOM_STORAGE_ACCOUNT_URL", ""),

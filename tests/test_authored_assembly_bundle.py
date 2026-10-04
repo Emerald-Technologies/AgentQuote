@@ -16,7 +16,7 @@ from test_source_assembly_association import setup
 CODE = 'import argparse\np = argparse.ArgumentParser()\np.add_argument("--input")\np.add_argument("--output")\n'
 
 
-def authored():
+def authored(parser_code=CODE):
     store, sources, associations, old_service = setup()
     path = "candidates/requests/xlsx-demo.json"
     request = json.loads(store.registry[path])
@@ -30,7 +30,7 @@ def authored():
 
         async def run(self, text):
             seen.append(json.loads(text))
-            return SimpleNamespace(output_text=json.dumps({"parser_code": CODE,
+            return SimpleNamespace(output_text=json.dumps({"parser_code": parser_code,
                                                            "assembly_associations": associations}))
 
     result = CandidateAuthoringService("xlsx-demo", store,
