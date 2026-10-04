@@ -15,6 +15,8 @@ MAX_CELLS = 160
 MAX_CHARS = 8_000
 MAX_HTML_BYTES = 2_000_000
 MAX_HTML_TEXT = 2_000
+BUNDLE_MAX_TOKENS = 8192
+BUNDLE_TIMEOUT_SECONDS = 120.0
 SYSTEM_INSTRUCTION = (
     "Write only one Python parser source file. It must accept --input and --output, "
     "read the supplied BOM, and write a real XLSX workbook to --output using pandas "
@@ -216,7 +218,8 @@ class FoundryModelAuthor:
             if factory is None:
                 from agent_framework import Agent
                 factory = Agent
-            response = await factory(client=self.client, instructions=instructions, tools=[]).run(user_text)
+            response = await factory(client=self.client, instructions=instructions, tools=[]).run(
+                user_text, options={"max_tokens": BUNDLE_MAX_TOKENS})
             text = _response_text(response)
             if len(text.encode("utf-8")) > 1_000_000:
                 raise ValueError("AUTHORING_RESPONSE_LIMIT")
@@ -261,6 +264,9 @@ def create_foundry_author() -> FoundryModelAuthor:
     import os
     credential: Any = ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None)
     endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
+    association_policy = os.environ.get("BOM_SOURCE_ASSOCIATIONS", "false")
+    if association_policy not in {"true", "false"}:
+        raise ValueError("invalid association policy")
     if ".azure.us" in endpoint:
         class GovScopeCredential:
             def __init__(self, inner): self.inner = inner
@@ -268,10 +274,21 @@ def create_foundry_author() -> FoundryModelAuthor:
                 translated = tuple(scope.replace("https://ai.azure.com/.default", "https://ai.azure.us/.default") for scope in scopes)
                 return self.inner.get_token(*translated, **kwargs)
         credential = GovScopeCredential(credential)
+    client_options: dict[str, Any] = {"project_endpoint": endpoint, "credential": credential}
+    if association_policy == "true":
+        from azure.ai.projects.aio import AIProjectClient
+
+        class BoundedProjectClient(AIProjectClient):
+            def get_openai_client(self, **kwargs):
+                # This documented seam forwards options to AsyncOpenAI. Never
+                # permit a caller to re-enable inference retries on this path.
+                return super().get_openai_client(**{
+                    **kwargs, "max_retries": 0, "timeout": BUNDLE_TIMEOUT_SECONDS})
+
+        client_options = {"project_client": BoundedProjectClient(endpoint=endpoint, credential=credential)}
     client = FoundryChatClient(
-        project_endpoint=endpoint,
+        **client_options,
         model=os.environ.get("AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH", "gpt-5.6-luna"),
-        credential=credential,
         instruction_role="system",
     )
     return FoundryModelAuthor(client=client)
