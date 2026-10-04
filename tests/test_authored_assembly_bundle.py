@@ -37,6 +37,18 @@ def authored(parser_code=CODE):
     result = CandidateAuthoringService("xlsx-demo", store,
         FoundryModelAuthor(agent_factory=Agent), source_associations=True).author()
     service = CandidateValidationService(result.request_id, result.candidate_id, store, old_service.orchestrator)
+    original_start = service.orchestrator.start
+
+    def transfer_checked_start(item):
+        from worker.transfer import remote_job
+        from test_worker_transfer import env, FakeTransport, fake_run
+        values = env()
+        values["WORKER_OUTPUT_NAME"] = item.output_name
+        _, code = remote_job(values, transport=FakeTransport(), run=fake_run)
+        assert code == 0
+        return original_start(item)
+
+    service.orchestrator.start = transfer_checked_start
     return store, result, service, seen
 
 

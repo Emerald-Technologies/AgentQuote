@@ -353,7 +353,7 @@ class CandidateValidationService:
                             f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
                             source_evidence["sha256"].lower(), source_evidence["size_bytes"],
                             manifest["code_sha256"], len(code), f"{base}/worker/attempt-{int(time.time()*1000)}-{index}/{job_id}",
-                            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}", f"output-{fixture_id[:16]}.xlsx", "result.json")
+                            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}", "output.xlsx", "result.json")
             record = {"fixture_sha256": source_evidence["sha256"].lower(), "document_id": source_evidence["document_id"],
                       "source_aliases": source_evidence.get("source_aliases", []), "status": "failed"}
             try:
