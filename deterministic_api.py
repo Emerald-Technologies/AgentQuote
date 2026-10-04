@@ -612,6 +612,7 @@ def _processor_factory(config: ApiConfig) -> BomProcessor:
         raise RuntimeError("invalid author budget policy")
     return RemoteBomProcessor(storage, JobOrchestrator(Reader(), sas, starter),
                                author_budget_enabled=budget_policy == "true",
+                               author_budget_quote_ids=_author_budget_quote_ids(),
                                registry_reader=BlobRegistryReader(storage.download_registry,
                                                                    max_bytes=config.processor_options["max_parser_bytes"]),
                                **config.processor_options)
@@ -670,7 +671,12 @@ def _candidate_automation_factory(config: ApiConfig, storage: Any):
                                  image=os.environ.get("BOM_CANDIDATE_VALIDATOR_IMAGE", ""),
                                  base_environment=validator_environment, resources=resources),
         max_author_attempts=max_author_attempts,
-        author_budget_enabled=_author_budget_enabled())
+        author_budget_enabled=_author_budget_enabled() or bool(_author_budget_quote_ids()))
+
+
+def _author_budget_quote_ids() -> frozenset[str]:
+    from bom_processor.quote_budget_scope import parse_quote_scope
+    return parse_quote_scope(os.environ.get("BOM_AUTHOR_GROUP_BUDGET_QUOTE_UUIDS", ""))
 
 
 def _author_budget_enabled() -> bool:
@@ -851,6 +857,9 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
 
 
 def main() -> None:
+    # Reject both selectors before clients, routes or the listening server exist.
+    _author_budget_enabled()
+    _author_budget_quote_ids()
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
     config = ApiConfig.from_env()
     api = ProcessingApi(config, lambda: _processor_factory(config),

@@ -33,6 +33,7 @@ class RemoteBomProcessor:
                  registry_reader: BlobRegistryReader | None = None,
                  candidate_clock=None,
                  author_budget_enabled: bool = False,
+                 author_budget_quote_ids: frozenset[str] = frozenset(),
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         limits = (timeout_seconds, poll_interval_seconds, max_source_bytes, max_total_source_bytes,
@@ -46,8 +47,15 @@ class RemoteBomProcessor:
         self.clock, self.sleep = clock, sleep
         self.candidate_clock = candidate_clock
         self.author_budget_enabled = author_budget_enabled
+        from .quote_budget_scope import parse_quote_scope
+        if type(author_budget_enabled) is not bool or not isinstance(author_budget_quote_ids, frozenset):
+            raise ValueError("invalid author budget scope")
+        self.author_budget_quote_ids = parse_quote_scope(",".join(sorted(author_budget_quote_ids)))
         reader = getattr(storage, "download_registry", None)
         self.registry_reader = registry_reader or (BlobRegistryReader(reader, max_bytes=max_parser_bytes) if reader else None)
+
+    def _budget_enabled(self, request: ProcessingRequest) -> bool:
+        return self.author_budget_enabled or request.rfq_uuid.lower() in self.author_budget_quote_ids
 
     def process(self, request: ProcessingRequest) -> dict[str, Any]:
         request.validate()
@@ -123,14 +131,14 @@ class RemoteBomProcessor:
                                      for d in documents)
                     candidate = persist_candidate(self.storage, request.parser_key,
                                                   request.customer_key, profile, evidence,
-                                                self.candidate_clock, stable_order=self.author_budget_enabled)
+                                                self.candidate_clock, stable_order=self._budget_enabled(request))
                     pending.append(CandidateRequiredError(
                         candidate.request_id, request.parser_key, profile.profile_hash,
                         tuple(d.document_id for d in documents)))
                 if (len(pending) == 1 and not selections
                         and len(pending[0].document_ids) == 1
                         and len(request.documents) == 1):
-                    if not self.author_budget_enabled:
+                    if not self._budget_enabled(request):
                         raise pending[0] from exc
                 self._raise_grouped(request, selections, pending, exc)
             else:
@@ -143,14 +151,14 @@ class RemoteBomProcessor:
                                  for d in documents)
                 candidate = persist_candidate(self.storage, request.parser_key,
                                               request.customer_key, profile, evidence,
-                                            self.candidate_clock, stable_order=self.author_budget_enabled)
+                                            self.candidate_clock, stable_order=self._budget_enabled(request))
                 pending.append(CandidateRequiredError(
                     candidate.request_id, request.parser_key, profile.profile_hash,
                     tuple(d.document_id for d in documents)))
             if (len(pending) == 1 and not selections
                     and len(pending[0].document_ids) == 1
                     and len(request.documents) == 1):
-                if not self.author_budget_enabled:
+                if not self._budget_enabled(request):
                     raise pending[0]
             self._raise_grouped(request, selections, pending)
         if pending:
@@ -248,7 +256,7 @@ class RemoteBomProcessor:
                 pending_assignments=[{"request_id": item.request_id,
                                       "document_ids": list(item.document_ids)}
                                      for item in pending])
-        if self.author_budget_enabled:
+        if self._budget_enabled(request):
             from .author_budget import Budget, enroll
             for item in pending:
                 if Budget(self.storage, item.request_id).inspect()["status"] == "legacy":
@@ -273,11 +281,11 @@ class RemoteBomProcessor:
                              for d in documents)
             candidate = persist_candidate(self.storage, request.parser_key,
                                           request.customer_key, profile, evidence,
-                                          self.candidate_clock, stable_order=self.author_budget_enabled)
+                                          self.candidate_clock, stable_order=self._budget_enabled(request))
             errors.append(CandidateRequiredError(candidate.request_id, request.parser_key,
                                                   profile.profile_hash,
                                                   tuple(d.document_id for d in documents)))
-        if len(errors) == 1 and len(request.documents) == 1 and not self.author_budget_enabled:
+        if len(errors) == 1 and len(request.documents) == 1 and not self._budget_enabled(request):
             raise errors[0] from cause
         self._raise_grouped(request, {}, errors, cause)
 

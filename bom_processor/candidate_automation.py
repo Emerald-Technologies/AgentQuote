@@ -166,7 +166,7 @@ class CandidateAutomationService:
     def start_author(self, request_id: str) -> str | None:
         if self.author_starter is None:
             return None
-        if self.author_budget_enabled:
+        if self._budget_required(request_id):
             from .author_budget import Budget
             budget = Budget(self.storage, request_id, clock=self.budget_clock)
             state = budget.inspect()
@@ -242,7 +242,7 @@ class CandidateAutomationService:
         """
         if self.author_starter is None:
             return None
-        if self.author_budget_enabled:
+        if self._budget_required(request_id):
             from .author_budget import Budget
             state = Budget(self.storage, request_id, clock=self.budget_clock).inspect()
             if state["status"] != "legacy":
@@ -301,6 +301,18 @@ class CandidateAutomationService:
             # remains in flight and must not fan out concurrent refinements.
             author_attempt_kind="author-refinement")
         return result
+
+    def _budget_required(self, request_id: str) -> bool:
+        if self.author_budget_enabled:
+            return True
+        from .core import BlobNotFoundError
+        for kind in ("members", "required"):
+            try:
+                self.storage.download_registry(f"author-budget/v1/{kind}/{request_id}.json", 100_000)
+                return True
+            except (BlobNotFoundError, FileNotFoundError):
+                continue
+        return False
 
     def _budget_start(self, request_id: str, phase: str, candidate_id: str | None = None,
                       failure_event: dict[str, Any] | None = None) -> str:
