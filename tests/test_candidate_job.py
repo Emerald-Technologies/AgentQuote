@@ -3,6 +3,13 @@ import json
 import candidate_job
 
 
+def test_invalid_association_policy_fails_before_clients(monkeypatch, capsys):
+    monkeypatch.setenv("REQUEST_ID", "request-1")
+    monkeypatch.setenv("BOM_SOURCE_ASSOCIATIONS", "yes")
+    assert candidate_job.main() == 2
+    assert json.loads(capsys.readouterr().out)["error"] == "invalid_association_policy"
+
+
 def test_unknown_request_environment_is_rejected(monkeypatch, capsys):
     monkeypatch.setenv("REQUEST_ID", "request-1")
     monkeypatch.setenv("REQUEST_SECRET", "must-not-be-accepted")

@@ -49,6 +49,11 @@ class CandidateAutomationService:
     def __init__(self, storage: Any, author_starter: Any = None, validator_starter: Any = None,
                  max_author_attempts: int | None = None):
         self.storage, self.author_starter, self.validator_starter = storage, author_starter, validator_starter
+        policy = getattr(author_starter, "base_environment", {}).get("BOM_SOURCE_ASSOCIATIONS", "false")
+        if policy not in {"true", "false"}:
+            raise ValueError("invalid association policy")
+        self.authoring_version = "candidate-authoring.v6" if policy == "true" else AUTHORING_VERSION
+        self.author_environment = {"BOM_SOURCE_ASSOCIATIONS": "true"} if policy == "true" else {}
         if max_author_attempts is not None:
             if type(max_author_attempts) is not int or max_author_attempts < 1:
                 raise ValueError("invalid author attempt limit")
@@ -165,23 +170,23 @@ class CandidateAutomationService:
                 manifest = json.loads(self.storage.download_candidate(path, 1_000_000).decode("utf-8"))
             except Exception:
                 continue
-            if manifest.get("version") == AUTHORING_VERSION:
+            if manifest.get("version") == self.authoring_version:
                 return None
         # Version the namespace too: immutable v2 and v3 attempts coexist.
-        root = f"candidate-automation/{request_id}/author/{AUTHORING_VERSION}"
+        root = f"candidate-automation/{request_id}/author/{self.authoring_version}"
         # Legacy start-only markers cannot prove that an execution completed.
         # A failed execution previously left this request permanently blocked,
         # so only a current-version candidate artifact or a new attempt record
         # suppresses a start.
         result = self._run_attempt(
-            prefix=root, values={"REQUEST_ID": request_id},
-            marker_values={"request_id": request_id, "job": "author", "authoring_version": AUTHORING_VERSION},
+            prefix=root, values={"REQUEST_ID": request_id, **self.author_environment},
+            marker_values={"request_id": request_id, "job": "author", "authoring_version": self.authoring_version},
             starter=self.author_starter, author_attempt_kind="author")
         if result == "started":
             # Retain the old marker shape for readers deployed before attempt records.
             try:
-                self._write_marker(f"candidate-automation/{request_id}/author-started-{AUTHORING_VERSION}.json",
-                                   {"request_id": request_id, "job": "author", "authoring_version": AUTHORING_VERSION})
+                self._write_marker(f"candidate-automation/{request_id}/author-started-{self.authoring_version}.json",
+                                   {"request_id": request_id, "job": "author", "authoring_version": self.authoring_version})
             except Exception:
                 pass
         return result
@@ -239,7 +244,7 @@ class CandidateAutomationService:
                 continue
             other_id = manifest.get("candidate_id")
             if (other_id != candidate_id and other_id not in superseded
-                    and manifest.get("version") == AUTHORING_VERSION):
+                    and manifest.get("version") == self.authoring_version):
                 return None  # A newer candidate already exists.
 
         # Count existing refinement attempts (separate namespace from initial authoring).
@@ -247,7 +252,7 @@ class CandidateAutomationService:
         # started marker, so counting both would double the budget. A claim
         # without a started marker represents an in-flight attempt, which
         # _run_attempt treats as occupied rather than consumed.
-        refinement_root = f"candidate-automation/{request_id}/author-refinement/{AUTHORING_VERSION}"
+        refinement_root = f"candidate-automation/{request_id}/author-refinement/{self.authoring_version}"
         existing_attempts = sum(
             1 for path in self._paths(refinement_root + "/")
             if path.endswith(".started.json")
@@ -263,14 +268,14 @@ class CandidateAutomationService:
             feedback = f"Previous parser failed with {error_type}: {error_message}"
 
         # Trigger re-authoring with feedback.
-        values = {"REQUEST_ID": request_id}
+        values = {"REQUEST_ID": request_id, **self.author_environment}
         if feedback:
             values["AUTHOR_FEEDBACK"] = feedback
 
         result = self._run_attempt(
             prefix=refinement_root, values=values,
             marker_values={"request_id": request_id, "job": "author_refinement",
-                           "authoring_version": AUTHORING_VERSION,
+                           "authoring_version": self.authoring_version,
                            "refinement_of": candidate_id},
             starter=self.author_starter,
             max_attempts=self.MAX_AUTHOR_ATTEMPTS,

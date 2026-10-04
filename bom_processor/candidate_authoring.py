@@ -157,10 +157,13 @@ def _validate_code(code: str, source_subtype: str = "") -> bytes:
 
 class CandidateAuthoringService:
     def __init__(self, request_id: str, storage: Any, model: ModelAuthor,
-                 feedback: str | None = None):
+                 feedback: str | None = None, *, source_associations: bool = False):
         if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
             raise AuthoringError("INVALID_REQUEST_ID")
         self.request_id, self.storage, self.model = request_id, storage, model
+        if type(source_associations) is not bool:
+            raise ValueError("invalid association authoring policy")
+        self.source_associations = source_associations
         # Bounded refinement feedback from a prior validation failure, if any.
         self.feedback = feedback if isinstance(feedback, str) and feedback.strip() else None
     def author(self) -> AuthoringResult:
@@ -172,6 +175,9 @@ class CandidateAuthoringService:
         self._validate_request(request)
         evidence = request["source_evidence"][0]
         fixtures = unique_fixtures(request["source_evidence"])
+        if self.source_associations:
+            if len(fixtures) > 100 or sum(item["size_bytes"] for item in fixtures) > 32 * 1024 * 1024:
+                raise AuthoringError("SOURCE_PACKAGE_LIMIT")
         try:
             source = self.storage.download_source(evidence["blob_path"], MAX_SOURCE_BYTES)
         except Exception:
@@ -193,11 +199,40 @@ class CandidateAuthoringService:
                     "source_aliases": item.get("source_aliases", [])[:32]} for item in fixtures]
         prompt = AuthoringPrompt(tuple(CANONICAL_COLUMNS), rules, profile, analysis)
         source_subtype = request["profile"].get("source_subtype", "")
+        associations = None
+        authoring_version = AUTHORING_VERSION
         try:
-            generated = _generate(self.model, prompt, source)
+            if self.source_associations:
+                sources = []
+                for fixture in fixtures:
+                    data = self.storage.download_source(fixture["blob_path"], MAX_SOURCE_BYTES)
+                    if len(data) != fixture["size_bytes"] or hashlib.sha256(data).hexdigest() != fixture["sha256"].lower():
+                        raise AuthoringError("SOURCE_INTEGRITY")
+                    sources.append({"sha256": fixture["sha256"].lower(), "bytes": data,
+                                    "extension": fixture["blob_path"].rsplit(".", 1)[-1].lower()})
+                bundle = self.model.generate_bundle(prompt, sources)
+                if not isinstance(bundle, dict) or set(bundle) != {"parser_code", "assembly_associations"}:
+                    raise AuthoringError("AUTHORING_BUNDLE_INVALID")
+                associations = bundle["assembly_associations"]
+                if not isinstance(associations, dict) or set(associations) != {item["sha256"] for item in sources}:
+                    raise AuthoringError("ASSOCIATION_COVERAGE_INVALID")
+                from .assembly_association import verify_association
+                for item in sources:
+                    proposal = associations[item["sha256"]]
+                    if isinstance(proposal, dict) and proposal.get("name") is None:
+                        raise AuthoringError("ASSEMBLY_ASSOCIATION_REVIEW_REQUIRED")
+                    verified = verify_association(item["bytes"], "." + item["extension"], proposal)
+                    if verified["has_blocking_findings"]:
+                        raise AuthoringError("ASSEMBLY_ASSOCIATION_REVIEW_REQUIRED")
+                generated = bundle["parser_code"]
+                authoring_version = "candidate-authoring.v6"
+            else:
+                generated = _generate(self.model, prompt, source)
             try:
                 code = _validate_code(generated, source_subtype)
             except AuthoringError as failure:
+                if self.source_associations:
+                    raise
                 if failure.code != "CANDIDATE_CODE_POLICY":
                     raise
                 # The rejected source is deliberately kept only in this stack
@@ -214,22 +249,33 @@ class CandidateAuthoringService:
         except Exception:
             raise AuthoringError("MODEL_FAILED") from None
         code_hash = hashlib.sha256(code).hexdigest()
+        association_bytes = (json.dumps(associations, sort_keys=True, separators=(",", ":")).encode()
+                     if associations is not None else None)
+        association_hash = hashlib.sha256(association_bytes).hexdigest() if association_bytes is not None else None
+        if association_bytes is not None and len(association_bytes) > 1_000_000:
+            raise AuthoringError("ASSOCIATION_ARTIFACT_LIMIT")
         signature = request["profile"].get("signature_hash", request["profile_hash"])
         candidate_id = _hash({"request_id": self.request_id, "code_sha256": code_hash,
-                      "signature": signature, "authoring_version": AUTHORING_VERSION})
+                  "signature": signature, "authoring_version": authoring_version,
+                  **({"association_sha256": association_hash} if association_hash else {})})
         base = f"candidates/{self.request_id}/{candidate_id}"
-        manifest = {"version": AUTHORING_VERSION, "status": "generated_unvalidated", "request_id": self.request_id,
+        manifest = {"version": authoring_version, "status": "generated_unvalidated", "request_id": self.request_id,
                     "candidate_id": candidate_id, "parser_key": request["parser_key"], "customer_key": request["customer_key"],
                     "profile_hash": request["profile_hash"], "source_sha256": evidence["sha256"], "source_size_bytes": evidence["size_bytes"],
-                    "code_sha256": code_hash, "signature_suggestion": signature, "model_version": "injected", "prompt_version": AUTHORING_VERSION,
+                    "code_sha256": code_hash, "signature_suggestion": signature, "model_version": "injected", "prompt_version": authoring_version,
                     "fixtures": [{"sha256": item["sha256"], "size_bytes": item["size_bytes"],
                                    "source_aliases": item.get("source_aliases", [])} for item in fixtures]}
+        if association_bytes is not None:
+            manifest["assembly_associations"] = {"blob_path": f"{base}/assembly-associations.json",
+                                                "sha256": association_hash, "size_bytes": len(association_bytes)}
         manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         try:
             _write(self.storage, f"{base}/parse.py", code, "text/x-python")
+            if association_bytes is not None:
+                _write(self.storage, f"{base}/assembly-associations.json", association_bytes, "application/json")
             _write(self.storage, f"{base}/candidate-manifest.json", manifest_bytes, "application/json")
             event = json.dumps({"event": "candidate.generated", "request_id": self.request_id,
-                                "candidate_id": candidate_id, "authoring_version": AUTHORING_VERSION},
+                                "candidate_id": candidate_id, "authoring_version": authoring_version},
                                sort_keys=True).encode()
             _write(self.storage, f"candidates/events/{self.request_id}/{candidate_id}.json", event, "application/json")
         except BlobConflictError:
@@ -246,8 +292,10 @@ class CandidateAuthoringService:
         if not _HASH.fullmatch(value["profile_hash"]) or not isinstance(value["profile"], dict):
             raise AuthoringError("REQUEST_INVALID")
         evidence = value["source_evidence"]
-        if not isinstance(evidence, list) or not evidence or any(not isinstance(item, dict) for item in evidence):
+        if not isinstance(evidence, list) or not 1 <= len(evidence) <= 100 or any(not isinstance(item, dict) for item in evidence):
             raise AuthoringError("REQUEST_INVALID")
-        item = evidence[0]
-        if not isinstance(item.get("blob_path"), str) or type(item.get("size_bytes")) is not int or item["size_bytes"] < 0 or not _HASH.fullmatch(item.get("sha256", "")):
-            raise AuthoringError("REQUEST_INVALID")
+        for item in evidence:
+            if (not isinstance(item.get("blob_path"), str) or type(item.get("size_bytes")) is not int
+                    or not 0 <= item["size_bytes"] <= MAX_SOURCE_BYTES
+                    or not isinstance(item.get("sha256"), str) or not _HASH.fullmatch(item["sha256"])):
+                raise AuthoringError("REQUEST_INVALID")

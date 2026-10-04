@@ -329,6 +329,9 @@ class CandidateValidationService:
     def _validate_group(self, request: dict[str, Any], manifest: dict[str, Any], code: bytes,
                         fixtures: tuple[dict[str, Any], ...]) -> CandidateValidationResult:
         """Validate every unique byte fixture and persist one aggregate record."""
+        if self.assembly_associations is not None:
+            for fixture in fixtures:
+                self._association(self._source(fixture), fixture)
         validation_id = _sha256(_json_bytes({"version": self.validation_version, "request_id": self.request_id,
                                              "candidate_id": self.candidate_id, "code_sha256": manifest["code_sha256"],
                                                             "fixtures": [item["sha256"].lower() for item in fixtures],
@@ -441,6 +444,22 @@ class CandidateValidationService:
         version = manifest.get("version")
         if isinstance(version, str) and version.startswith("candidate-authoring."):
             identity["authoring_version"] = version
+        if version == "candidate-authoring.v6":
+            ref = manifest.get("assembly_associations")
+            if (not isinstance(ref, dict) or set(ref) != {"blob_path", "sha256", "size_bytes"}
+                    or ref["blob_path"] != f"{base}/assembly-associations.json"
+                    or type(ref["size_bytes"]) is not int or not 0 < ref["size_bytes"] <= MAX_METADATA_BYTES
+                    or not isinstance(ref["sha256"], str) or not _SHA.fullmatch(ref["sha256"])):
+                raise CandidateValidationError("ASSOCIATION_ARTIFACT_INVALID")
+            raw = self.storage.download_candidate(ref["blob_path"], MAX_METADATA_BYTES)
+            if len(raw) != ref["size_bytes"] or _sha256(raw) != ref["sha256"]:
+                raise CandidateValidationError("ASSOCIATION_ARTIFACT_INTEGRITY")
+            associations = _load_json(raw, "ASSOCIATION_ARTIFACT_INVALID")
+            if self.assembly_associations is not None and self.assembly_associations != associations:
+                raise CandidateValidationError("ASSOCIATION_POLICY_MISMATCH")
+            self.assembly_associations = associations
+            self.validation_version = "candidate-validation.v4"
+            identity["association_sha256"] = ref["sha256"]
         expected_id = _sha256(_json_bytes(identity))
         if (manifest.get("status") != "generated_unvalidated"
                 or manifest.get("request_id") != self.request_id

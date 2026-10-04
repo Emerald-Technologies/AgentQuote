@@ -26,10 +26,12 @@ def _attempt_context() -> tuple[str, int] | None:
 def _write_attempt_marker(storage, request_id: str, context: tuple[str, int], state: str,
                           values: dict[str, object]) -> None:
     kind, attempt = context
-    path = (f"candidate-automation/{request_id}/{kind}/{AUTHORING_VERSION}/"
+    version = ("candidate-authoring.v6" if os.environ.get("BOM_SOURCE_ASSOCIATIONS") == "true"
+           else AUTHORING_VERSION)
+    path = (f"candidate-automation/{request_id}/{kind}/{version}/"
             f"attempt-{attempt}.{state}.json")
     marker = {"request_id": request_id, "job": kind.replace("-", "_"),
-              "authoring_version": AUTHORING_VERSION, "attempt": attempt, **values}
+          "authoring_version": version, "attempt": attempt, **values}
     storage.upload_registry_immutable(
         path, json.dumps(marker, sort_keys=True).encode(), "application/json")
 
@@ -39,6 +41,10 @@ def main() -> int:
     unknown = sorted(key for key in os.environ if key.startswith("REQUEST_") and key != "REQUEST_ID")
     if not request_id or unknown:
         print(json.dumps({"status": "error", "error": "invalid_request_environment"}, sort_keys=True))
+        return 2
+    association_policy = os.environ.get("BOM_SOURCE_ASSOCIATIONS", "false")
+    if association_policy not in {"true", "false"}:
+        print(json.dumps({"status": "error", "error": "invalid_association_policy"}, sort_keys=True))
         return 2
     try:
         attempt_context = _attempt_context()
@@ -59,7 +65,9 @@ def main() -> int:
         feedback = os.environ.get("AUTHOR_FEEDBACK", "") or None
         # Only pass the feedback keyword when present so older injected doubles
         # that do not accept it continue to work unchanged.
-        result = (CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback).author()
+        result = (CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback,
+              source_associations=True).author() if association_policy == "true" else
+              CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback).author()
                   if feedback else CandidateAuthoringService(request_id, storage, create_foundry_author()).author())
         if attempt_context:
             _write_attempt_marker(storage, request_id, attempt_context, "completed",
