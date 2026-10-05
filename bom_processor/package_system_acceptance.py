@@ -55,23 +55,48 @@ class SystemPackageService(ParentPackageService):
     def accept_system(self, *, plan_id: str, review_manifest_sha256: str,
                       assembly_identities: list[dict], caller_application: str,
                       _persist: bool = True) -> dict:
+        from .package_writer_gate import package_writer
+        from .package_writer_gate import assert_plan_coordination
+        if not _persist:
+            return self._accept_system_locked(plan_id=plan_id,
+                review_manifest_sha256=review_manifest_sha256,
+                assembly_identities=assembly_identities, caller_application=caller_application,
+                _persist=False)
+        assert_plan_coordination(self.storage, self._plan(plan_id))
+        with package_writer(self.storage, plan_id, "approval") as guard:
+            return self._accept_system_locked(plan_id=plan_id,
+                review_manifest_sha256=review_manifest_sha256,
+                assembly_identities=assembly_identities, caller_application=caller_application,
+            _persist=_persist, _guard=guard)
+
+    def _accept_system_locked(self, *, plan_id: str, review_manifest_sha256: str,
+                      assembly_identities: list[dict], caller_application: str,
+                      _persist: bool = True, _guard=None) -> dict:
         if (not isinstance(caller_application, str) or not caller_application
                 or len(caller_application) > 128
                 or any(not (c.isalnum() or c in "._-") for c in caller_application)):
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("SYSTEM_CALLER_INVALID"))
             raise PackageResolutionError("SYSTEM_CALLER_INVALID")
         if (not isinstance(assembly_identities, list) or not assembly_identities
                 or len(assembly_identities) > 50):
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
         identities = []
         for item in assembly_identities:
             if (not isinstance(item, dict) or set(item) != {"name", "revision"}
                     or any(not isinstance(item[key], str) or len(item[key]) > 256
                            for key in ("name", "revision")) or not item["name"].strip()):
+                if _guard is not None:
+                    _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_IDENTITY_INVALID"))
                 raise PackageResolutionError("SYSTEM_ASSEMBLY_IDENTITY_INVALID")
             identities.append({"name": item["name"].strip().casefold(),
                                "revision": item["revision"].strip().casefold()})
         identities.sort(key=lambda item: (item["name"], item["revision"]))
         if len({_hash(item) for item in identities}) != len(identities):
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_IDENTITY_AMBIGUOUS"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_IDENTITY_AMBIGUOUS")
         # Independently rebuild full review without mappings/conflict choices.
         self._verify_plan_sources(plan_id)
@@ -79,6 +104,8 @@ class SystemPackageService(ParentPackageService):
         if (not review["approval_ready"] or not review["complete"]
                 or review["manifest_sha256"] != review_manifest_sha256
                 or review["assembly_mappings"] or review["conflict_dispositions"]):
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("SYSTEM_REVIEW_NOT_QUALIFIED"))
             raise PackageResolutionError("SYSTEM_REVIEW_NOT_QUALIFIED")
         actual = []
         covered = []
@@ -89,6 +116,8 @@ class SystemPackageService(ParentPackageService):
                     or evidence.get("reconciliation") not in {"equivalent", "merged"}
                     or not isinstance(evidence.get("assembly_identity"), dict)
                     or not evidence.get("fixtures")):
+                if _guard is not None:
+                    _guard.reject(PackageResolutionError("SYSTEM_REVIEW_REQUIRES_EXCEPTION"))
                 raise PackageResolutionError("SYSTEM_REVIEW_REQUIRES_EXCEPTION")
             actual.append(evidence["assembly_identity"])
             covered.extend(group["document_ids"])
@@ -96,6 +125,8 @@ class SystemPackageService(ParentPackageService):
         plan = self._plan(plan_id)
         if (actual != identities or len(covered) != len(set(covered))
                 or sorted(covered) != sorted(item["document_id"] for item in plan["sources"])):
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
         body = {"version": VERSION, "plan_id": plan_id,
                 "review_manifest_sha256": review_manifest_sha256, "review": review,
@@ -110,6 +141,8 @@ class SystemPackageService(ParentPackageService):
         if not _persist:
             return record
         path = self._approval_path(plan_id, approval_id)
+        if _guard is not None:
+            _guard.write_attempted = True
         try:
             self.storage.upload_registry_immutable(path, _json_bytes(record), "application/json")
         except BlobConflictError as exc:

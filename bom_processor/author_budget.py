@@ -117,6 +117,7 @@ def begin_execution(storage: Any, group_id: str, slot: int, request_id: str,
     token = _token()
     record = {"version": VERSION, "request_id": request_id,
               "reservation_hash": claim["reservation_hash"], "execution_owner": token}
+    record["version"] = claim["version"]
     # Any conflict loses execution ownership, including identical-byte conflicts.
     storage.upload_registry_immutable(_slot_path(group_id, slot, "execution"), _bytes(record), "application/json")
     return token
@@ -284,7 +285,7 @@ def _reservation(storage: Any, group_id: str, slot: int, request_id: str,
     _require(isinstance(claim, dict))
     body = {key: value for key, value in claim.items() if key != "reservation_hash"}
     _require(claim.get("reservation_hash") == reservation_hash == _hash(body)
-             and claim.get("version") == VERSION and claim.get("group_id") == group_id
+             and claim.get("version") in {VERSION, "author-budget-recovery.v1"} and claim.get("group_id") == group_id
              and claim.get("slot") == slot and type(claim.get("slot")) is int
              and claim.get("request_id") == request_id
              and claim.get("membership_hash") == _hash(binding[0]))
@@ -296,6 +297,9 @@ def _reservation(storage: Any, group_id: str, slot: int, request_id: str,
     else:
         _require(claim.get("source_candidate") is None and claim.get("failure_hash") is None)
     _require(type(claim.get("claimed_at")) in (int, float) and math.isfinite(claim["claimed_at"]))
+    if claim["version"] == "author-budget-recovery.v1":
+        from .author_recovery import validate_recovery_claim
+        validate_recovery_claim(storage, claim)
     return claim
 
 
@@ -308,18 +312,18 @@ def complete(storage: Any, group_id: str, slot: int, request_id: str,
     including a known dispatch rejection). Unknown starts are never cleared.
     """
     try:
-        _reservation(storage, group_id, slot, request_id, reservation_hash)
+        claim = _reservation(storage, group_id, slot, request_id, reservation_hash)
         owner = _read(storage, _slot_path(group_id, slot, "execution"))
         _require(owner is not None and execution_owner is not None
                  and owner.get("execution_owner") == execution_owner
-                 and owner.get("version") == VERSION and owner.get("request_id") == request_id
+                 and owner.get("version") == claim["version"] and owner.get("request_id") == request_id
                  and owner.get("reservation_hash") == reservation_hash)
         _require(state in {"completed", "failed"})
         if state == "completed":
             _identifier(candidate_id)
         else:
             _require(candidate_id is None)
-        record = {"version": VERSION, "request_id": request_id,
+        record = {"version": claim["version"], "request_id": request_id,
                   "reservation_hash": reservation_hash, "state": state, "candidate_id": candidate_id,
                   "execution_owner": execution_owner}
         _put(storage, _slot_path(group_id, slot, "terminal"), record)
@@ -374,7 +378,7 @@ class Budget:
             for kind, marker in markers.items():
                 if marker is None:
                     continue
-                _require(marker.get("version") == VERSION
+                _require(marker.get("version") == claim["version"]
                          and marker.get("request_id") == claim["request_id"]
                          and marker.get("reservation_hash") == claim["reservation_hash"])
                 if kind == "started":
@@ -502,7 +506,7 @@ class Budget:
             _require(reservation == {"status": "reserved", **claim})
             if state == "started":
                 _identifier(execution)
-            record = {"version": VERSION, "request_id": self.request_id,
+            record = {"version": claim["version"], "request_id": self.request_id,
                       "reservation_hash": claim["reservation_hash"], "state": state}
             if execution is not None:
                 record["execution"] = execution

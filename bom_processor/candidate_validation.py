@@ -182,6 +182,11 @@ class CandidateValidationService:
         return result
 
     def validate(self) -> CandidateValidationResult:
+        from .package_writer_gate import candidate_writer
+        with candidate_writer(self.storage, self.request_id):
+            return self._validate_locked()
+
+    def _validate_locked(self) -> CandidateValidationResult:
         request = self._request()
         manifest, code = self._candidate(request)
         fixtures = unique_fixtures(request["source_evidence"])
@@ -231,7 +236,7 @@ class CandidateValidationService:
             output = self.storage.download_candidate(item.output_blob, self.max_output_bytes)
         except CandidateValidationError as exc:
             classification = exc.classification
-            self._write_validation_failed_event(validation_id, item, exc.code, classification)
+            exc.feedback_recorded = self._write_validation_failed_event(validation_id, item, exc.code, classification)
             raise
         except Exception:
             raise CandidateValidationError("WORKER_FAILED") from None
@@ -316,16 +321,20 @@ class CandidateValidationService:
         except BlobConflictError:
             raise CandidateValidationError("VALIDATION_CONFLICT") from None
         if not schema_valid:
-            self._write_validation_failed_event(
+            recorded = self._write_validation_failed_event(
                 validation_id, item, "SCHEMA_INVALID",
                 {"error_type": "SchemaError", "error_message": "canonical_schema_invalid"})
-            raise CandidateValidationError("SCHEMA_INVALID")
+            failure = CandidateValidationError("SCHEMA_INVALID")
+            failure.feedback_recorded = recorded
+            raise failure
         if not semantic["valid"]:
-            self._write_validation_failed_event(
+            recorded = self._write_validation_failed_event(
                 validation_id, item, "SEMANTIC_INVALID",
                 {"error_type": "SemanticError",
                  "error_message": f"semantic_output_invalid coverage_basis={semantic.get('coverage_basis', 'unknown')}"})
-            raise CandidateValidationError("SEMANTIC_INVALID")
+            failure = CandidateValidationError("SEMANTIC_INVALID")
+            failure.feedback_recorded = recorded
+            raise failure
         return CandidateValidationResult(self.request_id, self.candidate_id, validation_id,
                                          evidence_path, resulting_status)
 
@@ -648,7 +657,7 @@ class CandidateValidationService:
 
     def _write_validation_failed_event(self, validation_id: str, item: WorkItem,
                                        error_code: str,
-                                       classification: dict[str, str] | None) -> None:
+                                       classification: dict[str, str] | None) -> bool:
         """Persist an immutable validation-failed event for the refinement loop.
 
         Best effort: a failure to write the event must not mask the original
@@ -671,5 +680,6 @@ class CandidateValidationService:
             path = (f"candidates/events/{self.request_id}/{self.candidate_id}/"
                     f"validation-failed-{validation_id}.json")
             self.storage.upload_candidate_immutable(path, _json_bytes(event), "application/json")
+            return True
         except Exception:
-            pass
+            return False

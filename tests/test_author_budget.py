@@ -54,6 +54,19 @@ class Storage:
             raise ValueError("too large")
         return data
 
+    def download_registry_with_etag(self, path, max_bytes):
+        data = self.download_registry(path, max_bytes)
+        return data, hashlib.sha256(data).hexdigest()
+
+    def upload_registry_if_match(self, path, data, content_type, etag):
+        with self.lock:
+            current = self.registry.get(path)
+            if (etag is None and current is not None) or (etag is not None and
+                    (current is None or hashlib.sha256(current).hexdigest() != etag)):
+                raise BlobConflictError()
+            self.registry[path] = data
+            return hashlib.sha256(data).hexdigest()
+
     def upload_registry_immutable(self, path, data, content_type):
         assert content_type == "application/json"
         if self.write_error:

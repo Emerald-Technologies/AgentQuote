@@ -702,11 +702,31 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
                  status_api: CandidateStatusApi | None = None,
                  review_output_api: CandidateReviewOutputApi | None = None,
                  package_api: PackageApi | None = None,
-                 evidence_api=None) -> type[BaseHTTPRequestHandler]:
+                 evidence_api=None, recovery_api=None) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "AgentQuoteDeterministicAPI/1"
 
         def do_POST(self) -> None:  # noqa: N802
+            if self.path in {"/api/v1/parser-author-recoveries", "/api/v1/parser-author-recoveries/lookup"} and recovery_api is not None:
+                try:
+                    recovery_api.authenticate(self.headers)
+                except PermissionError:
+                    self._write(401, {"error": {"code": "unauthenticated"}}); return
+                except LookupError:
+                    self._write(403, {"error": {"code": "forbidden"}}); return
+                raw = self.headers.get("Content-Length", "")
+                from bom_processor.author_recovery_api import MAX_BODY
+                if not raw.isdigit() or int(raw) > MAX_BODY:
+                    self._write(413, {"error": {"code": "request_too_large"}}); return
+                try:
+                    from bom_processor.package_evidence_api import read_evidence_body
+                    body = read_evidence_body(self.rfile, self.connection, int(raw))
+                except (OSError, ValueError):
+                    self.close_connection = True
+                    self._write(408, {"error": {"code": "body_timeout"}}); return
+                action = recovery_api.lookup if self.path.endswith("/lookup") else recovery_api.handle
+                status, payload = action(self.headers, body)
+                self._write(status, payload); return
             system_match = PACKAGE_ROUTE.fullmatch(self.path)
             system_resolution = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
             if package_api is not None and ((system_match and system_match.group(2) == "accept-system")
@@ -888,6 +908,18 @@ def main() -> None:
     review_output_api = CandidateReviewOutputApi(
         config, lambda: CandidateReviewService(_storage_factory()))
     package_api = PackageApi(config, lambda: SystemPackageService(_storage_factory()))
+    from bom_processor.author_recovery import RecoveryService
+    from bom_processor.author_recovery_api import RecoveryApi
+    recovery_setting = os.environ.get("BOM_AUTHOR_RECOVERY_ENABLED", "false")
+    if recovery_setting not in {"true", "false"}:
+        raise RuntimeError("invalid author recovery policy")
+    def recovery_service():
+        storage = _storage_factory()
+        automation = _candidate_automation_factory(config, storage)
+        if automation is None:
+            raise RuntimeError("author recovery automation unavailable")
+        return RecoveryService(storage, automation)
+    recovery_api = RecoveryApi(config, recovery_service, enabled=recovery_setting == "true")
     evidence_api = None
     if os.environ.get("PACKAGE_EVIDENCE_API_ENABLED") == "true":
         from bom_processor.package_evidence_api import EvidenceApi, configured_policy
@@ -909,7 +941,7 @@ def main() -> None:
         evidence_api = EvidenceApi(authorize=lambda headers: authorize(headers, config),
             service_factory=evidence_service, policy=configured_policy(), enabled=True)
     server = ThreadingHTTPServer(
-        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api, package_api, evidence_api))
+        (config.host, config.port), make_handler(api, decision_api, status_api, review_output_api, package_api, evidence_api, recovery_api))
     log.info("Deterministic BOM API listening on port %d", config.port)
     server.serve_forever()
 

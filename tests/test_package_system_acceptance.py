@@ -50,6 +50,40 @@ def test_system_acceptance_rejects_stale_or_ambiguous_binding(changes):
     service, _, package, review = setup()
     with pytest.raises(PackageResolutionError):
         accept(service, package, review, **changes)
+    assert accept(service, package, review)["approval_id"]
+
+
+def test_stale_system_binding_releases_before_valid_same_store_acceptance():
+    service, _, package, review = setup()
+    with pytest.raises(PackageResolutionError, match="SYSTEM_REVIEW_NOT_QUALIFIED"):
+        accept(service, package, review, review_manifest_sha256="f" * 64)
+    assert accept(service, package, review)["approval_id"]
+
+
+def test_stale_human_binding_releases_before_valid_same_store_approval():
+    service, _, package, review = setup()
+    with pytest.raises(PackageResolutionError, match="PACKAGE_REVIEW_BINDING"):
+        service.approve(plan_id=package["plan_id"], review_manifest_sha256="f" * 64, approver="admin")
+    assert service.approve(plan_id=package["plan_id"],
+        review_manifest_sha256=review["manifest_sha256"], approver="admin")["approval_id"]
+
+
+@pytest.mark.parametrize("human", [True, False])
+def test_attempted_approval_publication_failure_retains_gate(human):
+    from bom_processor.package_writer_gate import PackageWriterBusy
+    service, store, package, review = setup()
+    original = store.upload_registry_immutable
+    def failed_write(*_args, **_kwargs):
+        raise PackageResolutionError("simulated uncertain publication")
+    store.upload_registry_immutable = failed_write
+    with pytest.raises(PackageResolutionError, match="uncertain publication"):
+        if human:
+            service.approve(plan_id=package["plan_id"], review_manifest_sha256=review["manifest_sha256"], approver="admin")
+        else:
+            accept(service, package, review)
+    store.upload_registry_immutable = original
+    with pytest.raises(PackageWriterBusy):
+        accept(service, package, review)
 
 
 def test_material_conflict_cannot_be_selected_by_system():

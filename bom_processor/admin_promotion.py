@@ -50,6 +50,18 @@ class AdminDecisionService:
                variant_id: str | None = None, version: str | None = None,
                review_manifest_sha256: str | None = None,
                fixture_selections: dict[str, str] | None = None) -> dict[str, Any]:
+        from .package_writer_gate import candidate_writer
+        with candidate_writer(self.storage, request_id, "approval"):
+            return self._decide_locked(request_id=request_id, candidate_id=candidate_id,
+                validation_id=validation_id, decision=decision, approver=approver,
+                reason=reason, ticket=ticket, variant_id=variant_id, version=version,
+                review_manifest_sha256=review_manifest_sha256, fixture_selections=fixture_selections)
+
+    def _decide_locked(self, *, request_id: str, candidate_id: str, validation_id: str,
+               decision: str, approver: Any, reason: str, ticket: str,
+               variant_id: str | None = None, version: str | None = None,
+               review_manifest_sha256: str | None = None,
+               fixture_selections: dict[str, str] | None = None) -> dict[str, Any]:
         if not all(isinstance(x, str) and x and len(x) <= 128 and all(c.isalnum() or c in "._-" for c in x)
                    for x in (request_id, candidate_id, validation_id)):
             raise RegistryError("INVALID_DECISION_ID")

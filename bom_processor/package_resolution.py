@@ -184,13 +184,29 @@ class ParentPackageService:
                 approver: str, assembly_mappings: dict[str, dict[str, str]] | None = None,
                 conflict_dispositions: dict[str, str] | None = None,
                 reason: str = "", ticket: str = "") -> dict[str, Any]:
+        from .package_writer_gate import package_writer
+        from .package_writer_gate import assert_plan_coordination
+        assert_plan_coordination(self.storage, self._plan(plan_id))
+        with package_writer(self.storage, plan_id, "approval") as guard:
+            return self._approve_locked(plan_id=plan_id, review_manifest_sha256=review_manifest_sha256,
+                approver=approver, assembly_mappings=assembly_mappings,
+            conflict_dispositions=conflict_dispositions, reason=reason, ticket=ticket, _guard=guard)
+
+    def _approve_locked(self, *, plan_id: str, review_manifest_sha256: str,
+                approver: str, assembly_mappings: dict[str, dict[str, str]] | None = None,
+                conflict_dispositions: dict[str, str] | None = None,
+                reason: str = "", ticket: str = "", _guard=None) -> dict[str, Any]:
         _ids(plan_id, approver)
         if (not _HASH.fullmatch(str(review_manifest_sha256)) or not isinstance(reason, str)
                 or len(reason) > 2000 or not isinstance(ticket, str) or len(ticket) > 256):
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("PACKAGE_APPROVAL_INVALID"))
             raise PackageResolutionError("PACKAGE_APPROVAL_INVALID")
         review = self.review(plan_id, assembly_mappings=assembly_mappings,
                              conflict_dispositions=conflict_dispositions)
         if not review["approval_ready"] or review["manifest_sha256"] != review_manifest_sha256:
+            if _guard is not None:
+                _guard.reject(PackageResolutionError("PACKAGE_REVIEW_BINDING"))
             raise PackageResolutionError("PACKAGE_REVIEW_BINDING")
         identity = {"version": "package-approval.v1", "plan_id": plan_id,
                     "review_manifest_sha256": review_manifest_sha256, "review": review,
@@ -202,6 +218,8 @@ class ParentPackageService:
         record = {**identity, "approval_id": approval_id,
                   "approved_time": now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}
         path = self._approval_path(plan_id, approval_id)
+        if _guard is not None:
+            _guard.write_attempted = True
         try:
             self.storage.upload_registry_immutable(path, _json_bytes(record), "application/json")
         except BlobConflictError as exc:

@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -79,6 +80,7 @@ class InMemoryStorage:
         self.registry_content_types: dict[str, str] = {}
         self.candidates = dict(candidates or {})
         self.candidate_content_types: dict[str, str] = {}
+        self._registry_lock = threading.RLock()
 
     def _registry_etag(self, path: str) -> str:
         return hashlib.sha256(self.registry[path]).hexdigest()
@@ -112,6 +114,10 @@ class InMemoryStorage:
         return None if data is None else self._bounded(data, max_bytes, "stored output")
 
     def upload_registry_immutable(self, path: str, data: bytes, content_type: str) -> None:
+        with self._registry_lock:
+            self._upload_registry_immutable_locked(path, data, content_type)
+
+    def _upload_registry_immutable_locked(self, path: str, data: bytes, content_type: str) -> None:
         existing = self.registry.get(path)
         if existing is not None and existing != data:
             raise BlobConflictError("immutable registry conflict")
@@ -120,10 +126,15 @@ class InMemoryStorage:
             self.registry_content_types[path] = content_type
 
     def download_registry_with_etag(self, path: str, max_bytes: int) -> tuple[bytes, str]:
-        data = self.download_registry(path, max_bytes)
-        return data, self._registry_etag(path)
+        with self._registry_lock:
+            data = self.download_registry(path, max_bytes)
+            return data, self._registry_etag(path)
 
     def upload_registry_if_match(self, path: str, data: bytes, content_type: str, etag: str | None) -> str:
+        with self._registry_lock:
+            return self._upload_registry_if_match_locked(path, data, content_type, etag)
+
+    def _upload_registry_if_match_locked(self, path: str, data: bytes, content_type: str, etag: str | None) -> str:
         current = self.registry.get(path)
         if etag is None:
             if current is not None:
@@ -260,9 +271,19 @@ class AzureBlobStorage:
 
     def download_registry_with_etag(self, path: str, max_bytes: int) -> tuple[bytes, str]:
         client = self._parsers.get_blob_client(path)
-        data = self._download_bounded(client, max_bytes)
+        from azure.core import MatchConditions
+        from azure.core.exceptions import ResourceNotFoundError
         try:
-            return data, client.get_blob_properties().etag
+            properties = client.get_blob_properties()
+            if properties.size > max_bytes:
+                raise ProcessingError("registry exceeds limit")
+            data = client.download_blob(offset=0, length=max_bytes + 1, max_concurrency=1,
+                etag=properties.etag, match_condition=MatchConditions.IfNotModified).readall()
+            if len(data) > max_bytes:
+                raise ProcessingError("registry exceeds limit")
+            return data, properties.etag
+        except ResourceNotFoundError as exc:
+            raise BlobNotFoundError("registry blob unavailable") from exc
         except Exception as exc:
             raise ProcessingError("registry properties failed") from exc
 
