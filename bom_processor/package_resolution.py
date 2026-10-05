@@ -183,20 +183,23 @@ class ParentPackageService:
     def approve(self, *, plan_id: str, review_manifest_sha256: str,
                 approver: str, assembly_mappings: dict[str, dict[str, str]] | None = None,
                 conflict_dispositions: dict[str, str] | None = None,
-                reason: str = "", ticket: str = "") -> dict[str, Any]:
+                reason: str = "", ticket: str = "", caller_application: str | None = None) -> dict[str, Any]:
         from .package_writer_gate import package_writer
         from .package_writer_gate import assert_plan_coordination
         assert_plan_coordination(self.storage, self._plan(plan_id))
         with package_writer(self.storage, plan_id, "approval") as guard:
             return self._approve_locked(plan_id=plan_id, review_manifest_sha256=review_manifest_sha256,
                 approver=approver, assembly_mappings=assembly_mappings,
-            conflict_dispositions=conflict_dispositions, reason=reason, ticket=ticket, _guard=guard)
+            conflict_dispositions=conflict_dispositions, reason=reason, ticket=ticket,
+            caller_application=caller_application, _guard=guard)
 
     def _approve_locked(self, *, plan_id: str, review_manifest_sha256: str,
                 approver: str, assembly_mappings: dict[str, dict[str, str]] | None = None,
                 conflict_dispositions: dict[str, str] | None = None,
-                reason: str = "", ticket: str = "", _guard=None) -> dict[str, Any]:
+                reason: str = "", ticket: str = "", caller_application: str | None = None, _guard=None) -> dict[str, Any]:
         _ids(plan_id, approver)
+        if caller_application is not None:
+            _ids(caller_application)
         if (not _HASH.fullmatch(str(review_manifest_sha256)) or not isinstance(reason, str)
                 or len(reason) > 2000 or not isinstance(ticket, str) or len(ticket) > 256):
             if _guard is not None:
@@ -211,6 +214,8 @@ class ParentPackageService:
         identity = {"version": "package-approval.v1", "plan_id": plan_id,
                     "review_manifest_sha256": review_manifest_sha256, "review": review,
                     "approver": approver, "reason": reason.strip(), "ticket": ticket.strip()}
+        if caller_application is not None:
+            identity["caller_application"] = caller_application
         approval_id = _hash(identity)
         now = self.clock()
         if now.tzinfo is None:
@@ -861,6 +866,9 @@ class ParentPackageService:
         approval = _json(self.storage, self._approval_path(plan_id, approval_id))
         identity = {key: approval.get(key) for key in (
             "version", "plan_id", "review_manifest_sha256", "review", "approver", "reason", "ticket")}
+        if "caller_application" in approval:
+            _ids(approval["caller_application"])
+            identity["caller_application"] = approval["caller_application"]
         if (approval.get("version") != "package-approval.v1"
                 or approval.get("plan_id") != plan_id
                 or approval.get("approval_id") != approval_id or _hash(identity) != approval_id):

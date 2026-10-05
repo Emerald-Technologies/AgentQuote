@@ -563,6 +563,7 @@ def test_package_api_uses_authenticated_actor_and_rejects_impersonation():
 
 
 def test_package_api_get_routes_are_read_only():
+    """Legacy reads remain available without delegated authority."""
     class Service:
         def __init__(self):
             self.calls = []
@@ -598,6 +599,52 @@ def test_package_api_get_routes_are_read_only():
     assert api.handle_get(auth_headers(), "plan-1", "output")[0] == 405
     assert api.handle_get(auth_headers(), "plan-1", "resolve")[0] == 405
     assert len(service.calls) == 6
+
+
+def test_delegated_approval_requires_app_and_binds_resolution():
+    config = ApiConfig("127.0.0.1", 0, "easy_auth", frozenset({"trusted-app"}),
+                       frozenset({"admin-1"}), 100_000, 1, {})
+    def app_headers(app="trusted-app"):
+        message = Message()
+        message["X-MS-CLIENT-PRINCIPAL"] = base64.b64encode(json.dumps(
+            {"claims": [{"typ": "appid", "val": app}, {"typ": "oid", "val": "service-object"}, {"typ": "idtyp", "val": "app"}]}).encode()).decode()
+        return message
+    class Service:
+        calls = []
+        def approve(self, **value):
+            self.calls.append(value)
+            return {"approver": value["approver"], "caller_application": value["caller_application"]}
+        def _bound_approval(self, *args):
+            return {"version": "package-approval.v1", "approver": "human-1", "caller_application": "trusted-app"}
+        def resolve(self, **value):
+            self.calls.append(value)
+            return {"status": "resolved"}
+    service = Service()
+    api = PackageApi(config, lambda: service)
+    def body(operator="human-1", approval=None):
+        return json.dumps({"operator_id": operator, "approval": approval if approval is not None else {}}).encode()
+    assert api.handle_post(app_headers(), "plan-1", "approve",
+        body(approval={"review_manifest_sha256": "a" * 64}))[1]["approver"] == "human-1"
+    assert service.calls[0]["caller_application"] == "trusted-app"
+    assert api.handle_post(app_headers(), "plan-1", "resolve", body(), "approval-1")[0] == 200
+    count = len(service.calls)
+    assert api.handle_post(app_headers(), "plan-1", "resolve", body("other"), "approval-1")[0] == 403
+    assert api.handle_post(auth_headers(), "plan-1", "approve", body())[0] == 403
+    assert api.handle_post(app_headers("untrusted"), "plan-1", "approve", body())[0] == 403
+    delegated = app_headers()
+    delegated["X-MS-CLIENT-PRINCIPAL"] = base64.b64encode(json.dumps({"claims": [
+        {"typ": "appid", "val": "trusted-app"}, {"typ": "oid", "val": "admin-1"},
+        {"typ": "scp", "val": "user-access"}]}).encode()).decode()
+    # Message allows duplicate headers; replace the original rather than append.
+    del delegated["X-MS-CLIENT-PRINCIPAL"]
+    delegated["X-MS-CLIENT-PRINCIPAL"] = base64.b64encode(json.dumps({"claims": [
+        {"typ": "appid", "val": "trusted-app"}, {"typ": "oid", "val": "admin-1"},
+        {"typ": "scp", "val": "user-access"}]}).encode()).decode()
+    assert api.handle_post(delegated, "plan-1", "approve", body())[0] == 403
+    assert api.handle_post(app_headers(), "plan-1", "approve", body("bad/id"))[0] == 422
+    assert api.handle_post(app_headers(), "plan-1", "approve", body(approval={"approver": "forged"}))[0] == 422
+    assert api.handle_post(auth_headers(), "plan-1", "resolve", b"{}", "approval-1")[0] == 403
+    assert len(service.calls) == count
 
 
 def test_package_api_get_auth_and_failures_are_safe():

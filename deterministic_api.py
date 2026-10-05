@@ -467,8 +467,26 @@ class PackageApi:
                     raise ValueError
                 return 200, service.accept_system(plan_id=plan_id,
                     caller_application=next(iter(applications)), **value)
-            actor = authenticated_actor(headers, self.config)
+            authorize(headers, self.config)
             value = json.loads(body.decode("utf-8"))
+            caller_application = None
+            if isinstance(value, dict) and set(value) == {"operator_id", "approval"}:
+                principal = _decode_principal(headers.get("X-MS-CLIENT-PRINCIPAL", ""))
+                if (_claim_values(principal, {"idtyp"}) != {"app"}
+                        or _claim_values(principal, {"scp", "http://schemas.microsoft.com/identity/claims/scope"})):
+                    raise LookupError("application-only identity required")
+                applications = _claim_values(principal, {
+                    "appid", "azp", "http://schemas.microsoft.com/identity/claims/appid",
+                }) & self.config.allowed_app_ids
+                if len(applications) != 1:
+                    raise LookupError("trusted application required")
+                actor = value["operator_id"]
+                if not isinstance(actor, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", actor):
+                    raise ValueError
+                caller_application = next(iter(applications))
+                value = value["approval"]
+            else:
+                actor = authenticated_actor(headers, self.config)
             if not isinstance(value, dict) or any(key in value for key in ("actor", "actor_id", "approver")):
                 raise ValueError
             service = self.service_factory()
@@ -476,11 +494,17 @@ class PackageApi:
                 allowed = {"review_manifest_sha256", "assembly_mappings", "conflict_dispositions", "reason", "ticket"}
                 if set(value) - allowed or not isinstance(value.get("review_manifest_sha256"), str):
                     raise ValueError
-                return 200, service.approve(plan_id=plan_id, approver=actor, **value)
+                return 200, service.approve(plan_id=plan_id, approver=actor,
+                    **({"caller_application": caller_application} if caller_application is not None else {}), **value)
             if action == "resolve" and approval_id is not None and not value:
                 bound = service._bound_approval(plan_id, approval_id)
                 if bound.get("version") == "package-system-acceptance.v1":
                     raise LookupError("system resolution route required")
+                if caller_application is not None:
+                    if bound.get("caller_application") != caller_application or bound.get("approver") != actor:
+                        raise LookupError("delegated approval caller mismatch")
+                elif "caller_application" in bound:
+                    raise LookupError("delegated resolution route required")
                 return 200, service.resolve(plan_id=plan_id, approval_id=approval_id)
             raise ValueError
         except PermissionError:
