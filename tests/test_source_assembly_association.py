@@ -45,10 +45,13 @@ def setup(conflict=False):
     for index, (name, quantity, alternate) in enumerate([
             ("ASM-100", 2, False), ("ASM-100", 2, False),
             ("ASM-100", 3 if conflict else 2, True), ("ASM-200", 4, False)], 1):
-        source = workbook([["Assembly", name], ["Revision", "A"], ["Part", "Quantity", "Maker", "MPN"],
+        # doc-2 is an exact file alias, not a separately serialized equivalent
+        # workbook whose ZIP timestamps can change its byte hash.
+        source = (store.sources[sources[0]["blob_path"]] if index == 2 else
+              workbook([["Assembly", name], ["Revision", "A"], ["Part", "Quantity", "Maker", "MPN"],
                            ["R1", quantity, "Acme", "M1"],
                            [None, None, "Other", "M2"] if alternate else ["Notes", "Ordinary layout"],
-                           ["Drawing", "DRAW-1"], ["Procedure", "PROC-2"]])
+                   ["Drawing", "DRAW-1"], ["Procedure", "PROC-2"]]))
         digest = hashlib.sha256(source).hexdigest()
         path = ("customer/rfq-12345678-1234-4234-8234-123456789012/"
             f"package-1/original-boms/attachment-{index}.xlsx")
@@ -98,6 +101,39 @@ def setup(conflict=False):
     service = CandidateValidationService(request_id, candidate_id, store, Orchestrator(),
                                          assembly_associations=associations)
     return store, sources, associations, service
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_exact_alias_copies_bytes_even_when_workbook_metadata_changes(monkeypatch, conflict):
+    import sys
+    import zipfile
+    module = sys.modules[__name__]
+    original = workbook
+    generated = []
+
+    def changing_metadata(rows):
+        raw = original(rows)
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as output:
+            for name in archive.namelist():
+                # Deliberately distinct ZIP metadata; no real clock/wait required.
+                entry = zipfile.ZipInfo(name, (2030, 1, 1, 0, 0, 2 * len(generated)))
+                output.writestr(entry, archive.read(name))
+        archive.close()
+        value = stream.getvalue()
+        generated.append(value)
+        return value
+
+    monkeypatch.setattr(module, "workbook", changing_metadata)
+    store, sources, associations, _ = setup(conflict=conflict)
+    first, alias = sources[:2]
+    assert first["document_id"] != alias["document_id"]
+    assert first["blob_path"] != alias["blob_path"]
+    assert store.sources[first["blob_path"]] == store.sources[alias["blob_path"]]
+    assert first["sha256"] == alias["sha256"]
+    assert len({source["sha256"] for source in sources}) == len(associations) == 3
+    assert len({value for value in generated}) == len(generated)
 
 
 def test_two_assemblies_unrelated_filenames_documents_and_richer_bom_resolve():
