@@ -150,6 +150,7 @@ class SemanticFenceCoordinator:
                         and snapshot[-1][0]["request_id"] == authority["request_id"]
                         and snapshot[-1][0]["phase"] == "author-refinement"
                         and snapshot[-1][0]["source_candidate"] == authority["source_candidate"]
+                        and snapshot[-1][0]["failure_hash"] == authority["authority_sha256"]
                         and snapshot[-1][1] is not None
                         and snapshot[-1][1]["state"] == "completed"
                         and snapshot[-1][1]["candidate_id"] == successor)

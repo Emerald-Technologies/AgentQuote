@@ -88,7 +88,7 @@ def test_real_writer_fence_lifecycle_preserves_exact_successor(monkeypatch):
     s,p,f=fixture(); authority=f["authority"]
     # This isolates fence CAS. Real budget/worker/publication coverage is below.
     snapshot = [({"request_id": authority["request_id"], "phase": "author-refinement",
-                  "source_candidate": authority["source_candidate"]},
+                  "source_candidate": authority["source_candidate"], "failure_hash": authority["authority_sha256"]},
                  {"state": "completed", "candidate_id": authority["source_candidate"]})]
     projection = {"group_id": authority["budget_group"], "used": 1}
     monkeypatch.setattr("bom_processor.semantic_repair.verified_published_budget",
@@ -262,7 +262,8 @@ def test_real_budget_publication_requires_completed_worker_terminal():
         verified_published_budget(storage, request, clock=lambda: NOW)
 
 
-def test_fence_transitions_consume_actual_same_group_worker_lineage():
+@pytest.mark.parametrize("wrong_authority", [False, True])
+def test_fence_transitions_consume_actual_same_group_worker_lineage(wrong_authority):
     from test_author_budget_integration import NOW, finish
     from bom_processor.author_budget import Budget
     storage, request, plan, fence, starter, automation = automation_fixture("released")
@@ -278,7 +279,8 @@ def test_fence_transitions_consume_actual_same_group_worker_lineage():
     with package_writer(storage, plan, "recovery", semantic_coordinator=coordinator) as writer:
         coordinator.update(authority, writer, "observing", evidence={"sql_armed": True})
     budget = Budget(storage, request, clock=lambda: NOW)
-    reservation = budget.reserve("author-refinement", authority["source_candidate"], authority["authority_sha256"])
+    reservation = budget.reserve("author-refinement", authority["source_candidate"],
+                                 "9"*64 if wrong_authority else authority["authority_sha256"])
     assert reservation["slot"] == 2
     budget.mark_dispatch(reservation)
     budget.mark_started(reservation, "execution-2")
@@ -289,6 +291,14 @@ def test_fence_transitions_consume_actual_same_group_worker_lineage():
     storage.candidates[f"candidates/{request}/{successor}/candidate-manifest.json"] = encoded(
         {"request_id": request, "candidate_id": successor})
     state[0] = "observing"
+    if wrong_authority:
+        from bom_processor.semantic_repair import read_fence
+        with pytest.raises(SemanticRepairHeld):
+            with package_writer(storage, plan, "recovery", semantic_coordinator=coordinator) as writer:
+                coordinator.update(authority, writer, "validation_required", successor=successor,
+                                   evidence={"completed_slot": 2})
+        assert read_fence(storage, plan)[0]["phase"] == "observing"
+        return
     with package_writer(storage, plan, "recovery", semantic_coordinator=coordinator) as writer:
         result = coordinator.update(authority, writer, "validation_required", successor=successor,
                                     evidence={"completed_slot": 2})
