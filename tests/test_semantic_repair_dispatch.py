@@ -88,3 +88,118 @@ def test_concurrent_bridge_call_cannot_cross_dispatch_writer():
     starter.start = start
     bridge.dispatch("feedback")
     assert len(starter.calls) == 1
+
+
+def completed_bridge():
+    storage, request, plan, authority, starter, state, bridge = setup()
+    bridge.arm(); bridge.dispatch("feedback")
+    successor = "5"*64
+    finish(storage, starter.calls[-1], "completed", successor)
+    storage.candidates[f"candidates/{request}/{successor}/candidate-manifest.json"] = encoded(
+        {"request_id": request, "candidate_id": successor})
+    state[0] = "observing"
+    return storage, request, plan, authority, starter, state, bridge, successor
+
+
+def successor_proof(starter):
+    return lambda a,c,e: {"candidate_id":c,"execution":e,
+                         "reservation_hash":starter.calls[-1]["AUTHOR_BUDGET_RESERVATION"]}
+
+
+def test_real_budget_successor_validation_and_sql_last_release():
+    storage, request, plan, authority, starter, state, bridge, successor = completed_bridge()
+    proof = successor_proof(starter)
+    fence = bridge.authorize_successor(proof)
+    assert fence["successor"] == successor and fence["phase"] == "validation_required"
+    state[0] = "validation_required"
+    replacement = lambda a, candidate: {"candidate_id": candidate, "validation_id": "6"*64, "output_sha256": "7"*64}
+    bridge.mark_verified(replacement)
+    with pytest.raises(SemanticRepairHeld): bridge.release(replacement)
+    assert read_fence(storage, plan)[0]["phase"] == "verified"
+
+
+def test_producer_release_replay_allows_sql_last_recovery_without_dispatch():
+    storage, request, plan, authority, starter, state, bridge, successor = completed_bridge()
+    bridge.authorize_successor(successor_proof(starter))
+    state[0] = "validation_required"
+    replacement = lambda a,c: {"candidate_id":c,"validation_id":"6"*64,"output_sha256":"7"*64}
+    bridge.mark_verified(replacement)
+    state[0] = "verified"
+    released = bridge.release(replacement)
+    assert released["phase"] == "released"
+    original_immutable = storage.upload_registry_immutable
+    original_cas = storage.upload_registry_if_match
+    def forbidden(*args): pytest.fail("release replay attempted a write")
+    storage.upload_registry_immutable = forbidden
+    storage.upload_registry_if_match = forbidden
+    assert bridge.release(replacement) == released
+    with pytest.raises(SemanticRepairHeld):
+        bridge.release(lambda a,c: {"candidate_id":c,"validation_id":"6"*64,"output_sha256":"8"*64})
+    storage.upload_registry_immutable = original_immutable
+    storage.upload_registry_if_match = original_cas
+    assert len(starter.calls) == 1
+    with package_writer(storage, plan, "approval"): pass
+
+
+def test_changed_replacement_proof_cannot_release_fence():
+    storage, request, plan, authority, starter, state, bridge, successor = completed_bridge()
+    bridge.authorize_successor(successor_proof(starter))
+    state[0] = "validation_required"
+    bridge.mark_verified(lambda a,c: {"validation_id":"6"*64,"output_sha256":"7"*64})
+    state[0] = "verified"
+    with pytest.raises(SemanticRepairHeld):
+        bridge.release(lambda a,c: {"validation_id":"6"*64,"output_sha256":"8"*64})
+    assert read_fence(storage, plan)[0]["phase"] == "verified"
+
+
+def test_producer_ahead_of_sql_reconstructs_without_writes_or_dispatch():
+    from bom_processor.semantic_repair_dispatch import SemanticRepairDispatch
+    storage, request, plan, authority, starter, state, bridge, successor = completed_bridge()
+    fence = bridge.authorize_successor(successor_proof(starter))
+    fresh = SemanticRepairDispatch(storage, bridge.coordinator.verify_sql, authority,
+                                   bridge.verify_original, starter, clock=lambda: NOW)
+    original_immutable = storage.upload_registry_immutable
+    original_cas = storage.upload_registry_if_match
+    def forbidden(*args): pytest.fail("producer-ahead replay attempted write")
+    storage.upload_registry_immutable = forbidden; storage.upload_registry_if_match = forbidden
+    assert fresh.authorize_successor(successor_proof(starter)) == fence
+    storage.upload_registry_immutable = original_immutable; storage.upload_registry_if_match = original_cas
+    state[0] = "validation_required"
+    replacement = lambda a,c: {"candidate_id":c,"validation_id":"6"*64,"output_sha256":"7"*64}
+    verified = fresh.mark_verified(replacement)
+    storage.upload_registry_immutable = forbidden; storage.upload_registry_if_match = forbidden
+    assert fresh.mark_verified(replacement) == verified
+    assert len(starter.calls) == 1
+
+
+def test_losing_stale_reconciler_releases_own_unmodified_writer():
+    from contextlib import contextmanager
+    from bom_processor.author_budget import BudgetError
+    storage, request, plan, authority, starter, state, bridge, successor = completed_bridge()
+    actual_writer = bridge._writer
+    @contextmanager
+    def competing_writer():
+        # Caller A completes between caller B's pre-read and writer acquisition.
+        bridge._writer = actual_writer
+        bridge.authorize_successor(successor_proof(starter))
+        state[0] = "validation_required"
+        with actual_writer() as writer:
+            yield writer
+    bridge._writer = competing_writer
+    with pytest.raises(BudgetError): bridge.authorize_successor(successor_proof(starter))
+    bridge._writer = actual_writer
+    with actual_writer(): pass  # Losing pre-write rejection did not strand gate.
+    replacement = lambda a,c: {"candidate_id":c,"validation_id":"6"*64,"output_sha256":"7"*64}
+    @contextmanager
+    def competing_verification():
+        bridge._writer = actual_writer
+        bridge.mark_verified(replacement)
+        state[0] = "verified"
+        with actual_writer() as writer:
+            yield writer
+    bridge._writer = competing_verification
+    with pytest.raises(BudgetError): bridge.mark_verified(replacement)
+    bridge._writer = actual_writer
+    with actual_writer(): pass
+    assert read_fence(storage, plan)[0]["phase"] == "verified"
+    assert len(starter.calls) == 1
