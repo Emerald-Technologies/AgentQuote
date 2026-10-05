@@ -834,6 +834,12 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self._write(status, payload)
 
         def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/api/v1/identity/classification":
+                from bom_processor.identity_classification import classify_identity
+                status, payload = classify_identity(self.headers, api.config,
+                    enabled=os.environ.get("BOM_API_IDENTITY_CLASSIFICATION_ENABLED") == "true")
+                self._write(status, payload)
+                return
             evidence_match = EVIDENCE_ROUTE.fullmatch(self.path)
             if evidence_match and evidence_match.group(2) == "status" and evidence_api is not None:
                 status, payload = evidence_api.handle(self.headers, *evidence_match.groups())
