@@ -8,6 +8,7 @@ import json
 import re
 from html.parser import HTMLParser
 from typing import Any, Callable
+from .author_failure import failure_stage
 
 MAX_SHEETS = 4
 MAX_ROWS = 20
@@ -185,10 +186,15 @@ class FoundryModelAuthor:
 
     def generate_bundle(self, prompt: Any, sources: list[dict[str, Any]]) -> dict[str, Any]:
         """One existing-agent call returns code and source-backed proposals."""
+        with failure_stage("inventory"):
+            return self._generate_bundle(prompt, sources)
+
+    def _generate_bundle(self, prompt: Any, sources: list[dict[str, Any]]) -> dict[str, Any]:
         contexts = []
         context_chars = 0
         for item in sources:
-            inventory = build_complete_inventory(item["bytes"], item["extension"])
+            with failure_stage("inventory"):
+                inventory = build_complete_inventory(item["bytes"], item["extension"])
             context_chars += len(inventory)
             if context_chars > 120_000:
                 raise ValueError("AUTHORING_SOURCE_CONTEXT_LIMIT")
@@ -218,13 +224,15 @@ class FoundryModelAuthor:
             if factory is None:
                 from agent_framework import Agent
                 factory = Agent
-            response = await factory(client=self.client, instructions=instructions, tools=[]).run(
-                user_text, options={"max_tokens": BUNDLE_MAX_TOKENS})
-            text = _response_text(response)
-            if len(text.encode("utf-8")) > 1_000_000:
-                raise ValueError("AUTHORING_RESPONSE_LIMIT")
-            from .interpretation_coverage import _pairs_hook
-            return json.loads(text, object_pairs_hook=_pairs_hook)
+            with failure_stage("invocation"):
+                response = await factory(client=self.client, instructions=instructions, tools=[]).run(
+                    user_text, options={"max_tokens": BUNDLE_MAX_TOKENS})
+            with failure_stage("response"):
+                text = _response_text(response)
+                if len(text.encode("utf-8")) > 1_000_000:
+                    raise ValueError("AUTHORING_RESPONSE_LIMIT")
+                from .interpretation_coverage import _pairs_hook
+                return json.loads(text, object_pairs_hook=_pairs_hook)
         return asyncio.run(invoke())
 
     def generate(self, prompt: Any, source_bytes: bytes, prior_code: str | None = None,

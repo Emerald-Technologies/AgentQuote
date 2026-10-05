@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from .core import BlobConflictError, CANONICAL_COLUMNS
 from .candidates import unique_fixtures
+from .author_failure import AuthorFailure, diagnostic_fields, failure_stage
 
 MAX_CODE_BYTES = 1_000_000
 MAX_SOURCE_BYTES = 50_000_000
@@ -48,9 +49,12 @@ _BANNED_MODULES = {
 
 class AuthoringError(ValueError):
     """Safe, stable failure returned by this boundary."""
-    def __init__(self, code: str, rule_id: str | None = None):
+    def __init__(self, code: str, rule_id: str | None = None, *, diagnostics=None):
         self.code = code
         self.rule_id = rule_id
+        self.diagnostics = diagnostic_fields(
+            (diagnostics or {}).get("failure_stage"), (diagnostics or {}).get("failure_category"),
+            (diagnostics or {}).get("failure_http_status"))
         super().__init__(code)
 
 
@@ -221,7 +225,8 @@ class CandidateAuthoringService:
                     proposal = associations[item["sha256"]]
                     if isinstance(proposal, dict) and proposal.get("name") is None:
                         raise AuthoringError("ASSEMBLY_ASSOCIATION_REVIEW_REQUIRED")
-                    verified = verify_association(item["bytes"], "." + item["extension"], proposal)
+                    with failure_stage("association"):
+                        verified = verify_association(item["bytes"], "." + item["extension"], proposal)
                     if verified["has_blocking_findings"]:
                         raise AuthoringError("ASSEMBLY_ASSOCIATION_REVIEW_REQUIRED")
                 generated = bundle["parser_code"]
@@ -246,6 +251,8 @@ class CandidateAuthoringService:
                 code = _validate_code(corrective, source_subtype)
         except AuthoringError:
             raise
+        except AuthorFailure as failure:
+            raise AuthoringError("MODEL_FAILED", diagnostics=failure.diagnostics) from None
         except Exception:
             raise AuthoringError("MODEL_FAILED") from None
         code_hash = hashlib.sha256(code).hexdigest()

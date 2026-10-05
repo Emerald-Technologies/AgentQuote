@@ -86,6 +86,30 @@ def test_job_reports_safe_authoring_error_code(monkeypatch, capsys):
     assert marker["rule_id"] == "banned_import"
 
 
+def test_job_reports_safe_model_diagnostics(monkeypatch, capsys):
+    import sys
+    from types import ModuleType
+    from bom_processor.candidate_authoring import AuthoringError
+    class Service:
+        def __init__(self, *args): pass
+        def author(self):
+            raise AuthoringError("MODEL_FAILED", diagnostics={"failure_stage": "response", "failure_category": "json_invalid", "raw_message": "secret"})
+    monkeypatch.setenv("REQUEST_ID", "request-1")
+    monkeypatch.setenv("BOM_STORAGE_ACCOUNT_URL", "https://example.blob.core.usgovcloudapi.net")
+    azure = ModuleType("azure"); identity = ModuleType("azure.identity")
+    identity.ManagedIdentityCredential = lambda **_: object(); azure.identity = identity
+    monkeypatch.setitem(sys.modules, "azure", azure); monkeypatch.setitem(sys.modules, "azure.identity", identity)
+    monkeypatch.setattr("bom_processor.candidate_authoring.CandidateAuthoringService", Service)
+    monkeypatch.setattr("bom_processor.foundry_author.create_foundry_author", lambda: object())
+    monkeypatch.setattr("bom_processor.core.AzureBlobStorage.from_account_url", lambda *args, **kwargs: object())
+    assert candidate_job.main() == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["failure_stage"] == "response"
+    assert output["failure_category"] == "json_invalid"
+    assert output["error_code"] == "MODEL_FAILED"
+    assert "secret" not in json.dumps(output)
+
+
 def test_job_success_records_completed_attempt(monkeypatch, capsys):
     class Result:
         status = "generated_unvalidated"

@@ -89,18 +89,20 @@ def main() -> int:
     except Exception as exc:
         error_code = None
         rule_id = None
+        diagnostics = {}
         try:
             from bom_processor.candidate_authoring import AuthoringError
             if isinstance(exc, AuthoringError):
                 error = "candidate_authoring_failed"
                 error_code = exc.code
                 rule_id = exc.rule_id
+                diagnostics = exc.diagnostics
             else:
                 error = "candidate_job_failed"
         except Exception:
             error = "candidate_job_failed"
         if storage is not None and attempt_context:
-            marker = {"error_type": type(exc).__name__}
+            marker = {"error_type": type(exc).__name__, **diagnostics}
             if error_code: marker["error_code"] = error_code
             if rule_id: marker["rule_id"] = rule_id
             try:
@@ -114,7 +116,7 @@ def main() -> int:
                          budget_values[2], "failed", execution_owner=budget_owner)
             except Exception:
                 pass
-        payload = {"status": "error", "request_id": request_id, "error": error}
+        payload = {"status": "error", "request_id": request_id, "error": error, **diagnostics}
         if error_code: payload["error_code"] = error_code
         if rule_id: payload["rule_id"] = rule_id
         print(json.dumps(payload, sort_keys=True))
