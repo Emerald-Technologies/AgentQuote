@@ -641,6 +641,12 @@ def test_delegated_approval_requires_app_and_binds_resolution():
         {"typ": "appid", "val": "trusted-app"}, {"typ": "oid", "val": "admin-1"},
         {"typ": "scp", "val": "user-access"}]}).encode()).decode()
     assert api.handle_post(delegated, "plan-1", "approve", body())[0] == 403
+    for claims in ([{"typ": "appid", "val": "trusted-app"}],
+                   [{"typ": "appid", "val": "trusted-app"}, {"typ": "idtyp", "val": "app"},
+                    {"typ": "scp", "val": "user-access"}]):
+        headers = Message()
+        headers["X-MS-CLIENT-PRINCIPAL"] = base64.b64encode(json.dumps({"claims": claims}).encode()).decode()
+        assert api.handle_post(headers, "plan-1", "approve", body())[0] == 403
     assert api.handle_post(app_headers(), "plan-1", "approve", body("bad/id"))[0] == 422
     assert api.handle_post(app_headers(), "plan-1", "approve", body(approval={"approver": "forged"}))[0] == 422
     assert api.handle_post(auth_headers(), "plan-1", "resolve", b"{}", "approval-1")[0] == 403
