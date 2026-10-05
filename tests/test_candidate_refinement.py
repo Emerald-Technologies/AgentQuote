@@ -8,6 +8,7 @@ import pytest
 from bom_processor.candidate_automation import CandidateAutomationService
 from bom_processor.candidate_validation import CandidateValidationService
 from worker.transfer import _failure_classification
+from bom_processor.core import BlobNotFoundError
 
 
 class FakeStorage:
@@ -19,7 +20,7 @@ class FakeStorage:
 
     def download_registry(self, path, max_bytes):
         if path not in self.registry:
-            raise FileNotFoundError(path)
+            raise BlobNotFoundError(path)
         return self.registry[path]
 
     def download_candidate(self, path, max_bytes):

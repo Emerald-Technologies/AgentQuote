@@ -182,8 +182,9 @@ class CandidateValidationService:
         return result
 
     def validate(self) -> CandidateValidationResult:
-        from .package_writer_gate import candidate_writer
-        with candidate_writer(self.storage, self.request_id, candidate_id=self.candidate_id):
+        from .package_writer_gate import candidate_validation_writer
+        with candidate_validation_writer(self.storage, self.request_id, self.candidate_id,
+                                         clock=self.clock, sleep=self.sleep):
             return self._validate_locked()
 
     def _validate_locked(self) -> CandidateValidationResult:

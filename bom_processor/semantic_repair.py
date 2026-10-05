@@ -103,8 +103,9 @@ class SemanticFenceCoordinator:
     verify_sql(authority, expected_state) independently reads the durable record;
     no HTTP caller may supply it. Missing adapter always blocks fence writes.
     """
-    def __init__(self, storage, verify_sql, authority=None):
+    def __init__(self, storage, verify_sql, authority=None, *, budget_clock=None):
         self.storage, self.verify_sql, self.authority = storage, verify_sql, authority
+        self.budget_clock = budget_clock
 
     def authorize_writer(self, plan, operation):
         """Internal repair reconciliation access, never general approval access."""
@@ -136,6 +137,22 @@ class SemanticFenceCoordinator:
         expected_sql = {"observing": "dispatch_armed", "validation_required": "observing",
                         "verified": "validation_required", "released": "verified"}[phase]
         require(self.verify_sql(authority, expected_sql) is True)
+        if phase in {"observing", "validation_required"}:
+            projection, snapshot = verified_published_budget(self.storage, authority["request_id"],
+                                                            clock=self.budget_clock)
+            require(projection["group_id"] == authority["budget_group"])
+            if phase == "observing":
+                require(projection["used"] == authority["next_slot"] - 1
+                        and snapshot[-1][1] is not None
+                        and snapshot[-1][1]["candidate_id"] == authority["source_candidate"])
+            else:
+                require(projection["used"] == authority["next_slot"]
+                        and snapshot[-1][0]["request_id"] == authority["request_id"]
+                        and snapshot[-1][0]["phase"] == "author-refinement"
+                        and snapshot[-1][0]["source_candidate"] == authority["source_candidate"]
+                        and snapshot[-1][1] is not None
+                        and snapshot[-1][1]["state"] == "completed"
+                        and snapshot[-1][1]["candidate_id"] == successor)
         if phase == "observing":
             require(successor is None and validation_id is None)
         else:
@@ -180,3 +197,24 @@ def assert_published_lineage(storage, request_id, snapshot):
             require(pin(candidate) and candidate in completed)
             manifest = json.loads(storage.download_candidate(path, 1000000))
             require(manifest.get("candidate_id") == candidate and manifest.get("request_id") == request_id)
+
+
+def verified_published_budget(storage, request_id, *, clock=None):
+    """Read actual validated budget markers and account for all publications.
+
+    Call under the package writer before repair reservation or reconciliation.
+    No markers, reservations, status automation or remote starts are written.
+    """
+    from .author_budget import Budget
+    snapshot = []
+    budget = Budget(storage, request_id, **({"clock": clock} if clock is not None else {}))
+    try:
+        projection = budget._inspect(snapshot)
+        require(projection["status"] == "available" or
+                (projection["status"] == "hold" and projection["reason"] == "budget_exhausted"))
+        assert_published_lineage(storage, request_id, snapshot)
+    except SemanticRepairHeld:
+        raise
+    except Exception:
+        raise SemanticRepairHeld() from None
+    return projection, snapshot

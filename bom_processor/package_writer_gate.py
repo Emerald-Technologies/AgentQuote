@@ -138,3 +138,34 @@ def candidate_writer(storage, request_id, operation="validation", *, candidate_i
     member = _membership(storage, request_id)
     return package_writer(storage, member[0]["plan_id"], operation,
                           request_id=request_id, candidate_id=candidate_id) if member else nullcontext()
+
+
+@contextmanager
+def candidate_validation_writer(storage, request_id, candidate_id, *, clock, sleep):
+    """Wait briefly for the dispatcher; never retry validation or remote start.
+
+    Ten seconds/eleven attempts bounds acquisition even with an injected clock.
+    An unresolved fence still rejects immediately after writer acquisition.
+    """
+    deadline = clock() + 10
+    for attempt in range(11):
+        context = candidate_writer(storage, request_id, candidate_id=candidate_id)
+        try:
+            guard = context.__enter__()
+        except PackageWriterBusy:
+            remaining = deadline - clock()
+            if attempt == 10 or remaining <= 0:
+                raise
+            sleep(min(1, remaining))
+            continue
+        # Context exit handles validation failure exactly once. An error from
+        # the validation body must never be mistaken for acquisition contention.
+        try:
+            yield guard
+        except BaseException:
+            import sys
+            if not context.__exit__(*sys.exc_info()):
+                raise
+        else:
+            context.__exit__(None, None, None)
+        return

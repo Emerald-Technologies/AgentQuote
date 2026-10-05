@@ -169,11 +169,15 @@ class CandidateAutomationService:
         return "exhausted"
 
     def start_author(self, request_id: str) -> str | None:
-        scoped = self._request_policy(request_id)
-        if scoped is not self:
-            return scoped.start_author(request_id)
         if self.author_starter is None:
             return None
+        from .package_writer_gate import candidate_writer
+        # Fence eligibility and dispatch share the same short writer. A check
+        # outside this scope could race a repair coordinator arming its fence.
+        with candidate_writer(self.storage, request_id, "recovery"):
+            return self._request_policy(request_id)._start_author_locked(request_id)
+
+    def _start_author_locked(self, request_id: str) -> str | None:
         if self._budget_required(request_id):
             from .author_budget import Budget
             budget = Budget(self.storage, request_id, clock=self.budget_clock)
@@ -215,6 +219,11 @@ class CandidateAutomationService:
     def start_validator(self, request_id: str, candidate_id: str) -> str | None:
         if self.validator_starter is None:
             return None
+        from .package_writer_gate import candidate_writer
+        with candidate_writer(self.storage, request_id, "validation", candidate_id=candidate_id):
+            return self._start_validator_locked(request_id, candidate_id)
+
+    def _start_validator_locked(self, request_id: str, candidate_id: str) -> str | None:
         root = f"candidates/{request_id}/{candidate_id}/"
         paths = self._paths(root)
         if any("/validation/" in path and path.endswith("/evidence.json") for path in paths):
@@ -240,9 +249,14 @@ class CandidateAutomationService:
 
     def start_author_refinement(self, request_id: str, candidate_id: str,
                                 failure_event: dict[str, Any] | None = None) -> str | None:
-        scoped = self._request_policy(request_id)
-        if scoped is not self:
-            return scoped.start_author_refinement(request_id, candidate_id, failure_event)
+        if self.author_starter is None:
+            return None
+        from .package_writer_gate import candidate_writer
+        with candidate_writer(self.storage, request_id, "recovery", candidate_id=candidate_id):
+            return self._request_policy(request_id)._start_author_refinement_locked(request_id, candidate_id, failure_event)
+
+    def _start_author_refinement_locked(self, request_id: str, candidate_id: str,
+                                        failure_event: dict[str, Any] | None = None) -> str | None:
         """Re-trigger authoring with feedback after a validation failure.
 
         Uses a separate attempt namespace from the initial authoring so the

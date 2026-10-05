@@ -97,3 +97,29 @@ def test_alias_plan_is_rejected_before_writer_acquisition():
     with pytest.raises(PackageWriterBusy):
         assert_plan_coordination(store, alias)
     assert_plan_coordination(store, {**alias, "plan_id": member["plan_id"]})
+
+
+def test_validation_wait_is_bounded_and_never_steals_owner():
+    from bom_processor.package_writer_gate import candidate_validation_writer
+    from test_author_budget import ready
+    store, _, member = ready()
+    waits = []
+    with package_writer(store, member["plan_id"], "recovery"):
+        before = dict(store.registry)
+        with pytest.raises(PackageWriterBusy):
+            with candidate_validation_writer(store, "request-1", "candidate", clock=lambda: 0,
+                                             sleep=waits.append):
+                pytest.fail("held writer stolen")
+        assert len(waits) == 10 and store.registry == before
+
+
+def test_validation_body_busy_is_not_retried():
+    from bom_processor.package_writer_gate import candidate_validation_writer
+    from test_author_budget import ready
+    store, _, _ = ready()
+    waits = []
+    with pytest.raises(PackageWriterBusy):
+        with candidate_validation_writer(store, "request-1", "candidate", clock=lambda: 0,
+                                         sleep=waits.append):
+            raise PackageWriterBusy()
+    assert waits == []
