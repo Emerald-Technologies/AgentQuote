@@ -3,13 +3,17 @@
 Inputs: Git240b64a tests/ad03cd9 budget and three local images. Output: assertions.
 Run python dev/qualify_recovery_images.py. No image rebuild, push or live dispatch.
 """
-import ast
 import base64
+import json
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMAGES = [f"agentquote-recovery-{kind}:240b64a-20261005-01" for kind in ("api", "author", "validator")]
+IMAGES = {
+    "api": ("agentquote-recovery-api:240b64a-20261005-01", "sha256:6f30b783151d035472b88816949b8be8a57ea704e1896bee913232b73a78d050"),
+    "author": ("agentquote-recovery-author:240b64a-20261005-01", "sha256:e1abe74b3cc70abf0ba6754cdf4519b0f61c1f55dca4db3f4a908806e5e63aae"),
+    "validator": ("agentquote-recovery-validator:240b64a-20261005-01", "sha256:c66dbc07df96739caead7de3fe26f49088a670018b61475d2c67a12d91351006"),
+}
 SCRIPT = r'''
 import ast,base64,sys,types,json
 for name,encoded in INPUTS.items():
@@ -45,14 +49,23 @@ with package_writer(storage,authority['plan_id'],'approval'):
     except PackageWriterBusy:pass
 store2,budget2,auth2=failed_refinement();claim2=reserve_recovery(budget2,auth2);budget2.mark_dispatch(claim2);budget2.mark_unknown(claim2)
 assert budget2.inspect()['reason']=='budget_start_unknown' and reserve_recovery(budget2,auth2)['reason']=='budget_recovery_consumed'
-config=SimpleNamespace(auth_mode='entra',allowed_app_ids=frozenset({'test-app'}),allowed_object_ids=frozenset())
-factory=Mock(side_effect=AssertionError('service must not construct'));api=RecoveryApi(config,factory)
-headers={'X-MS-CLIENT-PRINCIPAL':base64.b64encode(json.dumps({'claims':[{'typ':'appid','val':'test-app'}]}).encode()).decode()}
-assert api.handle({},b'{')[0]==401
-assert api.handle(headers,b'{')[0]==403
-assert api.lookup(headers,b'{')[0]==403
-factory.assert_not_called()
-print('PASS: claim/replay/history/newworker/oldworker/unknownhold/writergate/auth-disabled')
+assert not RecoveryApi(None,None).enabled
+if ROLE == 'api':
+    config=SimpleNamespace(auth_mode='entra',allowed_app_ids=frozenset({'test-app'}),allowed_object_ids=frozenset())
+    factory=Mock(side_effect=AssertionError('service must not construct'));api=RecoveryApi(config,factory)
+    headers={'X-MS-CLIENT-PRINCIPAL':base64.b64encode(json.dumps({'claims':[{'typ':'appid','val':'test-app'}]}).encode()).decode()}
+    assert api.handle({},b'{')[0]==401
+    assert api.handle(headers,b'{')[0]==403
+    assert api.lookup(headers,b'{')[0]==403
+    factory.assert_not_called()
+    enabled=RecoveryApi(config,factory,enabled=True)
+    assert enabled.handle(headers,b'x'*8193)[0]==413
+    assert enabled.lookup(headers,b'x'*8193)[0]==413
+    service=Mock();service.lookup.return_value={'status':'hold','reason':'budget_recovery_consumed'}
+    query=RecoveryApi(config,lambda:service,enabled=True)
+    assert query.lookup(headers,b'{"operator_id":"test-admin","recovery":{}}')[0]==200
+    service.lookup.assert_called_once();service.recover.assert_not_called()
+print('PASS: '+ROLE+' common recovery contracts'+(' plus API auth/lookup/body bounds' if ROLE=='api' else ' (API-only checks excluded)'))
 '''
 
 
@@ -63,11 +76,14 @@ def main():
                            ("test_author_recovery", "tests/test_author_recovery.py")]}
     old = base64.b64encode(subprocess.check_output(
         ["git", "show", "ad03cd9:bom_processor/author_budget.py"], cwd=ROOT)).decode()
-    script = "INPUTS=" + repr(inputs) + "\nOLD=" + repr(old) + "\n" + SCRIPT
-    for image in IMAGES:
+    for role, (image, expected) in IMAGES.items():
+        actual = subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
+        if actual != expected:
+            raise RuntimeError("RETAINED_IMAGE_MISMATCH")
+        script = "INPUTS=" + repr(inputs) + "\nOLD=" + repr(old) + "\nROLE=" + repr(role) + "\n" + SCRIPT
         result = subprocess.run(["docker", "run", "--rm", "-i", "--network", "none",
             "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-            "--env", "PYTHONDONTWRITEBYTECODE=1", "--entrypoint", "python", image, "-"],
+            "--env", "PYTHONDONTWRITEBYTECODE=1", "--entrypoint", "python", expected, "-"],
             input=script, text=True, capture_output=True, timeout=60)
         print(image, result.stdout.strip())
         if result.returncode != 0:
