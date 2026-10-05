@@ -183,7 +183,7 @@ class CandidateValidationService:
 
     def validate(self) -> CandidateValidationResult:
         from .package_writer_gate import candidate_writer
-        with candidate_writer(self.storage, self.request_id):
+        with candidate_writer(self.storage, self.request_id, candidate_id=self.candidate_id):
             return self._validate_locked()
 
     def _validate_locked(self) -> CandidateValidationResult:

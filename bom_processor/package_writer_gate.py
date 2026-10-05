@@ -51,7 +51,8 @@ def _read(storage, path):
 
 
 @contextmanager
-def package_writer(storage, plan_id, operation):
+def package_writer(storage, plan_id, operation, *, request_id=None, candidate_id=None,
+                   semantic_coordinator=None):
     if (type(plan_id) is not str or len(plan_id) != 64
             or any(char not in "0123456789abcdef" for char in plan_id)
             or operation not in OPERATIONS):
@@ -69,6 +70,30 @@ def package_writer(storage, plan_id, operation):
         raise PackageWriterBusy() from None
     outcome = None
     guard = WriterGuard()
+    guard.plan_id = plan_id
+    guard.owner = record["owner"]
+    guard.held_etag = held_etag
+    # Definitive pre-action semantic rejection releases only this short writer.
+    # It never alters or clears the persistent repair fence.
+    from .semantic_repair import assert_action, SemanticRepairHeld
+    try:
+        if semantic_coordinator is None:
+            assert_action(storage, plan_id, operation, request_id, candidate_id)
+        else:
+            # Internal coordinator checks the independently persisted SQL owner;
+            # no route/caller supplies a bypass boolean or owner string here.
+            from .semantic_repair import SemanticFenceCoordinator
+            if not isinstance(semantic_coordinator, SemanticFenceCoordinator):
+                raise SemanticRepairHeld()
+            semantic_coordinator.authorize_writer(plan_id, operation)
+    except SemanticRepairHeld:
+        record["state"] = "idle"
+        try:
+            storage.upload_registry_if_match(path, json.dumps(record, sort_keys=True).encode(),
+                                             "application/json", held_etag)
+        except Exception:
+            raise PackageWriterBusy() from None
+        raise
     try:
         yield guard
     except BaseException as exception:
@@ -107,8 +132,9 @@ def assert_plan_coordination(storage, plan):
             raise PackageWriterBusy()
 
 
-def candidate_writer(storage, request_id, operation="validation"):
+def candidate_writer(storage, request_id, operation="validation", *, candidate_id=None):
     """Only enrolled package requests participate; read errors are never absence."""
     from .author_budget import _membership
     member = _membership(storage, request_id)
-    return package_writer(storage, member[0]["plan_id"], operation) if member else nullcontext()
+    return package_writer(storage, member[0]["plan_id"], operation,
+                          request_id=request_id, candidate_id=candidate_id) if member else nullcontext()
