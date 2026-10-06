@@ -146,7 +146,8 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      include_classification: bool = False,
                      include_manufacturing: bool = False,
                      retained_bom_sources: dict | None = None,
-                     correction: dict | None = None) -> dict:
+                     correction: dict | None = None,
+                     review_inputs: dict | None = None) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
@@ -174,7 +175,8 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
             sources.append(source)
     require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
     inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
-    require((policy_version == "package-evidence-foundry.v4") == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
+    from .package_evidence_contracts import RETAINED_POLICIES
+    require((policy_version in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
     retained_objects = {}
     if retained_bom_sources is not None:
         from .package_evidence_retention import retained_inventory
@@ -275,5 +277,9 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
         if include_manufacturing:
             from .package_manufacturing_assessment import assessment_artifact
             result["manufacturingAssessment"] = assessment_artifact(graph, classification, sources, manufacturing)
+        if review_inputs is not None:
+            # Same verified observations the producer saw, for the independent reviewer call.
+            review_inputs.update(sources=detached(sources), inventory=detached(inventory), rows=detached(rows),
+                                 retained=detached(retained_objects))
         return result
     return detached(graph)

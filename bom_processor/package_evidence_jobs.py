@@ -11,8 +11,8 @@ from typing import Any
 
 from .core import BlobConflictError, BlobNotFoundError
 from .package_evidence_contracts import (
-    PackageEvidenceError, assemblies_metadata, detached, digest, hash_value,
-    integer, json_bytes, object_hash, require, strict, text, uuid_value,
+    ASSESSED_POLICIES, CLASSIFIED_POLICIES, PackageEvidenceError, RETAINED_POLICIES, REVIEWED_POLICIES,
+    assemblies_metadata, detached, digest, hash_value, integer, json_bytes, object_hash, require, strict, text, uuid_value,
 )
 from .package_evidence_proposal import produce_proposal
 
@@ -87,7 +87,7 @@ def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], po
         require({k: book[k] for k in ("documentId", "sha256", "sizeBytes")} == expected[book["documentId"]], "WORKBOOK_BINDING")
     require(sum(r["sizeBytes"] for r in locations.values()) <= 200_000_000, "REQUEST_BYTE_LIMIT")
     body = {"version": VERSION, "context": context, "roots": roots, "workbooks": workbooks, "policy": detached(policy)}
-    require((policy["policyVersion"] == "package-evidence-foundry.v4") == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
+    require((policy["policyVersion"] in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
     if retained_bom_sources is not None:
         from .package_evidence_retention import validate_retained_sources
         validate_retained_sources(retained_bom_sources, roots)
@@ -182,11 +182,13 @@ class EvidenceJobService:
         request = self.request(request_id)
         completed = self._read(request_id, "completed")
         if completed is not None:
-            classified = request["policy"]["policyVersion"] in {"package-evidence-foundry.v2", "package-evidence-foundry.v3", "package-evidence-foundry.v4"}
-            assessed = request["policy"]["policyVersion"] in {"package-evidence-foundry.v3", "package-evidence-foundry.v4"}
+            classified = request["policy"]["policyVersion"] in CLASSIFIED_POLICIES
+            assessed = request["policy"]["policyVersion"] in ASSESSED_POLICIES
+            reviewed = request["policy"]["policyVersion"] in REVIEWED_POLICIES
             strict(completed, {"requestId", "proposalSha256", "artifactSha256"}
                      | ({"classificationArtifactSha256"} if classified else set())
-                     | ({"assessmentArtifactSha256"} if assessed else set()))
+                     | ({"assessmentArtifactSha256"} if assessed else set())
+                     | ({"reviewArtifactSha256"} if reviewed else set()))
             graph = self._read(request_id, "proposal", MAX_GRAPH)
             require(graph is not None and completed["requestId"] == request_id
                     and digest(json_bytes(graph)) == completed["artifactSha256"], "RESULT_CORRUPT")
@@ -206,6 +208,10 @@ class EvidenceJobService:
                 assessment = self._assessment(request_id, graph, classification)
                 require(digest(json_bytes(assessment)) == completed["assessmentArtifactSha256"], "ASSESSMENT_RESULT_CORRUPT")
                 result["manufacturingAssessment"] = assessment
+            if reviewed:
+                review = self._review(request_id, graph, classification, assessment)
+                require(digest(json_bytes(review)) == completed["reviewArtifactSha256"], "REVIEW_RESULT_CORRUPT")
+                result["review"] = review
             return result
         for artifact, state in (("failed", "failed"), ("worker-claim", "running"),
                                 ("start-unknown", "start_unknown"), ("started", "started"),
@@ -243,12 +249,15 @@ class EvidenceJobService:
                 and graph.get("provenance") == {"kind": "agent", **request["policy"], "runId": request_id}, "RESULT_BINDING")
         completed = {"requestId": request_id, "proposalSha256": graph["proposalSha256"],
                      "artifactSha256": digest(json_bytes(graph))}
-        if request["policy"]["policyVersion"] in {"package-evidence-foundry.v2", "package-evidence-foundry.v3", "package-evidence-foundry.v4"}:
+        if request["policy"]["policyVersion"] in CLASSIFIED_POLICIES:
             classification = self._classification(request_id, graph)
             completed["classificationArtifactSha256"] = digest(json_bytes(classification))
-        if request["policy"]["policyVersion"] in {"package-evidence-foundry.v3", "package-evidence-foundry.v4"}:
+        if request["policy"]["policyVersion"] in ASSESSED_POLICIES:
             assessment = self._assessment(request_id, graph, classification)
             completed["assessmentArtifactSha256"] = digest(json_bytes(assessment))
+        if request["policy"]["policyVersion"] in REVIEWED_POLICIES:
+            review = self._review(request_id, graph, classification, assessment)
+            completed["reviewArtifactSha256"] = digest(json_bytes(review))
         self._write(request_id, "completed", completed)
         return self.status(request_id)
 
@@ -267,6 +276,12 @@ class EvidenceJobService:
                         for k in ("producer", "model", "promptSha256", "runId")),
                 "CLASSIFICATION_RESULT_BINDING")
         return value
+
+    def _review(self, request_id: str, graph: dict, classification: dict, assessment: dict) -> dict:
+        from .package_evidence_review import validate_review_artifact
+        value = self._read(request_id, "review", MAX_GRAPH)
+        require(value is not None, "REVIEW_RESULT_MISSING")
+        return validate_review_artifact(value, graph, classification, assessment)
 
     def _assessment(self, request_id: str, graph: dict, classification: dict) -> dict:
         value = self._read(request_id, "manufacturing-assessment", MAX_GRAPH)
@@ -291,6 +306,8 @@ class EvidenceJobService:
         for attribute, key in (("policy_version", "policyVersion"), ("prompt_sha256", "promptSha256")):
             if hasattr(model, attribute):
                 require(getattr(model, attribute) == request["policy"][key], "MODEL_POLICY_BINDING")
+        require(request["policy"]["policyVersion"] not in REVIEWED_POLICIES
+                or (callable(getattr(model, "review", None)) and hasattr(model, "reviewer_identity")), "REVIEWER_REQUIRED")
         import uuid
         try:
             self._write(request_id, "worker-claim", {"requestId": request_id, "claimId": uuid.uuid4().hex})
@@ -307,8 +324,10 @@ class EvidenceJobService:
                 cache[item["documentId"]] = data
             roots = [{k: r[k] for k in ("documentId", "sha256", "sizeBytes", "fileName")} | {"data": cache[r["documentId"]]} for r in request["roots"]]
             policy = request["policy"]
-            classified = policy["policyVersion"] in {"package-evidence-foundry.v2", "package-evidence-foundry.v3", "package-evidence-foundry.v4"}
-            assessed = policy["policyVersion"] in {"package-evidence-foundry.v3", "package-evidence-foundry.v4"}
+            classified = policy["policyVersion"] in CLASSIFIED_POLICIES
+            assessed = policy["policyVersion"] in ASSESSED_POLICIES
+            reviewed = policy["policyVersion"] in REVIEWED_POLICIES
+            review_inputs: dict | None = {} if reviewed else None
             successor = request.get("successor")
             context = request["context"] if successor is None else {
                 **request["context"], "predecessorProposalSha256": successor["predecessorProposalSha256"]}
@@ -318,8 +337,26 @@ class EvidenceJobService:
                 prompt_sha256=policy["promptSha256"], run_id=request_id,
                 include_classification=classified, include_manufacturing=assessed,
                 retained_bom_sources=request.get("retainedBomSources"),
-                correction=None if successor is None else {"attempt": successor["attempt"], "feedback": successor["feedback"]})
+                correction=None if successor is None else {"attempt": successor["attempt"], "feedback": successor["feedback"]},
+                review_inputs=review_inputs)
             graph = produced["proposal"] if classified else produced
+            review = None
+            if reviewed:
+                # Second, independent model call. Its failure never discards the paid proposal:
+                # a failed review artifact is published and QuickQuote routes the package to a human.
+                from .package_evidence_review import review_artifact, review_packet
+                packet = review_packet(graph, produced["classification"], produced["manufacturingAssessment"],
+                                       review_inputs["sources"], review_inputs["inventory"], review_inputs["rows"],
+                                       review_inputs["retained"])
+                hints, error = None, None
+                try:
+                    hints = model.review(packet)
+                except PackageEvidenceError as exc:
+                    error = str(exc)
+                except Exception:
+                    error = "REVIEW_REQUEST_FAILED"
+                review = review_artifact(graph, produced["classification"], produced["manufacturingAssessment"],
+                                         packet, hints, error, model.reviewer_identity)
         except Exception as exc:
             self._write(request_id, "failed", {"requestId": request_id, "code": "EVIDENCE_JOB_FAILED"})
             raise PackageEvidenceError("EVIDENCE_JOB_FAILED") from exc
@@ -332,6 +369,8 @@ class EvidenceJobService:
                 self._write(request_id, "classification", produced["classification"])
             if assessed:
                 self._write(request_id, "manufacturing-assessment", produced["manufacturingAssessment"])
+            if reviewed:
+                self._write(request_id, "review", review)
             return self.reconcile_publication(request_id)
         except Exception as exc:
             raise PackageEvidenceError("PUBLICATION_UNKNOWN") from exc

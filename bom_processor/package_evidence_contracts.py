@@ -14,6 +14,14 @@ class PackageEvidenceError(ValueError):
     """Stable, non-source-bearing validation error."""
 
 
+# Producer policy capability sets. v5 = v4 (retained provenance) plus independent reviewer artifact.
+CLASSIFIED_POLICIES = frozenset({"package-evidence-foundry.v2", "package-evidence-foundry.v3",
+                                 "package-evidence-foundry.v4", "package-evidence-foundry.v5"})
+ASSESSED_POLICIES = frozenset({"package-evidence-foundry.v3", "package-evidence-foundry.v4", "package-evidence-foundry.v5"})
+RETAINED_POLICIES = frozenset({"package-evidence-foundry.v4", "package-evidence-foundry.v5"})
+REVIEWED_POLICIES = frozenset({"package-evidence-foundry.v5"})
+
+
 def require(condition: bool, code: str) -> None:
     if not condition:
         raise PackageEvidenceError(code)
