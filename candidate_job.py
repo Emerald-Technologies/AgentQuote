@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 
-from bom_processor.candidate_authoring import AUTHORING_VERSION
+from bom_processor.candidate_authoring import AUTHORING_VERSION, ASSOCIATION_AUTHORING_VERSION
 
 
 _ATTEMPT_KINDS = {"author", "author-refinement"}
@@ -26,7 +26,7 @@ def _attempt_context() -> tuple[str, int] | None:
 def _write_attempt_marker(storage, request_id: str, context: tuple[str, int], state: str,
                           values: dict[str, object]) -> None:
     kind, attempt = context
-    version = ("candidate-authoring.v6" if os.environ.get("BOM_SOURCE_ASSOCIATIONS") == "true"
+    version = (ASSOCIATION_AUTHORING_VERSION if os.environ.get("BOM_SOURCE_ASSOCIATIONS") == "true"
            else AUTHORING_VERSION)
     path = (f"candidate-automation/{request_id}/{kind}/{version}/"
             f"attempt-{attempt}.{state}.json")

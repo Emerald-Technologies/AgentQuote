@@ -61,7 +61,8 @@ class CandidateAutomationService:
         policy = getattr(author_starter, "base_environment", {}).get("BOM_SOURCE_ASSOCIATIONS", "false")
         if policy not in {"true", "false"}:
             raise ValueError("invalid association policy")
-        self.authoring_version = "candidate-authoring.v6" if policy == "true" else AUTHORING_VERSION
+        from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION
+        self.authoring_version = ASSOCIATION_AUTHORING_VERSION if policy == "true" else AUTHORING_VERSION
         self.author_environment = {"BOM_SOURCE_ASSOCIATIONS": "true"} if policy == "true" else {}
         if max_author_attempts is not None:
             if type(max_author_attempts) is not int or max_author_attempts < 1:
@@ -340,7 +341,8 @@ class CandidateAutomationService:
         binding = _membership(self.storage, request_id)
         if binding is None:
             return self  # Unenrolled requests cannot opt in via an untrusted path.
-        selected = (self.authoring_version == "candidate-authoring.v6"
+        from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION
+        selected = (self.authoring_version == ASSOCIATION_AUTHORING_VERSION
                     or binding[1]["identity"]["rfq_uuid"] in self.association_quote_ids)
         from .author_policy import resolve
         policy = resolve(self.storage, request_id, selected)

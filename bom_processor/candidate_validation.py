@@ -18,6 +18,8 @@ from .master_registry import html_table_rows
 from .candidates import unique_fixtures
 from .arena_policy import is_arena_source, validate as validate_arena
 from .semantic_facts import SemanticFactsError, facts_from_rows
+from .document_roles import POLICY_VERSION as DOCUMENT_ROLE_POLICY, check_document_roles
+from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION
 
 VALIDATION_VERSION = "candidate-validation.v3"
 FAILURE_FEEDBACK_POLICY = "candidate-failure-feedback.v1"
@@ -39,6 +41,9 @@ def _semantic_output(output: bytes, source: bytes, subtype: str, *,
         path = Path(directory) / "output.xlsx"
         path.write_bytes(output)
         frame = pd.read_excel(path, engine="openpyxl")
+        # Preserve documentary cell types for role comparison only. Shared
+        # semantic facts must keep the same loading rules as review consumers.
+        role_frame = pd.read_excel(path, engine="openpyxl", dtype=object) if subtype == "xlsx" else None
     output_rows = len(frame)
     base = {"valid": False, "result": "semantic_output_invalid", "source_rows": 0, "output_rows": output_rows}
     if output_rows < 1:
@@ -80,6 +85,12 @@ def _semantic_output(output: bytes, source: bytes, subtype: str, *,
             return {**base, "source_rows": source_rows, "coverage_basis": "source_rows_and_identity"}
         coverage_basis = "source_rows_and_identity"
     parsed_rows = frame.to_dict(orient="records")
+    document_roles = None
+    if subtype == "xlsx":
+        document_roles = check_document_roles(source, role_frame.to_dict(orient="records"))
+        if not document_roles["valid"]:
+            return {**base, "coverage_basis": "xlsx_document_roles",
+                    "document_roles": document_roles}
     try:
         facts = facts_from_rows(parsed_rows, infer_document_assembly=infer_document_assembly)
     except SemanticFactsError:
@@ -89,7 +100,8 @@ def _semantic_output(output: bytes, source: bytes, subtype: str, *,
             "coverage_basis": coverage_basis, "fingerprint": facts.fingerprint,
             "assembly_identity": _assembly_dict(facts.assembly),
             "mapping_required": facts.assembly is None,
-            "model_summary": facts.model_summary}
+            "model_summary": facts.model_summary,
+            **({"document_roles": document_roles} if document_roles is not None else {})}
 
 
 def _assembly_dict(assembly: Any) -> dict[str, str] | None:
@@ -97,6 +109,22 @@ def _assembly_dict(assembly: Any) -> dict[str, str] | None:
         return None
     name, revision = assembly.normalized()
     return {"name": name, "revision": revision}
+
+
+def _semantic_feedback(semantic: dict[str, Any]) -> str:
+    roles = semantic.get("document_roles")
+    if isinstance(roles, dict) and roles.get("valid") is False:
+        return (f"xlsx_document_roles:{roles['result']}; preserve each source document ID, revision, "
+                "description and quantity in Document fields, not manufacturer/MPN fields; "
+                "do not drop references or guess ambiguous roles")
+    return f"semantic_output_invalid coverage_basis={semantic.get('coverage_basis', 'unknown')}"
+
+
+def _source_subtype(request: dict[str, Any]) -> str:
+    profile = request.get("profile", {})
+    # Ordinary profiles omit their default subtype from serialized metadata.
+    return str(profile.get("source_subtype") or
+               ("xlsx" if str(profile.get("extension", "")).lower() in {"xlsx", ".xlsx"} else ""))
 
 
 class CandidateValidationError(ValueError):
@@ -201,6 +229,7 @@ class CandidateValidationService:
         association = self._association(source, source_evidence)
         validation_id = _sha256(_json_bytes({
             "version": self.validation_version,
+            "document_role_policy": DOCUMENT_ROLE_POLICY,
             "request_id": self.request_id,
             "candidate_id": self.candidate_id,
             "code_sha256": manifest["code_sha256"],
@@ -209,6 +238,7 @@ class CandidateValidationService:
         }))
         base = f"candidates/{self.request_id}/{self.candidate_id}/validation/{validation_id}"
         evidence_path = f"{base}/evidence.json"
+        self._require_single_proof(evidence_path)
         existing = self._optional_candidate(evidence_path)
         if existing is not None:
             evidence = _load_json(existing, "VALIDATION_EVIDENCE_INVALID")
@@ -257,7 +287,7 @@ class CandidateValidationService:
             try:
                 semantic = _semantic_output(
                     output, source,
-                    str(request.get("profile", {}).get("source_subtype", "")),
+                    _source_subtype(request),
                     infer_document_assembly=association is None)
             except Exception:
                 semantic = {"valid": False, "result": "semantic_output_invalid",
@@ -282,6 +312,7 @@ class CandidateValidationService:
         resulting_status = "awaiting_approval" if validation_valid else "generated_unvalidated"
         evidence = {
             "version": self.validation_version,
+            "document_role_policy": DOCUMENT_ROLE_POLICY,
             "failure_feedback_policy": FAILURE_FEEDBACK_POLICY,
             "validation_id": validation_id,
             "request_id": self.request_id,
@@ -332,7 +363,7 @@ class CandidateValidationService:
             recorded = self._write_validation_failed_event(
                 validation_id, item, "SEMANTIC_INVALID",
                 {"error_type": "SemanticError",
-                 "error_message": f"semantic_output_invalid coverage_basis={semantic.get('coverage_basis', 'unknown')}"})
+                 "error_message": _semantic_feedback(semantic)})
             failure = CandidateValidationError("SEMANTIC_INVALID")
             failure.feedback_recorded = recorded
             raise failure
@@ -345,13 +376,14 @@ class CandidateValidationService:
         if self.assembly_associations is not None:
             for fixture in fixtures:
                 self._association(self._source(fixture), fixture)
-        validation_id = _sha256(_json_bytes({"version": self.validation_version, "request_id": self.request_id,
+        validation_id = _sha256(_json_bytes({"version": self.validation_version, "document_role_policy": DOCUMENT_ROLE_POLICY, "request_id": self.request_id,
                                              "candidate_id": self.candidate_id, "code_sha256": manifest["code_sha256"],
                                                             "fixtures": [item["sha256"].lower() for item in fixtures],
                                                             **({"assembly_associations": self.assembly_associations}
                                                                 if self.assembly_associations is not None else {})}))
         base = f"candidates/{self.request_id}/{self.candidate_id}/validation/{validation_id}"
         evidence_path = f"{base}/evidence.json"
+        self._require_single_proof(evidence_path)
         existing = self._optional_candidate(evidence_path)
         if existing is not None:
             return self._existing_result(_load_json(existing, "VALIDATION_EVIDENCE_INVALID"), validation_id, evidence_path)
@@ -379,7 +411,7 @@ class CandidateValidationService:
                     _validate_xlsx_bytes(output, self.max_rows)
                 except Exception:
                     schema_valid = False
-                semantic = _semantic_output(output, source, str(request.get("profile", {}).get("source_subtype", "")),
+                semantic = _semantic_output(output, source, _source_subtype(request),
                     infer_document_assembly=association is None) if schema_valid else {"valid": False, "result": "schema_invalid"}
                 policy = None
                 if schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls" and is_arena_source(source):
@@ -397,7 +429,7 @@ class CandidateValidationService:
                     record["failure"] = {"code": "SCHEMA_INVALID" if not schema_valid else "SEMANTIC_INVALID",
                                          "repairable": True,
                                          "classification": {"error_type": "ValidationError",
-                                             "error_message": "output schema invalid" if not schema_valid else "output semantic checks failed"}}
+                                             "error_message": "output schema invalid" if not schema_valid else _semantic_feedback(semantic)}}
             except Exception as exc:
                 all_valid = False
                 code_value = exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"
@@ -406,6 +438,7 @@ class CandidateValidationService:
                     record["failure"]["classification"] = exc.classification
             parsed.append(record)
         evidence = {"version": self.validation_version, "validation_id": validation_id, "request_id": self.request_id,
+                    "document_role_policy": DOCUMENT_ROLE_POLICY,
                     "failure_feedback_policy": FAILURE_FEEDBACK_POLICY,
                     "candidate_id": self.candidate_id, "prior_status": "generated_unvalidated",
                     "status": "awaiting_approval" if all_valid else "generated_unvalidated",
@@ -427,6 +460,17 @@ class CandidateValidationService:
             raise CandidateValidationError("VALIDATION_CONFLICT") from None
         return CandidateValidationResult(self.request_id, self.candidate_id, validation_id, evidence_path,
                                          "awaiting_approval" if all_valid else "generated_unvalidated")
+
+    def _require_single_proof(self, evidence_path: str) -> None:
+        """Hold before dispatch when new policy would create ambiguous proof history."""
+        root = f"candidates/{self.request_id}/{self.candidate_id}/validation/"
+        paths = self.storage.list_candidate_paths(root, 100)
+        if len(paths) >= 100 or any(not path.startswith(root) or ".." in path.split("/") for path in paths):
+            raise CandidateValidationError("VALIDATION_HISTORY_INVALID")
+        if any(path.endswith("/evidence.json") and path != evidence_path for path in paths):
+            # Never overwrite or reinterpret old proof; a fresh author policy
+            # produces a distinct candidate suitable for ordinary validation.
+            raise CandidateValidationError("VALIDATION_POLICY_REAUTHOR_REQUIRED")
 
     def _request(self) -> dict[str, Any]:
         try:
@@ -468,7 +512,7 @@ class CandidateValidationService:
         version = manifest.get("version")
         if isinstance(version, str) and version.startswith("candidate-authoring."):
             identity["authoring_version"] = version
-        if version == "candidate-authoring.v6":
+        if version in {"candidate-authoring.v6", ASSOCIATION_AUTHORING_VERSION}:
             ref = manifest.get("assembly_associations")
             if (not isinstance(ref, dict) or set(ref) != {"blob_path", "sha256", "size_bytes"}
                     or ref["blob_path"] != f"{base}/assembly-associations.json"

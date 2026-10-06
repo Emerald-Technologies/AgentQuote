@@ -16,7 +16,8 @@ MAX_CODE_BYTES = 1_000_000
 MAX_SOURCE_BYTES = 50_000_000
 # Version changes are identity changes: a replacement cannot reuse a
 # contained candidate produced by an older authoring policy.
-AUTHORING_VERSION = "candidate-authoring.v5"
+AUTHORING_VERSION = "candidate-authoring.v7"
+ASSOCIATION_AUTHORING_VERSION = "candidate-authoring.v8"
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
     "write exactly the supplied canonical columns in the supplied order and at least one data row",
@@ -25,6 +26,9 @@ CANONICAL_OUTPUT_RULES = (
     "map source component taxonomy such as Capacitor, Resistor, or PCB assembly to canonical item_category='Part'; reserve item_category='Document' for document, drawing, or specification rows; do not require the source category to already be Part or Document",
     "item_category must be exactly Part or Document after applying the source taxonomy mapping",
     "Part quantity must be a finite number; Document quantity is not priced, preserve supplied numeric values or None when absent, never invent a quantity",
+    "for Document rows, use explicit source labels and row context to put the actual document ID in item_number and its revision in revision; a generic Document reference label is not an identity",
+    "overloaded Manufacturer / Document ID and MPN / Revision columns contain document identity and revision on document rows, not manufacturer/MPN pairs; leave all manufacturer fields empty for those rows, preserve description and quantity, and fail on ambiguous roles rather than guess",
+    "preserve actual Part quantities and all supplied primary and alternate manufacturer/MPN pairs independently of document references",
     "all populated strings must be trimmed; use None for unavailable optional values",
     "manufacturer_N and manufacturer_item_number_N must either both be populated or both be empty for N 1 through 8",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
@@ -230,7 +234,7 @@ class CandidateAuthoringService:
                     if verified["has_blocking_findings"]:
                         raise AuthoringError("ASSEMBLY_ASSOCIATION_REVIEW_REQUIRED")
                 generated = bundle["parser_code"]
-                authoring_version = "candidate-authoring.v6"
+                authoring_version = ASSOCIATION_AUTHORING_VERSION
             else:
                 generated = _generate(self.model, prompt, source)
             try:

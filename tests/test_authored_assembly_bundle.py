@@ -58,7 +58,8 @@ def test_one_agent_response_is_persisted_then_independently_loaded_and_reviewed(
     assert len(seen[0]["sources"]) == 3  # Exact equivalent sources share a hash.
     assert all(source["inventory"]["coverage"] == "complete" for source in seen[0]["sources"])
     manifest = json.loads(store.candidates[authored_result.manifest_path])
-    assert manifest["version"] == "candidate-authoring.v6"
+    from bom_processor.candidate_authoring import ASSOCIATION_AUTHORING_VERSION
+    assert manifest["version"] == ASSOCIATION_AUTHORING_VERSION
     result = service.validate()
     review = CandidateReviewService(store).get_v3(result.request_id, result.candidate_id, result.validation_id)
     assert len(review["groups"]) == 2 and review["approval_ready"]
@@ -93,7 +94,7 @@ def test_grouped_v6_replay_rechecks_source_hash():
         service.validate()
 
 
-def test_v6_controller_and_job_terminal_markers_share_retry_namespace(monkeypatch):
+def test_current_controller_and_job_terminal_markers_share_retry_namespace(monkeypatch):
     import candidate_job
     from bom_processor import InMemoryStorage
     from bom_processor.candidate_automation import CandidateAutomationService
@@ -110,10 +111,11 @@ def test_v6_controller_and_job_terminal_markers_share_retry_namespace(monkeypatc
     controller = CandidateAutomationService(store, Starter())
     assert controller.start_author("request") == "started"
     assert controller.start_author("request") == "started"
-    root = "candidate-automation/request/author/candidate-authoring.v6"
+    from bom_processor.candidate_authoring import ASSOCIATION_AUTHORING_VERSION
+    root = f"candidate-automation/request/author/{ASSOCIATION_AUTHORING_VERSION}"
     assert root + "/attempt-2.failed.json" in store.registry
     assert controller.start_author_refinement("request", "candidate") == "started"
-    root = "candidate-automation/request/author-refinement/candidate-authoring.v6"
+    root = f"candidate-automation/request/author-refinement/{ASSOCIATION_AUTHORING_VERSION}"
     candidate_job._write_attempt_marker(store, "request", ("author-refinement", 1), "completed", {})
     assert controller.start_author_refinement("request", "candidate") == "started"
     assert root + "/attempt-2.started.json" in store.registry

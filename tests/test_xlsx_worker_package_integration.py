@@ -194,7 +194,8 @@ def test_application_factory_passes_association_policy_to_controller_and_job(mon
     monkeypatch.setenv("BOM_SOURCE_ASSOCIATIONS", "true")
     from bom_processor import InMemoryStorage
     service = _candidate_automation_factory(SimpleNamespace(candidate_automation_enabled=True), InMemoryStorage())
-    assert service.authoring_version == "candidate-authoring.v6"
+    from bom_processor.candidate_authoring import ASSOCIATION_AUTHORING_VERSION
+    assert service.authoring_version == ASSOCIATION_AUTHORING_VERSION
     assert service.author_starter.base_environment["BOM_SOURCE_ASSOCIATIONS"] == "true"
     monkeypatch.setenv("BOM_SOURCE_ASSOCIATIONS", "invalid")
     with pytest.raises(RuntimeError, match="invalid association policy"):

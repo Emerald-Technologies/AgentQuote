@@ -80,6 +80,9 @@ def test_authoring_stores_only_quarantined_immutable_artifacts_without_execution
     assert SOURCE.decode(errors="ignore") not in repr(prompt)
     assert prompt.rules == CANONICAL_OUTPUT_RULES
     assert any("real XLSX" in rule for rule in prompt.rules)
+    assert any("actual document ID in item_number" in rule for rule in prompt.rules)
+    assert any("not manufacturer/MPN pairs" in rule for rule in prompt.rules)
+    assert any("primary and alternate" in rule for rule in prompt.rules)
 
 
 def test_html_rules_require_source_taxonomy_mapping_without_fabrication():

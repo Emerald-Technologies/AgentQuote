@@ -5,7 +5,7 @@ immutable request policy. Run tests/test_quote_association_scope.py offline.
 """
 from .author_budget import BudgetError, _hash, _membership, _read, _bytes, _require
 from .core import BlobConflictError
-from .candidate_authoring import AUTHORING_VERSION
+from .candidate_authoring import AUTHORING_VERSION, ASSOCIATION_AUTHORING_VERSION
 
 VERSION = "author-policy.v1"
 
@@ -24,7 +24,7 @@ def resolve(storage, request_id: str, selected: bool) -> dict:
         _require(all(record[key] == value for key, value in base.items()))
         mode = record["source_associations"]
         _require(type(mode) is bool and record["authoring_version"] ==
-                 ("candidate-authoring.v6" if mode else AUTHORING_VERSION))
+                 (ASSOCIATION_AUTHORING_VERSION if mode else AUTHORING_VERSION))
         return record
 
     existing = _read(storage, path)
@@ -35,7 +35,7 @@ def resolve(storage, request_id: str, selected: bool) -> dict:
     _require(not storage.list_registry_paths(f"candidate-automation/{request_id}/", 100))
     _require(not storage.list_candidate_paths(f"candidates/{request_id}/", 100))
     proposed = {**base, "source_associations": selected,
-                "authoring_version": "candidate-authoring.v6" if selected else AUTHORING_VERSION}
+                "authoring_version": ASSOCIATION_AUTHORING_VERSION if selected else AUTHORING_VERSION}
     try:
         storage.upload_registry_immutable(path, _bytes(proposed), "application/json")
     except BlobConflictError:
