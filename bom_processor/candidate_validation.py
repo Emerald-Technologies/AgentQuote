@@ -179,7 +179,8 @@ class CandidateValidationService:
                  max_rows: int = 100_000, job_resource: str = "",
                  worker_image: str = "", clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 assembly_associations: dict[str, dict[str, Any]] | None = None) -> None:
+                 assembly_associations: dict[str, dict[str, Any]] | None = None,
+                 serial_owner: str | None = None) -> None:
         self.request_id = _identifier(request_id, "INVALID_REQUEST_ID")
         self.candidate_id = _identifier(candidate_id, "INVALID_CANDIDATE_ID")
         limits = (timeout_seconds, poll_interval_seconds, max_source_bytes,
@@ -193,6 +194,7 @@ class CandidateValidationService:
         self.job_resource, self.worker_image = job_resource, worker_image
         self.clock, self.sleep = clock, sleep
         self.assembly_associations = assembly_associations
+        self.serial_owner = serial_owner
         self.validation_version = ("candidate-validation.v4" if assembly_associations is not None
                                    else VALIDATION_VERSION)
 
@@ -211,9 +213,38 @@ class CandidateValidationService:
 
     def validate(self) -> CandidateValidationResult:
         from .package_writer_gate import candidate_validation_writer
-        with candidate_validation_writer(self.storage, self.request_id, self.candidate_id,
-                                         clock=self.clock, sleep=self.sleep):
-            return self._validate_locked()
+        from .serial_validation import transition, reserve
+        from .author_budget import _membership
+        from .semantic_repair import read_fence
+        binding = _membership(self.storage, self.request_id)
+        fence = read_fence(self.storage, binding[0]["plan_id"])[0] if binding else None
+        if self.serial_owner is None and binding is not None and fence is None:
+            # Supported direct validation must own the same slot too; it cannot
+            # bypass a dispatcher reservation or overlap another enrolled worker.
+            self.serial_owner = reserve(self.storage, self.request_id, self.candidate_id)
+        if self.serial_owner is not None:
+            transition(self.storage, self.request_id, self.candidate_id, self.serial_owner, "reserved", "running")
+        try:
+            with candidate_validation_writer(self.storage, self.request_id, self.candidate_id,
+                                             clock=self.clock, sleep=self.sleep):
+                result = self._validate_locked()
+        except BaseException as exc:
+            if (self.serial_owner is not None and getattr(exc, "feedback_recorded", False) is True
+                    and getattr(exc, "code", None) in {"WORKER_PARSER_FAILED", "SCHEMA_INVALID", "SEMANTIC_INVALID"}):
+                transition(self.storage, self.request_id, self.candidate_id, self.serial_owner, "running", "idle")
+                self.serial_owner = None
+            raise
+        if self.serial_owner is not None:
+            if result.status != "awaiting_approval":
+                evidence = _load_json(self.storage.download_candidate(result.evidence_path, MAX_METADATA_BYTES),
+                                      "VALIDATION_EVIDENCE_INVALID")
+                failures = [item.get("failure") for item in evidence.get("fixtures", [])
+                            if item.get("status") != "passed"]
+                if not failures or any(not isinstance(item, dict) or item.get("repairable") is not True for item in failures):
+                    return result  # Infrastructure/unknown outcome keeps persistent slot held.
+            transition(self.storage, self.request_id, self.candidate_id, self.serial_owner, "running", "idle")
+            self.serial_owner = None
+        return result
 
     def _validate_locked(self) -> CandidateValidationResult:
         request = self._request()

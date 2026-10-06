@@ -60,6 +60,7 @@ def main() -> int:
             job_resource=(f"/subscriptions/{subscription}/resourceGroups/{resource_group}/"
                           f"providers/Microsoft.App/jobs/{worker_job}"),
             worker_image=worker_image,
+            serial_owner=os.environ.get("BOM_VALIDATOR_SERIAL_OWNER") or None,
         )
         result = service.validate()
         print(json.dumps({"status": result.status, "request_id": result.request_id,

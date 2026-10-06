@@ -221,10 +221,35 @@ class CandidateAutomationService:
         if self.validator_starter is None:
             return None
         from .package_writer_gate import candidate_writer
+        from .serial_validation import reserve, SerialValidationHeld
+        # The persistent slot spans remote execution; the short writer must not
+        # span ARM dispatch because the validator needs that writer on startup.
+        from .author_budget import _membership
+        binding = _membership(self.storage, request_id)
+        from .semantic_repair import read_fence
+        fence = read_fence(self.storage, binding[0]["plan_id"])[0] if binding else None
+        if binding is not None and fence is None:
+            with candidate_writer(self.storage, request_id, "validation", candidate_id=candidate_id):
+                root = f"candidates/{request_id}/{candidate_id}/"
+                if any("/validation/" in path and path.endswith("/evidence.json") for path in self._paths(root)):
+                    return None
+                attempt_root = f"candidate-automation/{request_id}/{candidate_id}/validator/{AUTHORING_VERSION}"
+                # Started/claimed history is never converted into a fresh slot.
+                # Parser failure feedback drives author refinement, not revalidation.
+                if self._paths(attempt_root + "/"):
+                    return None
+                try:
+                    owner = reserve(self.storage, request_id, candidate_id)
+                except SerialValidationHeld:
+                    return None
+                except Exception:
+                    return None  # Conditional conflict/uncertainty never permits dispatch.
+            # Any exception/unknown result retains the slot; no retry or stealing.
+            return self._start_validator_locked(request_id, candidate_id, serial_owner=owner)
         with candidate_writer(self.storage, request_id, "validation", candidate_id=candidate_id):
             return self._start_validator_locked(request_id, candidate_id)
 
-    def _start_validator_locked(self, request_id: str, candidate_id: str) -> str | None:
+    def _start_validator_locked(self, request_id: str, candidate_id: str, *, serial_owner=None) -> str | None:
         root = f"candidates/{request_id}/{candidate_id}/"
         paths = self._paths(root)
         if any("/validation/" in path and path.endswith("/evidence.json") for path in paths):
@@ -233,7 +258,8 @@ class CandidateAutomationService:
         # Legacy start-only markers are not completion evidence; validation
         # evidence or the versioned attempt records above provide suppression.
         result = self._run_attempt(
-            prefix=root, values={"REQUEST_ID": request_id, "CANDIDATE_ID": candidate_id},
+            prefix=root, values={"REQUEST_ID": request_id, "CANDIDATE_ID": candidate_id,
+                                 **({"BOM_VALIDATOR_SERIAL_OWNER": serial_owner} if serial_owner else {})},
             marker_values={"request_id": request_id, "candidate_id": candidate_id,
                            "job": "validator", "authoring_version": AUTHORING_VERSION},
             starter=self.validator_starter)
