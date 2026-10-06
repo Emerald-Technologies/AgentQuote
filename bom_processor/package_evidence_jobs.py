@@ -22,9 +22,24 @@ MAX_GRAPH = 8 * 1024 * 1024
 CHECKPOINT = {"qqUuid", "packageVersion", "bomPlanId", "bomApprovalId", "resolvedManifestSha256"}
 
 
+V3 = "package-evidence-request.v3"
+
+
+def request_fields(value: Any) -> set[str]:
+    version = value.get("version") if type(value) is dict else None
+    return ({"version", "context", "roots", "workbooks", "policy", "requestId"}
+            | ({"retainedBomSources"} if version in {"package-evidence-request.v2", V3} else set())
+            | ({"successor"} if version == V3 else set()))
+
+
+def expected_parent(request: dict) -> str | None:
+    successor = request.get("successor")
+    return None if successor is None else successor["predecessorProposalSha256"]
+
+
 def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], policy: dict,
-                     retained_bom_sources: dict | None = None) -> dict:
-    """Build an initial-only request. Authenticated server owns context/policy.
+                     retained_bom_sources: dict | None = None, successor: dict | None = None) -> dict:
+    """Build an initial or bounded-successor request. Server owns context/policy/feedback.
 
     References use an exact package/document/hash prefix, never URLs or SAS.
     This validates reference structure, not authority to access a customer's bytes.
@@ -77,6 +92,11 @@ def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], po
         from .package_evidence_retention import validate_retained_sources
         validate_retained_sources(retained_bom_sources, roots)
         body.update(version="package-evidence-request.v2", retainedBomSources=detached(retained_bom_sources))
+    if successor is not None:
+        # Successors exist only for the retained-provenance policy actually deployed.
+        require(retained_bom_sources is not None, "SUCCESSOR_POLICY_BINDING")
+        from .package_evidence_successor import validate_successor
+        body.update(version=V3, successor=validate_successor(successor))
     require(len(json_bytes(body)) <= MAX_METADATA, "REQUEST_METADATA_LIMIT")
     return {**body, "requestId": object_hash(body)}
 
@@ -121,16 +141,16 @@ class EvidenceJobService:
     def request(self, request_id: str) -> dict:
         value = self._read(request_id, "request")
         require(value is not None, "REQUEST_NOT_FOUND")
-        strict(value, {"version", "context", "roots", "workbooks", "policy", "requestId"}
-               | ({"retainedBomSources"} if value.get("version") == "package-evidence-request.v2" else set()))
-        rebuilt = evidence_request(value["context"], value["roots"], value["workbooks"], value["policy"], value.get("retainedBomSources"))
+        strict(value, request_fields(value))
+        rebuilt = evidence_request(value["context"], value["roots"], value["workbooks"], value["policy"],
+                                   value.get("retainedBomSources"), value.get("successor"))
         require(value == rebuilt and value["requestId"] == request_id, "REQUEST_CORRUPT")
         return value
 
     def submit(self, supplied: dict) -> dict:
-        strict(supplied, {"version", "context", "roots", "workbooks", "policy", "requestId"}
-               | ({"retainedBomSources"} if supplied.get("version") == "package-evidence-request.v2" else set()))
-        request = evidence_request(supplied["context"], supplied["roots"], supplied["workbooks"], supplied["policy"], supplied.get("retainedBomSources"))
+        strict(supplied, request_fields(supplied))
+        request = evidence_request(supplied["context"], supplied["roots"], supplied["workbooks"], supplied["policy"],
+                                   supplied.get("retainedBomSources"), supplied.get("successor"))
         require(supplied == request, "REQUEST_CORRUPT")
         self._write(request["requestId"], "request", request)
         return self.status(request["requestId"])
@@ -174,7 +194,7 @@ class EvidenceJobService:
                     and object_hash({k: v for k, v in graph.items() if k != "proposalSha256"}) == graph["proposalSha256"], "RESULT_CORRUPT")
             require(all(graph.get(k) == request["context"][k] for k in CHECKPOINT)
                     and graph.get("assemblies") == request["context"]["assemblies"]
-                    and graph.get("parentProposalSha256") is None
+                    and graph.get("parentProposalSha256") == expected_parent(request)
                     and graph.get("provenance") == {"kind": "agent", **request["policy"], "runId": request_id}, "RESULT_BINDING")
             result = {"requestId": request_id, "status": "completed", "proposal": graph}
             if classified:
@@ -219,7 +239,7 @@ class EvidenceJobService:
                 and object_hash({k: v for k, v in graph.items() if k != "proposalSha256"}) == graph.get("proposalSha256"), "RESULT_CORRUPT")
         require(all(graph.get(k) == request["context"][k] for k in CHECKPOINT)
                 and graph.get("assemblies") == request["context"]["assemblies"]
-                and graph.get("parentProposalSha256") is None
+                and graph.get("parentProposalSha256") == expected_parent(request)
                 and graph.get("provenance") == {"kind": "agent", **request["policy"], "runId": request_id}, "RESULT_BINDING")
         completed = {"requestId": request_id, "proposalSha256": graph["proposalSha256"],
                      "artifactSha256": digest(json_bytes(graph))}
@@ -289,12 +309,16 @@ class EvidenceJobService:
             policy = request["policy"]
             classified = policy["policyVersion"] in {"package-evidence-foundry.v2", "package-evidence-foundry.v3", "package-evidence-foundry.v4"}
             assessed = policy["policyVersion"] in {"package-evidence-foundry.v3", "package-evidence-foundry.v4"}
-            produced = produce_proposal(request["context"], roots,
+            successor = request.get("successor")
+            context = request["context"] if successor is None else {
+                **request["context"], "predecessorProposalSha256": successor["predecessorProposalSha256"]}
+            produced = produce_proposal(context, roots,
                 {w["documentId"]: cache[w["documentId"]] for w in request["workbooks"]}, model=model,
                 producer=policy["producer"], model_name=policy["model"], policy_version=policy["policyVersion"],
                 prompt_sha256=policy["promptSha256"], run_id=request_id,
                 include_classification=classified, include_manufacturing=assessed,
-                retained_bom_sources=request.get("retainedBomSources"))
+                retained_bom_sources=request.get("retainedBomSources"),
+                correction=None if successor is None else {"attempt": successor["attempt"], "feedback": successor["feedback"]})
             graph = produced["proposal"] if classified else produced
         except Exception as exc:
             self._write(request_id, "failed", {"requestId": request_id, "code": "EVIDENCE_JOB_FAILED"})

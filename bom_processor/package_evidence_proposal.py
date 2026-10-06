@@ -145,13 +145,17 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      max_packet_bytes: int = 8 * 1024 * 1024,
                      include_classification: bool = False,
                      include_manufacturing: bool = False,
-                     retained_bom_sources: dict | None = None) -> dict:
+                     retained_bom_sources: dict | None = None,
+                     correction: dict | None = None) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
     truncated; insufficient budgets reject before model invocation.
     """
     context = _context(context)
+    # Correction feedback is code-generated qualification output, bound to a
+    # predecessor. It never accompanies an initial proposal.
+    require(correction is None or "predecessorProposalSha256" in context, "SUCCESSOR_BINDING")
     provenance = {"kind": "agent", "producer": text(producer), "model": text(model_name),
                   "policyVersion": text(policy_version), "promptSha256": hash_value(prompt_sha256),
                   "runId": text(run_id)}
@@ -217,6 +221,13 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
         packet["retainedProvenance"] = [{"evidenceId": identity, "kind": kind}
             for identity, kind in sorted(retained_objects.items())]
         packet["retentionInstruction"] = "These verified objects are structural provenance only. Do not associate them or assign manufacturing relationships. Give dispositions only for every other object; every child remains independently checked."
+    if correction is not None:
+        from .package_evidence_successor import CORRECTION_INSTRUCTION, MAX_ATTEMPT
+        strict(correction, {"attempt", "feedback"}, "SUCCESSOR_BINDING")
+        integer(correction["attempt"], 2, MAX_ATTEMPT)
+        packet["correctionInstruction"] = CORRECTION_INSTRUCTION
+        packet["correctionFeedback"] = {"attempt": correction["attempt"],
+                                        "findings": detached(correction["feedback"]["findings"])}
     require(len(json_bytes(packet)) <= max_packet_bytes, "PACKET_BYTE_BUDGET")
     try:
         hints = model.propose(detached(packet))
