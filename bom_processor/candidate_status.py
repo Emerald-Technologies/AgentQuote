@@ -107,6 +107,16 @@ class CandidateStatusService:
             if manifest.get("status") not in {"generated_unvalidated"}:
                 raise CandidateStatusError("invalid candidate artifact")
             ev = evidence.get(candidate_id, [])
+            from .validation_policy import superseded_layout_failure
+            if sum(superseded_layout_failure(item) for item in ev) > 1:
+                raise CandidateStatusError("ambiguous validation evidence")
+            for item in ev:
+                if superseded_layout_failure(item):
+                    if (item["request_id"] != request_id or item["candidate_id"] != candidate_id
+                            or item["candidate"]["sha256"] != manifest.get("code_sha256")
+                            or len(source) != 1 or item["fixtures"][0].get("sha256") != source[0].get("sha256")):
+                        raise CandidateStatusError("invalid validation evidence binding")
+            ev = [item for item in ev if not superseded_layout_failure(item)]
             if len(ev) > 1:
                 raise CandidateStatusError("ambiguous validation evidence")
             current = "generated_unvalidated"
@@ -205,11 +215,14 @@ class CandidateStatusService:
                 except Exception:
                     result["automation_error"] = "validator_start_failed"
             if self.automation and not budget_held and status in {"generated_unvalidated", "schema_invalid"}:
+                if status == "generated_unvalidated" and any(superseded_layout_failure(item)
+                    for item in evidence.get(candidate_id, [])):
+                    return result  # Revalidate corrected policy, never paid-refine old feedback.
                 # Refinement loop: if validation already failed for this
                 # candidate, re-author with the failure feedback. Attempt
                 # markers inside the automation bound the number of retries.
                 try:
-                    failure_event = self._latest_validation_failure(request_id, candidate_id)
+                    failure_event = self._latest_validation_failure(request_id, candidate_id, validation_id)
                     if failure_event is None and status == "schema_invalid":
                         selected_evidence = evidence.get(candidate_id, [])
                         if any(item.get("failure_feedback_policy") == "candidate-failure-feedback.v1"
@@ -231,7 +244,8 @@ class CandidateStatusService:
                     result.setdefault("automation_error", "author_refinement_start_failed")
         return result
 
-    def _latest_validation_failure(self, request_id: str, candidate_id: str) -> dict[str, Any] | None:
+    def _latest_validation_failure(self, request_id: str, candidate_id: str,
+                                   validation_id: str | None = None) -> dict[str, Any] | None:
         """Return the most recent validation-failed event for a candidate, if any."""
         event_root = f"candidates/events/{request_id}/{candidate_id}/"
         try:
@@ -239,11 +253,17 @@ class CandidateStatusService:
         except Exception:
             return None
         failures = [p for p in paths if p.startswith(event_root) and "/validation-failed-" in p and p.endswith(".json")]
+        if validation_id is not None:
+            failures = [p for p in failures if p == f"{event_root}validation-failed-{validation_id}.json"]
         if not failures:
             return None
         failures.sort()
         try:
-            return _json(self.storage, failures[-1], True)
+            record = _json(self.storage, failures[-1], True)
+            if validation_id is not None and (record.get("request_id") != request_id
+                    or record.get("candidate_id") != candidate_id or record.get("validation_id") != validation_id):
+                return None
+            return record
         except Exception:
             return None
 

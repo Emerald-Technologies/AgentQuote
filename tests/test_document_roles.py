@@ -88,6 +88,55 @@ def test_ambiguous_component_headers_are_not_guessed():
     assert result["result"] == "source_roles_ambiguous"
 
 
+def test_actual_customer_item_component_headers_use_explicit_document_context():
+    book = load_workbook(io.BytesIO(source_bytes()))
+    sheet = book.active
+    sheet.cell(3, 1, "Customer item")
+    sheet.cell(3, 4, "Manufacturer")
+    sheet.cell(3, 5, "Manufacturer part number")
+    stream = io.BytesIO()
+    book.save(stream)
+    assert check_document_roles(stream.getvalue(), output_rows())["valid"] is True
+    assert check_document_roles(stream.getvalue(), output_rows(broken=True))["valid"] is False
+
+
+@pytest.mark.parametrize("labels", [("Document reference", "Part"), ("Part", "Document reference")])
+def test_duplicate_customer_item_roles_fail_closed(labels):
+    book = Workbook()
+    book.active.append(["Customer item", "Customer item", "Description", "Manufacturer", "Manufacturer part number"])
+    book.active.append([*labels, "Drawing", "DRAW-100", "A"])
+    stream = io.BytesIO()
+    book.save(stream)
+    assert check_document_roles(stream.getvalue(), output_rows())["valid"] is False
+
+
+def test_failure_feedback_selects_current_validation_not_hash_order():
+    from bom_processor.candidate_status import CandidateStatusService
+    service, storage, _ = setup_service()
+    root = f"candidates/events/{service.request_id}/{service.candidate_id}/"
+    for identity, message in [("zzz-old", "stale"), ("aaa-current", "current")]:
+        storage.candidates[root + f"validation-failed-{identity}.json"] = _json_bytes({
+            "request_id": service.request_id, "candidate_id": service.candidate_id,
+            "validation_id": identity, "failure_message": message, "repairable": True})
+    selected = CandidateStatusService(storage)._latest_validation_failure(service.request_id, service.candidate_id,
+                                                                         "aaa-current")
+    assert selected["failure_message"] == "current"
+    assert CandidateStatusService(storage)._latest_validation_failure(service.request_id, service.candidate_id,
+                                                                      "missing") is None
+
+
+def test_only_specific_failed_old_layout_policy_is_superseded():
+    from bom_processor.validation_policy import superseded_layout_failure
+    old = {"version": "candidate-validation.v4", "request_id": "r", "candidate_id": "c",
+            "validation_id": "v", "candidate": {"sha256": "a" * 64}, "fixtures": [{"sha256": "b" * 64}],
+            "document_role_policy": "xlsx-document-roles.v1", "status": "generated_unvalidated",
+           "schema": {"valid": True}, "semantic": {"valid": False, "document_roles": {
+               "version": "xlsx-document-roles.v1", "valid": False, "result": "source_roles_ambiguous"}}}
+    assert superseded_layout_failure(old)
+    assert not superseded_layout_failure({**old, "status": "awaiting_approval"})
+    assert not superseded_layout_failure({**old, "schema": {"valid": False}})
+
+
 def test_two_cell_reference_is_not_hidden_by_preceding_document_table():
     book = Workbook()
     book.active.append(["Document ID", "Description"])
@@ -201,3 +250,58 @@ def test_current_policy_proof_replays_without_second_worker(grouped):
     assert service.validate() == result
     assert len(worker.calls) == 1
     assert json.loads(storage.candidates[result.evidence_path])["document_role_policy"] == POLICY_VERSION
+
+
+def test_failed_v1_layout_is_preserved_and_current_validation_status_is_unambiguous():
+    from bom_processor.candidate_status import CandidateStatusService
+    service, storage, worker = setup_service()
+    first = service.validate()
+    evidence = json.loads(storage.candidates[first.evidence_path])
+    old = {**evidence, "document_role_policy": "xlsx-document-roles.v1",
+           "validation_id": "old-layout", "status": "generated_unvalidated",
+           "semantic": {"valid": False, "document_roles": {"version": "xlsx-document-roles.v1",
+               "valid": False, "result": "source_roles_ambiguous"}}}
+    old_path = first.evidence_path.replace(first.validation_id, "old-layout")
+    storage.candidates[old_path] = _json_bytes(old)
+    before = storage.candidates[old_path]
+    assert service.validate() == first
+    status = CandidateStatusService(storage).get(service.request_id)
+    assert status["status"] == "awaiting_approval"
+    assert status["validation_id"] == first.validation_id
+    assert storage.candidates[old_path] == before
+    assert len(worker.calls) == 1
+
+
+def test_current_dispatch_revalidates_old_layout_once_without_author_call():
+    from bom_processor.candidate_automation import CandidateAutomationService
+    from bom_processor.candidate_status import CandidateStatusService
+    from test_serial_validation import planned, Starter
+    service, storage, worker = setup_service()
+    from bom_processor.author_budget import _membership
+    enrolled, _, request_id, _ = planned()
+    binding = _membership(enrolled, request_id)
+    storage.registry.update(enrolled.registry)
+    member = {**binding[0], "request_id": service.request_id}
+    storage.registry[f"author-budget/v1/members/{service.request_id}.json"] = _json_bytes(member)
+    old = {"request_id": service.request_id, "candidate_id": service.candidate_id,
+            "version": "candidate-validation.v4",
+            "candidate": {"sha256": service._candidate(service._request())[0]["code_sha256"]},
+            "fixtures": service._request()["source_evidence"],
+           "document_role_policy": "xlsx-document-roles.v1", "validation_id": "old-layout",
+           "status": "generated_unvalidated", "schema": {"valid": True},
+           "semantic": {"valid": False, "document_roles": {"version": "xlsx-document-roles.v1",
+               "valid": False, "result": "source_roles_ambiguous"}}}
+    path = f"candidates/{service.request_id}/{service.candidate_id}/validation/old-layout/evidence.json"
+    storage.candidates[path] = _json_bytes(old)
+    validator = Starter()
+    author = Starter()
+    automation = CandidateAutomationService(storage, author, validator)
+    status = CandidateStatusService(storage, automation=automation).get(service.request_id)
+    assert status["status"] == "generated_unvalidated"
+    assert len(validator.calls) == 1 and author.calls == []
+    CandidateStatusService(storage, automation=automation).get(service.request_id)
+    assert len(validator.calls) == 1
+    service.serial_owner = validator.calls[0]["BOM_VALIDATOR_SERIAL_OWNER"]
+    result = service.validate()
+    assert result.status == "awaiting_approval"
+    assert storage.candidates[path] == _json_bytes(old)

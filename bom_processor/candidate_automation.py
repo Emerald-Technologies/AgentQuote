@@ -231,9 +231,22 @@ class CandidateAutomationService:
         if binding is not None and fence is None:
             with candidate_writer(self.storage, request_id, "validation", candidate_id=candidate_id):
                 root = f"candidates/{request_id}/{candidate_id}/"
-                if any("/validation/" in path and path.endswith("/evidence.json") for path in self._paths(root)):
+                from .validation_policy import superseded_layout_failure
+                proofs = [path for path in self._paths(root) if "/validation/" in path and path.endswith("/evidence.json")]
+                revalidate = bool(proofs) and all(superseded_layout_failure(json.loads(
+                    self.storage.download_candidate(path, 1_000_000))) for path in proofs)
+                if revalidate:
+                    from .candidate_validation import CandidateValidationService
+                    # Share the service's strict input/path/history gate before
+                    # reserving a slot or issuing any management request.
+                    CandidateValidationService(request_id, candidate_id, self.storage, None)._require_single_proof(
+                        root + "validation/current-policy/evidence.json")
+                if proofs and not revalidate:
                     return None
                 attempt_root = f"candidate-automation/{request_id}/{candidate_id}/validator/{AUTHORING_VERSION}"
+                if revalidate:
+                    from .document_roles import POLICY_VERSION
+                    attempt_root += "/" + POLICY_VERSION
                 # Started/claimed history is never converted into a fresh slot.
                 # Parser failure feedback drives author refinement, not revalidation.
                 if self._paths(attempt_root + "/"):
@@ -245,16 +258,21 @@ class CandidateAutomationService:
                 except Exception:
                     return None  # Conditional conflict/uncertainty never permits dispatch.
             # Any exception/unknown result retains the slot; no retry or stealing.
-            return self._start_validator_locked(request_id, candidate_id, serial_owner=owner)
+            return self._start_validator_locked(request_id, candidate_id, serial_owner=owner,
+                                                policy_revalidation=revalidate)
         with candidate_writer(self.storage, request_id, "validation", candidate_id=candidate_id):
             return self._start_validator_locked(request_id, candidate_id)
 
-    def _start_validator_locked(self, request_id: str, candidate_id: str, *, serial_owner=None) -> str | None:
+    def _start_validator_locked(self, request_id: str, candidate_id: str, *, serial_owner=None,
+                                policy_revalidation=False) -> str | None:
         root = f"candidates/{request_id}/{candidate_id}/"
         paths = self._paths(root)
-        if any("/validation/" in path and path.endswith("/evidence.json") for path in paths):
+        if not policy_revalidation and any("/validation/" in path and path.endswith("/evidence.json") for path in paths):
             return None
         root = f"candidate-automation/{request_id}/{candidate_id}/validator/{AUTHORING_VERSION}"
+        if policy_revalidation:
+            from .document_roles import POLICY_VERSION
+            root += "/" + POLICY_VERSION
         # Legacy start-only markers are not completion evidence; validation
         # evidence or the versioned attempt records above provide suppression.
         result = self._run_attempt(

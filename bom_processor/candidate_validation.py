@@ -499,6 +499,18 @@ class CandidateValidationService:
         if len(paths) >= 100 or any(not path.startswith(root) or ".." in path.split("/") for path in paths):
             raise CandidateValidationError("VALIDATION_HISTORY_INVALID")
         if any(path.endswith("/evidence.json") and path != evidence_path for path in paths):
+            from .validation_policy import superseded_layout_failure
+            others = [path for path in paths if path.endswith("/evidence.json") and path != evidence_path]
+            if len(others) == 1:
+                old = _load_json(self.storage.download_candidate(others[0], MAX_METADATA_BYTES), "VALIDATION_EVIDENCE_INVALID")
+                request = self._request()
+                manifest, _ = self._candidate(request)
+                if (superseded_layout_failure(old) and old["request_id"] == self.request_id
+                        and old["candidate_id"] == self.candidate_id
+                        and old["candidate"]["sha256"] == manifest["code_sha256"]
+                        and old["fixtures"][0]["sha256"] == request["source_evidence"][0]["sha256"]
+                        and others[0] == f"{root}{old['validation_id']}/evidence.json"):
+                    return
             # Never overwrite or reinterpret old proof; a fresh author policy
             # produces a distinct candidate suitable for ordinary validation.
             raise CandidateValidationError("VALIDATION_POLICY_REAUTHOR_REQUIRED")

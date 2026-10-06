@@ -14,12 +14,12 @@ from typing import Any
 
 from openpyxl import load_workbook
 
-POLICY_VERSION = "xlsx-document-roles.v1"
+POLICY_VERSION = "xlsx-document-roles.v2"
 MAX_ROWS = 100_000
 MAX_COLUMNS = 256
 MAX_EXPANDED_BYTES = 64 * 1024 * 1024
 _DOCUMENT_LABELS = {"document", "documentreference", "drawing", "procedure", "specification"}
-_LABEL_HEADERS = {"item", "itemnumber", "category", "itemcategory", "type", "description", "itemname"}
+_LABEL_HEADERS = {"item", "itemnumber", "customeritem", "category", "itemcategory", "type", "description", "itemname"}
 _ID_HEADERS = {"documentid", "documentnumber", "drawingnumber", "procedurenumber", "specificationnumber"}
 _OVERLOADED_IDS = {"manufacturerdocumentid", "manufacturerdocumentnumber"}
 _REV_HEADERS = {"revision", "rev", "documentrevision", "mpnrevision"}
@@ -70,7 +70,7 @@ def check_document_roles(source: bytes, parsed_rows: list[dict[str, Any]]) -> di
                     raise ValueError("source_limit")
                 values = [cell.value for cell in cells]
                 keys = [_key(value) for value in values]
-                if (set(keys) & (_ID_HEADERS | _OVERLOADED_IDS | {"item", "itemnumber"})
+                if (set(keys) & (_ID_HEADERS | _OVERLOADED_IDS | {"item", "itemnumber", "customeritem"})
                         and set(keys) & (_NAME_HEADERS | {"category", "itemcategory", "type"})):
                     headers = {}
                     for index, key in enumerate(keys):
@@ -103,8 +103,21 @@ def check_document_roles(source: bytes, parsed_rows: list[dict[str, Any]]) -> di
 
                 id_roles = (_ID_HEADERS if set(headers) & _ID_HEADERS else
                             _OVERLOADED_IDS if set(headers) & _OVERLOADED_IDS else {"item", "itemnumber"})
+                # Positively labelled documentary rows can overload component
+                # columns. Require the exact paired header roles and row label;
+                # never infer from an ID prefix or a filename.
+                component_reference = ("customeritem" in headers
+                    and len(headers["customeritem"]) == 1
+                    and keys[headers["customeritem"][0]] == "documentreference"
+                    and "manufacturer" in headers and "manufacturerpartnumber" in headers
+                    and "description" in headers
+                    and keys[headers["description"][0]] in {"drawing", "procedure", "specification", "document"})
+                if "customeritem" in headers and len(headers["customeritem"]) != 1:
+                    raise ValueError("source_roles_ambiguous")
+                if component_reference:
+                    id_roles = {"manufacturer"}
                 identity, id_index = field(id_roles, required=True)
-                revision, rev_index = field(_REV_HEADERS)
+                revision, rev_index = field({"manufacturerpartnumber"} if component_reference else _REV_HEADERS)
                 name, name_index = field(_NAME_HEADERS, required=True)
                 quantity, qty_index = field(_QTY_HEADERS)
                 for index in (id_index, rev_index, name_index, qty_index):
