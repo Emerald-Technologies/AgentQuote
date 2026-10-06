@@ -76,6 +76,29 @@ def test_initial_and_refinement_share_six_dispatches_then_hold():
     assert len(starter.calls) == 6
 
 
+def test_failed_association_author_next_slot_gets_explicit_import_guidance():
+    storage, _, request_id, _ = planned()
+    starter = Starter()
+    starter.base_environment = {"BOM_SOURCE_ASSOCIATIONS": "true"}
+    automation = CandidateAutomationService(storage, starter, author_budget_enabled=True,
+                                            budget_clock=lambda: NOW)
+    assert automation.start_author(request_id) == "started"
+    assert "AUTHOR_FEEDBACK" not in starter.calls[0]
+    first_claims = {path: data for path, data in storage.registry.items() if path.endswith(".claim.json")}
+    finish(storage, starter.calls[0], "failed")
+    terminal_paths = {path: data for path, data in storage.registry.items() if path.endswith("1.terminal.json")}
+    assert automation.start_author(request_id) == "started"
+    assert starter.calls[1]["AUTHOR_BUDGET_SLOT"] == "2"
+    guidance = starter.calls[1]["AUTHOR_FEEDBACK"]
+    assert "do not import" in guidance and "os" in guidance and "subprocess" in guidance
+    assert "argparse" in guidance and "pathlib" in guidance and "openpyxl" in guidance
+    assert len(guidance) < 1000
+    assert all(storage.registry[path] == data for path, data in first_claims.items())
+    assert all(storage.registry[path] == data for path, data in terminal_paths.items())
+    assert automation.start_author(request_id) == "budget_in_flight"
+    assert len(starter.calls) == 2
+
+
 def test_ambiguous_start_never_dispatches_second_execution():
     storage, _, request_id, _ = planned()
     class Uncertain(Starter):

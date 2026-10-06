@@ -409,6 +409,20 @@ class CandidateAutomationService:
                   "AUTHOR_BUDGET_GROUP": reservation["group_id"],
                   "AUTHOR_BUDGET_SLOT": str(reservation["slot"]),
                   "AUTHOR_BUDGET_RESERVATION": reservation["reservation_hash"]}
+        if (phase == "author" and reservation["slot"] > 1
+                and self.author_environment.get("BOM_SOURCE_ASSOCIATIONS") == "true"):
+            # Budget.reserve has verified preceding terminal history and absence
+            # of a completed candidate. This is a new counted attempt, not an
+            # inline second model call or a change to the pinned author policy.
+            from .candidate_authoring import _BANNED_MODULES
+            values["AUTHOR_FEEDBACK"] = (
+                "The preceding author attempt failed before publishing a candidate. "
+                "Follow the enforced import policy: do not import "
+                + ", ".join(sorted(_BANNED_MODULES))
+                + ". Use argparse for input/output arguments, pathlib or open for local paths, "
+                "and pandas/openpyxl for workbook parsing; no network, subprocess or dynamic imports. "
+                "This guidance does not identify the previous failure's exact import."
+            )
         if failure_event:
             values["AUTHOR_FEEDBACK"] = (f"Previous parser failed with {failure_event.get('failure') or failure_event.get('error_code')}: "
                                         f"{failure_event.get('failure_message') or ''}")[:1000]
