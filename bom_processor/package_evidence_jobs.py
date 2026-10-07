@@ -27,13 +27,15 @@ CHECKPOINT = {"qqUuid", "packageVersion", "bomPlanId", "bomApprovalId", "resolve
 
 
 V3 = "package-evidence-request.v3"
+V4 = "package-evidence-request.v4"  # operator retry of a failed request (package_evidence_retry)
 
 
 def request_fields(value: Any) -> set[str]:
     version = value.get("version") if type(value) is dict else None
     return ({"version", "context", "roots", "workbooks", "policy", "requestId"}
-            | ({"retainedBomSources"} if version in {"package-evidence-request.v2", V3} else set())
-            | ({"successor"} if version == V3 else set()))
+            | ({"retainedBomSources"} if version in {"package-evidence-request.v2", V3, V4} else set())
+            | ({"successor"} if version == V3 else set())
+            | ({"retry"} if version == V4 else set()))
 
 
 def expected_parent(request: dict) -> str | None:
@@ -42,8 +44,9 @@ def expected_parent(request: dict) -> str | None:
 
 
 def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], policy: dict,
-                     retained_bom_sources: dict | None = None, successor: dict | None = None) -> dict:
-    """Build an initial or bounded-successor request. Server owns context/policy/feedback.
+                     retained_bom_sources: dict | None = None, successor: dict | None = None,
+                     retry: dict | None = None) -> dict:
+    """Build an initial, bounded-successor or failed-request retry. Server owns context/policy/feedback.
 
     References use an exact package/document/hash prefix, never URLs or SAS.
     This validates reference structure, not authority to access a customer's bytes.
@@ -101,6 +104,12 @@ def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], po
         require(retained_bom_sources is not None, "SUCCESSOR_POLICY_BINDING")
         from .package_evidence_successor import validate_successor
         body.update(version=V3, successor=validate_successor(successor))
+    if retry is not None:
+        # A retry replaces a failed request that has no proposal; it never also carries
+        # qualification feedback, and only the retained-provenance policy is deployed.
+        require(successor is None and retained_bom_sources is not None, "RETRY_POLICY_BINDING")
+        from .package_evidence_retry import validate_retry
+        body.update(version=V4, retry=validate_retry(retry))
     require(len(json_bytes(body)) <= MAX_METADATA, "REQUEST_METADATA_LIMIT")
     return {**body, "requestId": object_hash(body)}
 
@@ -147,15 +156,33 @@ class EvidenceJobService:
         require(value is not None, "REQUEST_NOT_FOUND")
         strict(value, request_fields(value))
         rebuilt = evidence_request(value["context"], value["roots"], value["workbooks"], value["policy"],
-                                   value.get("retainedBomSources"), value.get("successor"))
+                                   value.get("retainedBomSources"), value.get("successor"), value.get("retry"))
         require(value == rebuilt and value["requestId"] == request_id, "REQUEST_CORRUPT")
         return value
+
+    def _require_retry_lineage(self, request: dict) -> None:
+        """A retry is valid only for an existing FAILED initial/retry request with identical
+        package inputs and the immediately previous attempt number."""
+        from .package_evidence_retry import BOUND_FIELDS, request_attempt
+        binding = request["retry"]
+        prior_id = binding["retryOfRequestId"]
+        require(prior_id != request["requestId"], "RETRY_LINEAGE_INVALID")
+        try:
+            prior = self.request(prior_id)
+        except PackageEvidenceError as exc:
+            raise PackageEvidenceError("RETRY_PREDECESSOR_NOT_FOUND") from exc
+        require(prior["version"] in {"package-evidence-request.v2", V4}, "RETRY_PREDECESSOR_UNSUPPORTED")
+        require(self.status(prior_id)["status"] == "failed", "RETRY_PREDECESSOR_NOT_FAILED")
+        require(all(prior.get(key) == request.get(key) for key in BOUND_FIELDS), "RETRY_INPUT_MISMATCH")
+        require(binding["attempt"] == request_attempt(prior) + 1, "RETRY_LINEAGE_INVALID")
 
     def submit(self, supplied: dict) -> dict:
         strict(supplied, request_fields(supplied))
         request = evidence_request(supplied["context"], supplied["roots"], supplied["workbooks"], supplied["policy"],
-                                   supplied.get("retainedBomSources"), supplied.get("successor"))
+                                   supplied.get("retainedBomSources"), supplied.get("successor"), supplied.get("retry"))
         require(supplied == request, "REQUEST_CORRUPT")
+        if "retry" in request:
+            self._require_retry_lineage(request)
         self._write(request["requestId"], "request", request)
         return self.status(request["requestId"])
 
