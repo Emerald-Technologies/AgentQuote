@@ -74,6 +74,59 @@ def test_missing_foreign_or_invented_sources_fail(change):
         produce(Invalid())
 
 
+def _cited(change):
+    class Changed(AssessedModel):
+        def propose(self, packet):
+            out = super().propose(packet)
+            change(out["manufacturing"], packet)
+            return out
+    return produce(Changed())
+
+
+def test_model_offsets_are_ignored_and_code_locates_exact_quote():
+    # A029 retry ce0346b6: exact quote, model-counted offsets wrong. Code now derives them.
+    def wrong_offsets(m, packet):
+        source = packet["manufacturingSources"][0]
+        cite = m["requirements"][0]["citations"][0]
+        cite.update(text=source["text"][5:15], start=999, end=1000)
+        m["requirements"][1]["citations"][0] = {"evidenceId": source["evidenceId"], "page": None, "text": source["text"][5:15]}
+    result = _cited(wrong_offsets)
+    for requirement in result["manufacturingAssessment"]["requirements"][:2]:
+        cite = requirement["citations"][0]
+        assert (cite["start"], cite["end"]) == (5, 15)
+        assert set(cite) == {"evidenceId", "page", "start", "end", "text"}
+
+
+def test_located_offsets_are_utf16_units():
+    from bom_processor.package_manufacturing_assessment import assessment_artifact
+    graph = produce()
+    proposal, classification = graph["proposal"], graph["classification"]
+    hints = {"requirements": [{**r, "citations": [{"evidenceId": "e" * 64, "page": None, "text": "Rev B"}]}
+                              for r in graph["manufacturingAssessment"]["requirements"]],
+             "relationships": []}
+    proposal = {**proposal, "associations": []}
+    source = [{"evidenceId": "e" * 64, "page": None, "text": "\U0001F600 x Rev B", "readerVersion": "quickquote-complete-text.v1"}]
+    artifact = assessment_artifact(proposal, classification, source, hints)
+    cite = artifact["requirements"][0]["citations"][0]
+    # The emoji is 2 UTF16 units, so "Rev B" starts at unit 5 (JavaScript slice), not code point 4.
+    assert (cite["start"], cite["end"]) == (5, 10)
+    assert "\U0001F600 x Rev B".encode("utf-16-le")[cite["start"] * 2:cite["end"] * 2].decode("utf-16-le") == "Rev B"
+
+
+@pytest.mark.parametrize("change", [
+    # Text from a different file than the one cited.
+    lambda m, p: m["requirements"][0]["citations"][0].update(
+        evidenceId=next(s["evidenceId"] for s in p["manufacturingSources"]
+                        if s["evidenceId"] != m["requirements"][0]["citations"][0]["evidenceId"])),
+    lambda m, p: m["requirements"][0]["citations"][0].update(note="extra"),
+    lambda m, p: m["requirements"][0]["citations"][0].pop("text"),
+    lambda m, p: m["requirements"][0]["citations"].append(dict(m["requirements"][0]["citations"][0], start=1)),
+])
+def test_foreign_extra_missing_or_duplicate_citations_still_fail(change):
+    with pytest.raises(PackageEvidenceError):
+        _cited(change)
+
+
 def assessed_service():
     service, original, storage, _ = setup()
     context, roots, books = assessed_inputs()

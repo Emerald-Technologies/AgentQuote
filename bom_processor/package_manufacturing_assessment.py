@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from .package_evidence_contracts import association_id, detached, evidence_id, json_bytes, object_hash, require, strict, text
+from .package_evidence_contracts import association_id, detached, evidence_id, json_bytes, object_hash, require, strict, text, utf16_units
 
 ROLES = {"assembly_drawing", "assembly_instructions", "fabrication_drawing", "custom_drawing", "artwork", "drill"}
 
@@ -33,24 +33,28 @@ def assessment_artifact(graph, classification, sources, hints):
     source_map = {(s["evidenceId"], s["page"]): s["text"] for s in sources}
 
     def citations(values):
+        # The model supplies evidenceId, page and the exact quoted text. Code locates the text
+        # in that source and records start/end itself (UTF16 units, as the QuickQuote consumer
+        # slices). Model-counted offsets were unreliable while the quotes were exact (A029
+        # retry ce0346b6), and an exact quote already proves the source contains the statement.
+        # Any model-supplied start/end is ignored, never trusted. Text absent from the named
+        # source still fails. With several occurrences the first is recorded: any copy proves it.
         require(type(values) is list and 1 <= len(values) <= 50, "ASSESSMENT_CITATIONS_INVALID")
         seen = set()
-        for cite in values:
-            strict(cite, {"evidenceId", "page", "start", "end", "text"})
-            require(type(cite["evidenceId"]) is str and cite["page"] is None
-                    and type(cite["start"]) is int and type(cite["end"]) is int
-                    and 0 <= cite["start"] < cite["end"] <= 8_000_000, "ASSESSMENT_CITATION_INVALID")
-            text(cite["text"], 2000, controls=True)
+        for i, cite in enumerate(values):
+            require(type(cite) is dict and {"evidenceId", "page", "text"} <= set(cite)
+                    and set(cite) <= {"evidenceId", "page", "text", "start", "end"}, "INVALID_FIELDS")
+            require(type(cite["evidenceId"]) is str and cite["page"] is None, "ASSESSMENT_CITATION_INVALID")
+            quote = text(cite["text"], 2000, controls=True)
             source = source_map.get((cite["evidenceId"], cite["page"]))
-            # Consumer offsets are UTF16 units, not Python Unicode code points.
-            encoded = source.encode("utf-16-le") if source is not None else b""
-            require(cite["end"] * 2 <= len(encoded), "ASSESSMENT_CITATION_INVALID")
-            try:
-                quoted = encoded[cite["start"] * 2:cite["end"] * 2].decode("utf-16-le")
-            except UnicodeError:
-                require(False, "ASSESSMENT_CITATION_INVALID")
-            require(quoted == cite["text"] and json_bytes(cite) not in seen, "ASSESSMENT_CITATION_INVALID")
-            seen.add(json_bytes(cite))
+            found = source.find(quote) if source is not None else -1
+            require(found >= 0, "ASSESSMENT_CITATION_INVALID")
+            start = utf16_units(source[:found])
+            located = {"evidenceId": cite["evidenceId"], "page": None, "start": start,
+                       "end": start + utf16_units(quote), "text": quote}
+            require(located["end"] <= 8_000_000 and json_bytes(located) not in seen, "ASSESSMENT_CITATION_INVALID")
+            seen.add(json_bytes(located))
+            values[i] = located
 
     def conflicts(values):
         require(type(values) is list and len(values) <= 20, "ASSESSMENT_CONFLICTS_INVALID")
