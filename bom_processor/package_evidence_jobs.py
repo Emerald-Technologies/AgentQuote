@@ -12,13 +12,17 @@ from typing import Any
 from .core import BlobConflictError, BlobNotFoundError
 from .package_evidence_contracts import (
     ASSESSED_POLICIES, CLASSIFIED_POLICIES, PackageEvidenceError, RETAINED_POLICIES, REVIEWED_POLICIES,
-    assemblies_metadata, detached, digest, hash_value, integer, json_bytes, object_hash, require, strict, text, uuid_value,
+    assemblies_metadata, detached, digest, failure_causes, hash_value, integer, json_bytes, object_hash, require,
+    strict, text, uuid_value,
 )
 from .package_evidence_proposal import produce_proposal
 
 VERSION = "package-evidence-request.v1"
 MAX_METADATA = 2_000_000
 MAX_GRAPH = 8 * 1024 * 1024
+# Failure diagnostics (operator evidence only; never read back by status, never logged).
+DIAGNOSTIC_VERSION = "package-evidence-failure-diagnostic.v1"
+MAX_DIAGNOSTIC_REPLY_BYTES = 256 * 1024
 CHECKPOINT = {"qqUuid", "packageVersion", "bomPlanId", "bomApprovalId", "resolvedManifestSha256"}
 
 
@@ -296,6 +300,24 @@ class EvidenceJobService:
                 and all(value[k] == graph["provenance"][k] for k in ("producer", "model", "promptSha256", "runId")), "ASSESSMENT_RESULT_BINDING")
         return value
 
+    def _write_failure_diagnostic(self, request_id: str, exc: BaseException, model: Any) -> None:
+        """Best effort: keep the rejected producer reply next to the request so the exact
+        validation failure can be inspected. Same protected container as proposal.json; the
+        failed marker is already written, so any error here never changes the job outcome."""
+        try:
+            reply = getattr(model, "last_producer_reply", None)
+            record: dict | None = None
+            if isinstance(reply, str):
+                raw = reply.encode("utf-8", errors="replace")
+                record = {"sha256": digest(raw), "sizeBytes": len(raw),
+                          "text": reply if len(raw) <= MAX_DIAGNOSTIC_REPLY_BYTES else None,
+                          "omitted": None if len(raw) <= MAX_DIAGNOSTIC_REPLY_BYTES else "REPLY_TOO_LARGE"}
+            self._write(request_id, "failure-diagnostic", {
+                "version": DIAGNOSTIC_VERSION, "requestId": request_id,
+                "causes": failure_causes(exc), "producerReply": record})
+        except Exception:
+            pass
+
     def run(self, request_id: str, model: Any) -> dict:
         request = self.request(request_id)
         existing = self.status(request_id)
@@ -359,6 +381,7 @@ class EvidenceJobService:
                                          packet, hints, error, model.reviewer_identity)
         except Exception as exc:
             self._write(request_id, "failed", {"requestId": request_id, "code": "EVIDENCE_JOB_FAILED"})
+            self._write_failure_diagnostic(request_id, exc, model)
             raise PackageEvidenceError("EVIDENCE_JOB_FAILED") from exc
         # Publication uncertainty is not execution failure. Retain the claim;
         # explicit reconciliation can complete an existing proposal without billing

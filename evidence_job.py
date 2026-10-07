@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 
-from bom_processor.package_evidence_contracts import PackageEvidenceError, require
+from bom_processor.package_evidence_contracts import failure_causes, require  # noqa: F401 (re-exported)
 from bom_processor.package_evidence_api import configured_policy
 from bom_processor.package_evidence_jobs import EvidenceJobService
 
@@ -23,30 +22,6 @@ def run_worker(service: EvidenceJobService, request_id: str, policy: dict, model
     model = model_factory()
     require(model.model_name == policy["model"], "MODEL_BINDING")
     return service.run(request_id, model)
-
-
-_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}")
-_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
-
-
-def failure_causes(exc: BaseException, limit: int = 8) -> list[str]:
-    """Content-free cause chain for operators.
-
-    PackageEvidenceError carries stable codes only; any other exception contributes its
-    class name only (never its message, which can hold package data or provider bodies).
-    `raise ... from None` is honoured, so deliberately hidden provider details stay hidden.
-    """
-    causes, seen, current = [], set(), exc
-    while current is not None and len(causes) < limit and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, PackageEvidenceError):
-            message = str(current)
-            causes.append(message if _CODE.fullmatch(message) else "UNSTRUCTURED_EVIDENCE_ERROR")
-        else:
-            name = type(current).__name__
-            causes.append(name if _CLASS.fullmatch(name) else "Exception")
-        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
-    return causes
 
 
 def main() -> int:

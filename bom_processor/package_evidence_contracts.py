@@ -14,6 +14,30 @@ class PackageEvidenceError(ValueError):
     """Stable, non-source-bearing validation error."""
 
 
+_CAUSE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}")
+_CAUSE_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+
+
+def failure_causes(exc: BaseException, limit: int = 8) -> list[str]:
+    """Content-free cause chain for operators.
+
+    PackageEvidenceError carries stable codes only; any other exception contributes its
+    class name only (never its message, which can hold package data or provider bodies).
+    `raise ... from None` is honoured, so deliberately hidden provider details stay hidden.
+    """
+    causes, seen, current = [], set(), exc
+    while current is not None and len(causes) < limit and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, PackageEvidenceError):
+            message = str(current)
+            causes.append(message if _CAUSE_CODE.fullmatch(message) else "UNSTRUCTURED_EVIDENCE_ERROR")
+        else:
+            name = type(current).__name__
+            causes.append(name if _CAUSE_CLASS.fullmatch(name) else "Exception")
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+    return causes
+
+
 # Producer policy capability sets. v5 = v4 (retained provenance) plus independent reviewer artifact.
 CLASSIFIED_POLICIES = frozenset({"package-evidence-foundry.v2", "package-evidence-foundry.v3",
                                  "package-evidence-foundry.v4", "package-evidence-foundry.v5"})

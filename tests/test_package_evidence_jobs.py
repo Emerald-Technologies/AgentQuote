@@ -121,6 +121,86 @@ def test_tampered_source_fails_before_model_and_no_retry():
     assert service.run(request["requestId"], model)["status"] == "failed"
 
 
+class ReplyModel(FakeModel):
+    """FakeModel that records a raw reply like FoundryEvidenceProposalModel does."""
+
+    def __init__(self, reply, change=None):
+        super().__init__(change)
+        self.reply = reply
+        self.last_producer_reply = None
+
+    def propose(self, packet):
+        self.last_producer_reply = self.reply
+        output = super().propose(packet)
+        output["associations"].append(deepcopy(output["associations"][0]))  # DUPLICATE_ASSOCIATION
+        return output
+
+
+def _diagnostic(service, storage, request):
+    import json
+    raw = storage.registry.get(service._path(request["requestId"], "failure-diagnostic"))
+    return None if raw is None else json.loads(raw)
+
+
+def test_failed_producer_reply_is_kept_as_protected_diagnostic():
+    service, request, storage, _ = setup()
+    service.submit(request)
+    reply = '{"associations": ["exact model text"]}'
+    with pytest.raises(PackageEvidenceError, match="EVIDENCE_JOB_FAILED"):
+        service.run(request["requestId"], ReplyModel(reply))
+    record = _diagnostic(service, storage, request)
+    assert record == {"version": "package-evidence-failure-diagnostic.v1", "requestId": request["requestId"],
+                      "causes": ["DUPLICATE_ASSOCIATION"],
+                      "producerReply": {"sha256": digest(reply.encode()), "sizeBytes": len(reply.encode()),
+                                        "text": reply, "omitted": None}}
+    # Diagnostic never changes status or blocks the no-retry rule.
+    assert service.status(request["requestId"])["status"] == "failed"
+
+
+def test_failure_without_reply_records_causes_only_and_success_writes_nothing():
+    service, request, storage, _ = setup()
+    service.submit(request)
+    storage.sources[request["roots"][0]["blobPath"]] = b"tampered"
+    with pytest.raises(PackageEvidenceError):
+        service.run(request["requestId"], FakeModel())
+    assert _diagnostic(service, storage, request) == {
+        "version": "package-evidence-failure-diagnostic.v1", "requestId": request["requestId"],
+        "causes": ["SOURCE_IDENTITY_MISMATCH"], "producerReply": None}
+    ok_service, ok_request, ok_storage, _ = setup()
+    ok_service.submit(ok_request)
+    assert ok_service.run(ok_request["requestId"], FakeModel())["status"] == "completed"
+    assert _diagnostic(ok_service, ok_storage, ok_request) is None
+
+
+def test_oversize_reply_is_hashed_not_stored():
+    from bom_processor.package_evidence_jobs import MAX_DIAGNOSTIC_REPLY_BYTES
+    service, request, storage, _ = setup()
+    service.submit(request)
+    reply = "x" * (MAX_DIAGNOSTIC_REPLY_BYTES + 1)
+    with pytest.raises(PackageEvidenceError):
+        service.run(request["requestId"], ReplyModel(reply))
+    record = _diagnostic(service, storage, request)["producerReply"]
+    assert record == {"sha256": digest(reply.encode()), "sizeBytes": len(reply), "text": None,
+                      "omitted": "REPLY_TOO_LARGE"}
+
+
+def test_diagnostic_write_failure_never_changes_the_outcome():
+    service, request, storage, _ = setup()
+    service.submit(request)
+    original = storage.upload_registry_immutable
+
+    def refuse_diagnostic(path, data, content_type):
+        if path.endswith("/failure-diagnostic.json"):
+            raise RuntimeError("storage unavailable")
+        return original(path, data, content_type)
+    storage.upload_registry_immutable = refuse_diagnostic
+    with pytest.raises(PackageEvidenceError, match="EVIDENCE_JOB_FAILED") as caught:
+        service.run(request["requestId"], ReplyModel("{}"))
+    assert isinstance(caught.value.__cause__, PackageEvidenceError)
+    assert str(caught.value.__cause__) == "DUPLICATE_ASSOCIATION"
+    assert service.status(request["requestId"])["status"] == "failed"
+
+
 @pytest.mark.parametrize("change", [
     lambda r: r.update(requestId="0" * 64),
     lambda r: r.update(approved=True),

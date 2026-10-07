@@ -193,8 +193,12 @@ class FoundryEvidenceProposalModel:
         require(type(timeout_seconds) is int and 1 <= timeout_seconds <= MODEL_DEADLINE_SECONDS, "MODEL_TIMEOUT_INVALID")
         self.timeout_seconds = timeout_seconds
         self.agent_factory = agent_factory
+        # Raw text of the most recent producer reply (None if no reply arrived). Read only by
+        # the job service to persist a failure diagnostic in protected storage; never logged.
+        self.last_producer_reply: str | None = None
 
     def propose(self, packet: dict) -> dict:
+        self.last_producer_reply = None
         encoded = json_bytes(packet)
         require(len(encoded) <= MAX_PACKET_BYTES, "MODEL_PACKET_LIMIT")
         # The fixed instructions are part of the billable input. This is a
@@ -214,6 +218,8 @@ class FoundryEvidenceProposalModel:
             content = getattr(response, "output_text", None)
             if not isinstance(content, str):
                 content = getattr(response, "text", None)
+            if isinstance(content, str):
+                self.last_producer_reply = content
             return parse_response(content)
 
         try:

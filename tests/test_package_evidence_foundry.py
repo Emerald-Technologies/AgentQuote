@@ -139,6 +139,36 @@ def test_propose_preserves_shape_causes_through_agent_call():
         "MODEL_RESPONSE_INVALID", "MODEL_SHAPE_WRAPPED_PROPOSAL", "MODEL_SHAPE_INNER_VALID"]
 
 
+def test_propose_records_raw_reply_even_when_parsing_fails():
+    replies = iter(['{"proposal": {}}', "not json"])
+
+    class Agent:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self, packet, *, options):
+            return SimpleNamespace(output_text=next(replies))
+
+    model = FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=Agent)
+    assert model.last_producer_reply is None
+    for expected, code in (('{"proposal": {}}', "MODEL_RESPONSE_INVALID"), ("not json", "MODEL_JSON_INVALID")):
+        with pytest.raises(PackageEvidenceError, match=code):
+            model.propose({"small": "packet"})
+        assert model.last_producer_reply == expected
+
+    class Failing:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self, packet, *, options):
+            raise RuntimeError("provider body")
+
+    model.agent_factory = Failing
+    with pytest.raises(PackageEvidenceError, match="MODEL_REQUEST_FAILED"):
+        model.propose({"small": "packet"})
+    assert model.last_producer_reply is None
+
+
 def test_response_and_input_limits_before_invocation():
     with pytest.raises(PackageEvidenceError, match="LIMIT"):
         parse_response(" " * (MAX_RESPONSE_BYTES + 1))
