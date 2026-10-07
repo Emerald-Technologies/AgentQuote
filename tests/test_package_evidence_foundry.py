@@ -60,6 +60,85 @@ def test_strict_json_rejection(value):
         parse_response(value)
 
 
+def _shape_causes(value):
+    from evidence_job import failure_causes
+    with pytest.raises(PackageEvidenceError) as caught:
+        parse_response(value)
+    assert str(caught.value) == "MODEL_RESPONSE_INVALID"
+    return failure_causes(caught.value)
+
+
+VALID = {"associations": [], "dispositions": [], "classifications": [], "manufacturing": {}}
+
+
+def test_valid_shapes_still_parse():
+    assert parse_response(json.dumps(VALID)) == VALID
+    assert parse_response(json.dumps({**VALID, "categories": []}))["categories"] == []
+
+
+@pytest.mark.parametrize("value, expected", [
+    ([], ["MODEL_SHAPE_NOT_OBJECT_ARRAY"]),
+    ({"associations": [], "dispositions": []},
+     ["MODEL_SHAPE_MISSING_CLASSIFICATIONS", "MODEL_SHAPE_MISSING_MANUFACTURING"]),
+    ({**VALID, "manufacturing": []}, ["MODEL_SHAPE_TYPE_MANUFACTURING_ARRAY"]),
+    ({**VALID, "associations": {}, "categories": None},
+     ["MODEL_SHAPE_TYPE_ASSOCIATIONS_OBJECT", "MODEL_SHAPE_TYPE_CATEGORIES_NULL"]),
+    ({**VALID, "Requirements": [], "relationships": []},
+     ["MODEL_SHAPE_EXTRA_RELATIONSHIPS", "MODEL_SHAPE_EXTRA_REQUIREMENTS"]),
+    ({"proposal": VALID}, ["MODEL_SHAPE_WRAPPED_PROPOSAL", "MODEL_SHAPE_INNER_VALID"]),
+    ({"result": {"associations": []}}, ["MODEL_SHAPE_WRAPPED_RESULT", "MODEL_SHAPE_INNER_INVALID"]),
+])
+def test_shape_failure_names_the_gap(value, expected):
+    assert _shape_causes(json.dumps(value)) == ["MODEL_RESPONSE_INVALID", *expected]
+
+
+def test_shape_diagnostics_never_echo_model_chosen_keys():
+    secret = "PN-12345 customer drawing.pdf"
+    causes = _shape_causes(json.dumps({**VALID, secret: [], "TEST_ONLY_ASM_100": 1}))
+    assert causes == ["MODEL_RESPONSE_INVALID", "MODEL_SHAPE_EXTRA_OTHER"]
+    wrapped = _shape_causes(json.dumps({secret: VALID}))
+    assert wrapped == ["MODEL_RESPONSE_INVALID", "MODEL_SHAPE_WRAPPED_OTHER", "MODEL_SHAPE_INNER_VALID"]
+    assert not any("12345" in cause or "PDF" in cause for cause in causes + wrapped)
+
+
+def test_shape_details_are_bounded_and_fit_the_worker_cause_limit():
+    from evidence_job import failure_causes
+    bad = {"associations": 1, "dispositions": "x", "classifications": None, "manufacturing": [],
+           "categories": 2, "notes": []}
+    causes = _shape_causes(json.dumps(bad))
+    assert len(causes) == 1 + 5 and causes[-1] == "MODEL_SHAPE_MORE"
+    # Full worker chain: job -> proposal -> response -> at most 5 shape codes = 8 (the log limit).
+    Err = PackageEvidenceError
+    with pytest.raises(Err) as caught:
+        parse_response(json.dumps(bad))
+    try:
+        try:
+            raise Err("MODEL_PROPOSAL_FAILED") from caught.value
+        except Err as proposal:
+            raise Err("EVIDENCE_JOB_FAILED") from proposal
+    except Err as job:
+        chain = failure_causes(job)
+    assert chain[:3] == ["EVIDENCE_JOB_FAILED", "MODEL_PROPOSAL_FAILED", "MODEL_RESPONSE_INVALID"]
+    assert chain[-1] == "MODEL_SHAPE_MORE" and len(chain) == 8
+
+
+def test_propose_preserves_shape_causes_through_agent_call():
+    from evidence_job import failure_causes
+
+    class Agent:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self, packet, *, options):
+            return SimpleNamespace(output_text=json.dumps({"proposal": VALID}))
+
+    model = FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=Agent)
+    with pytest.raises(PackageEvidenceError) as caught:
+        model.propose({"small": "packet"})
+    assert failure_causes(caught.value) == [
+        "MODEL_RESPONSE_INVALID", "MODEL_SHAPE_WRAPPED_PROPOSAL", "MODEL_SHAPE_INNER_VALID"]
+
+
 def test_response_and_input_limits_before_invocation():
     with pytest.raises(PackageEvidenceError, match="LIMIT"):
         parse_response(" " * (MAX_RESPONSE_BYTES + 1))

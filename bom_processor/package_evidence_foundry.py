@@ -86,6 +86,70 @@ def _constant(_value: str) -> None:
     raise PackageEvidenceError("MODEL_JSON_INVALID")
 
 
+_REQUIRED_KEYS = ("associations", "dispositions", "classifications", "manufacturing")
+_OPTIONAL_KEYS = ("categories",)
+# Fixed vocabulary for naming unexpected keys in diagnostics. A model-chosen key is
+# reported by name only when it is (case-insensitively) one of these words; anything
+# else becomes OTHER, so package text, part numbers or filenames never reach a log.
+_KNOWN_KEY_NAMES = frozenset({
+    "requirements", "relationships", "evidence", "occurrences", "citations", "conflicts",
+    "proposal", "result", "results", "data", "output", "response", "hints", "graph",
+    "package", "assessment", "review", "notes", "summary", "rationale", "version", "schema",
+    "classification", "association", "disposition", "category", "manufacturingassessment",
+})
+MAX_SHAPE_DETAILS = 5
+
+
+def _type_name(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if type(value) is bool:
+        return "BOOL"
+    if type(value) in (int, float):
+        return "NUMBER"
+    return {dict: "OBJECT", list: "ARRAY", str: "STRING"}.get(type(value), "OTHER")
+
+
+def _key_name(key: str) -> str:
+    folded = key.casefold()
+    return folded.upper() if folded in _KNOWN_KEY_NAMES else "OTHER"
+
+
+def _shape_findings(result: Any) -> list[str]:
+    """Content-free codes describing why a parsed reply fails the top-level shape; [] if valid."""
+    if type(result) is not dict:
+        return [f"MODEL_SHAPE_NOT_OBJECT_{_type_name(result)}"]
+    allowed = set(_REQUIRED_KEYS) | set(_OPTIONAL_KEYS)
+    findings: list[str] = []
+    if len(result) == 1:
+        (key, inner), = result.items()
+        if key not in allowed and type(inner) is dict and set(inner) & allowed:
+            # The whole answer nested under one outer key.
+            return [f"MODEL_SHAPE_WRAPPED_{_key_name(key)}",
+                    "MODEL_SHAPE_INNER_INVALID" if _shape_findings(inner) else "MODEL_SHAPE_INNER_VALID"]
+    findings += [f"MODEL_SHAPE_MISSING_{key.upper()}" for key in _REQUIRED_KEYS if key not in result]
+    findings += [f"MODEL_SHAPE_TYPE_{key.upper()}_{_type_name(result[key])}"
+                 for key in (*_REQUIRED_KEYS, *_OPTIONAL_KEYS)
+                 if key in result and type(result[key]) is not (dict if key == "manufacturing" else list)]
+    extras = sorted({_key_name(key) for key in result if key not in allowed})
+    findings += [f"MODEL_SHAPE_EXTRA_{name}" for name in extras]
+    if len(findings) > MAX_SHAPE_DETAILS:
+        findings = findings[:MAX_SHAPE_DETAILS - 1] + ["MODEL_SHAPE_MORE"]
+    return findings
+
+
+def _shape_error(findings: list[str]) -> PackageEvidenceError:
+    """MODEL_RESPONSE_INVALID with the findings chained as causes (read by the worker log)."""
+    cause = None
+    for code in reversed(findings):
+        error = PackageEvidenceError(code)
+        error.__cause__ = cause
+        cause = error
+    error = PackageEvidenceError("MODEL_RESPONSE_INVALID")
+    error.__cause__ = cause
+    return error
+
+
 def parse_response(value: Any) -> dict:
     require(type(value) is str, "MODEL_RESPONSE_INVALID")
     try:
@@ -95,12 +159,9 @@ def parse_response(value: Any) -> dict:
         raise
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise PackageEvidenceError("MODEL_JSON_INVALID") from exc
-    require(type(result) is dict and set(result) in (
-        {"associations", "dispositions", "classifications", "manufacturing"},
-        {"associations", "dispositions", "classifications", "manufacturing", "categories"}),
-        "MODEL_RESPONSE_INVALID")
-    for key, collection in result.items():
-        require(type(collection) is (dict if key == "manufacturing" else list), "MODEL_RESPONSE_INVALID")
+    findings = _shape_findings(result)
+    if findings:
+        raise _shape_error(findings)
     return result
 
 
