@@ -40,7 +40,8 @@ def test_tool_free_packet_and_exact_prompt_provenance():
     assert len(result["classification"]["classifications"]) == len(graph["occurrences"])
     assert result["manufacturingAssessment"]["proposalSha256"] == graph["proposalSha256"]
     assert seen["tools"] == []
-    assert seen["options"] == {"max_tokens": MAX_OUTPUT_TOKENS, "store": False}
+    assert seen["options"] == {"max_tokens": MAX_OUTPUT_TOKENS, "store": False,
+                               "response_format": {"type": "json_object"}}
     assert seen["instructions"] == SYSTEM_INSTRUCTION
     assert graph["provenance"]["promptSha256"] == PROMPT_SHA256 == digest(SYSTEM_INSTRUCTION.encode())
     assert graph["provenance"]["model"] == "explicit-deployment"

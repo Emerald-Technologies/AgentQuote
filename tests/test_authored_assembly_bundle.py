@@ -29,7 +29,7 @@ def authored(parser_code=CODE):
             assert kwargs["tools"] == []
 
         async def run(self, text, *, options):
-            assert options == {"max_tokens": 8192}
+            assert options == {"max_tokens": 8192, "response_format": {"type": "json_object"}}
             seen.append(json.loads(text))
             return SimpleNamespace(output_text=json.dumps({"parser_code": parser_code,
                                                            "assembly_associations": associations}))

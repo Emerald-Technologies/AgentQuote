@@ -65,6 +65,13 @@ MAX_RESPONSE_BYTES = 2_000_000
 MAX_MODEL_INPUT_BYTES = 32 * 1024
 MAX_OUTPUT_TOKENS = 8192
 MODEL_DEADLINE_SECONDS = 120
+# Service-enforced JSON mode for producer and reviewer replies (syntax only; parse_response
+# and the producer/reviewer validators still enforce the exact shape). Both prompts say JSON.
+RESPONSE_FORMAT = {"type": "json_object"}
+
+
+def _call_options() -> dict:
+    return {"max_tokens": MAX_OUTPUT_TOKENS, "store": False, "response_format": dict(RESPONSE_FORMAT)}
 
 
 def _pairs(items: list[tuple[str, Any]]) -> dict:
@@ -140,9 +147,8 @@ class FoundryEvidenceProposalModel:
                 from agent_framework import Agent
                 factory = Agent
             agent = factory(client=self.client, instructions=SYSTEM_INSTRUCTION, tools=[])
-            response = await asyncio.wait_for(agent.run(encoded.decode("utf-8"), options={
-                "max_tokens": MAX_OUTPUT_TOKENS, "store": False,
-            }), self.timeout_seconds)
+            response = await asyncio.wait_for(agent.run(encoded.decode("utf-8"), options=_call_options()),
+                                              self.timeout_seconds)
             # No str(object) fallback that could expose response internals or accept tool output.
             content = getattr(response, "output_text", None)
             if not isinstance(content, str):
@@ -171,9 +177,8 @@ class FoundryEvidenceProposalModel:
                 from agent_framework import Agent
                 factory = Agent
             agent = factory(client=client, instructions=REVIEW_INSTRUCTION, tools=[])
-            response = await asyncio.wait_for(agent.run(encoded.decode("utf-8"), options={
-                "max_tokens": MAX_OUTPUT_TOKENS, "store": False,
-            }), self.timeout_seconds)
+            response = await asyncio.wait_for(agent.run(encoded.decode("utf-8"), options=_call_options()),
+                                              self.timeout_seconds)
             content = getattr(response, "output_text", None)
             if not isinstance(content, str):
                 content = getattr(response, "text", None)

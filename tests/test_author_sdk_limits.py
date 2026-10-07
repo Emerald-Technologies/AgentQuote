@@ -43,13 +43,22 @@ def run_check():
             author.generate_bundle(prompt, [{"sha256": "a"*64, "bytes": stream.getvalue(), "extension": "xlsx"}])
         except ChatClientException as exc:
             assert isinstance(exc.__cause__, RateLimitError)
+        except Exception as exc:
+            # failure_stage() wraps SDK errors in AuthorFailure ... from None; the
+            # provider request (asserted below) is the contract under test.
+            from bom_processor.author_failure import AuthorFailure
+            assert isinstance(exc, AuthorFailure)
+            assert exc.diagnostics.get("failure_stage") == "invocation"
         else:
             raise AssertionError("Expected synthetic rate-limit failure")
     assert len(settings) == 1 and settings[0]["max_retries"] == 0
     assert settings[0]["timeout"] == 120.0
     assert len(requests) == 1, "SDK must not retry the provider request"
     assert requests[0]["max_output_tokens"] == 8192
+    # The actual wire request carries service-enforced JSON mode (Responses API text.format).
+    assert requests[0].get("text", {}).get("format") == {"type": "json_object"}
     return {"provider_attempts": len(requests), "max_output_tokens": requests[0]["max_output_tokens"],
+            "text_format": requests[0]["text"]["format"],
             "max_retries": settings[0]["max_retries"], "timeout_seconds": settings[0]["timeout"]}
 
 

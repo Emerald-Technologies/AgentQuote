@@ -168,6 +168,8 @@ def test_foundry_reviewer_uses_fresh_client_tool_free_and_exact_prompt():
             seen.append(kwargs)
 
         async def run(self, packet, *, options):
+            # Reviewer replies are service-enforced JSON too (A026 had one producer call only).
+            assert options["response_format"] == {"type": "json_object"} and options["store"] is False
             return SimpleNamespace(output_text=json.dumps({"claims": [], "findings": [], "verdict": "stop"}))
 
     model = FoundryEvidenceProposalModel("first", model_name="explicit", agent_factory=Agent,

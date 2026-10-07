@@ -95,7 +95,7 @@ def execute_package(conflict=False):
         def __init__(self, **kwargs):
             assert kwargs["tools"] == []
         async def run(self, text, *, options):
-            assert options == {"max_tokens": 8192}
+            assert options == {"max_tokens": 8192, "response_format": {"type": "json_object"}}
             return SimpleNamespace(output_text=json.dumps({
                 "parser_code": PARSER, "assembly_associations": associations}))
 

@@ -58,7 +58,7 @@ class AuthoringError(ValueError):
         self.rule_id = rule_id
         self.diagnostics = diagnostic_fields(
             (diagnostics or {}).get("failure_stage"), (diagnostics or {}).get("failure_category"),
-            (diagnostics or {}).get("failure_http_status"))
+            (diagnostics or {}).get("failure_http_status"), (diagnostics or {}).get("failure_json_reason"))
         super().__init__(code)
 
 

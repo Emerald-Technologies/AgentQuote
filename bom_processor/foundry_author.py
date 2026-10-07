@@ -18,6 +18,10 @@ MAX_HTML_BYTES = 2_000_000
 MAX_HTML_TEXT = 2_000
 BUNDLE_MAX_TOKENS = 8192
 BUNDLE_TIMEOUT_SECONDS = 120.0
+# Service-enforced JSON mode: the reply is always syntactically valid JSON (A025-A027 bundle
+# replies failed json.loads with complete, untruncated output). Code still validates the shape.
+# A strict json_schema is not used: assembly_associations is keyed by per-package source hashes.
+BUNDLE_RESPONSE_FORMAT = {"type": "json_object"}
 SYSTEM_INSTRUCTION = (
     "Write only one Python parser source file. It must accept --input and --output, "
     "read the supplied BOM, and write a real XLSX workbook to --output using pandas "
@@ -226,7 +230,8 @@ class FoundryModelAuthor:
                 factory = Agent
             with failure_stage("invocation"):
                 response = await factory(client=self.client, instructions=instructions, tools=[]).run(
-                    user_text, options={"max_tokens": BUNDLE_MAX_TOKENS})
+                    user_text, options={"max_tokens": BUNDLE_MAX_TOKENS,
+                                        "response_format": dict(BUNDLE_RESPONSE_FORMAT)})
             with failure_stage("response"):
                 text = _response_text(response)
                 if len(text.encode("utf-8")) > 1_000_000:
