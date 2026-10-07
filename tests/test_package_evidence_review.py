@@ -77,6 +77,45 @@ def test_v5_publishes_independent_review_without_producer_rationale_and_replays(
     assert service.reconcile_publication(request["requestId"]) == result
 
 
+class StrictReviewer(ReviewedModel):
+    """Mimics the live reviewer (A025, 2026-10-06): any file it cannot read and that has no claim is
+    reported as unaccounted unless the packet marks it as code-verified retained provenance."""
+
+    def review(self, packet):
+        out = super().review(packet)
+        claimed = {c["evidenceId"] for c in packet["claims"]}
+        for f in packet["files"]:
+            if not f["readable"] and f["evidenceId"] not in claimed and not f["retainedKind"]:
+                out["findings"].append({"kind": "unaccounted_file", "subject": f["fileName"],
+                                        "explanation": "Present but unreadable and not accounted for.", "quotes": []})
+        if out["findings"]:
+            out["verdict"] = "stop"
+        return out
+
+
+def test_retained_bom_workbook_is_labeled_for_reviewer_and_does_not_stop_package():
+    # Regression: A025 stopped because retained original BOM workbooks reached the reviewer as
+    # unexplained unreadable files (readable false, no claim, no stated role).
+    service, request, _ = service_and_request()
+    model = StrictReviewer()
+    review = service.run(request["requestId"], model)["review"]
+    packet = model.review_packet
+    assert packet["version"] == "package-evidence-review-packet.v2"
+    retained = {r["evidenceId"]: r["kind"] for r in model.packet["retainedProvenance"]}
+    files = {f["evidenceId"]: f for f in packet["files"]}
+    assert "original_bom_input" in retained.values()
+    for identity, kind in retained.items():
+        assert files[identity]["retainedProvenance"] is True and files[identity]["retainedKind"] == kind
+    assert all(f["retainedKind"] is None for i, f in files.items() if i not in retained)
+    assert not any(f["kind"] == "unaccounted_file" and "original.xlsx" in f["subject"] for f in review["findings"])
+    assert "original_bom_input" in REVIEW_INSTRUCTION and "never report them as unaccounted" in REVIEW_INSTRUCTION
+
+
+def test_reviewer_prompt_allows_explicitly_shared_files_across_named_assemblies():
+    # Nick, 2026-10-07: a file whose text states it applies to other named assemblies may be linked as shared.
+    assert "except as shared" in REVIEW_INSTRUCTION and "shared scope" in REVIEW_INSTRUCTION
+
+
 @pytest.mark.parametrize("fail, code", [(RuntimeError("provider body"), "REVIEW_REQUEST_FAILED"),
                                         (PackageEvidenceError("REVIEW_TIMEOUT"), "REVIEW_TIMEOUT")])
 def test_reviewer_failure_preserves_proposal_and_publishes_failed_review(fail, code):
