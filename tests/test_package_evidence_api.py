@@ -92,3 +92,43 @@ def test_shared_policy_available_in_packaged_module(monkeypatch):
     assert "COPY bom_processor" in docker
     source = Path("deterministic_api.py").read_text()
     assert "from evidence_job import" not in source
+
+
+def test_worker_failure_log_names_stable_cause_chain_without_content(monkeypatch, capsys):
+    # Regression: A026 (2026-10-07) evidence job failed and the only log line was
+    # EVIDENCE_WORKER_FAILED, so the failing step could not be identified.
+    import json
+    import sys
+    from types import SimpleNamespace
+    import evidence_job
+    import bom_processor.package_evidence_foundry as foundry
+    service, request, _, _ = setup(); service.submit(request)
+    secret = "CUSTOMER-PART-XYZ provider body"
+
+    class Broken(FakeModel):
+        def propose(self, packet):
+            raise KeyError(secret)
+    model = Broken(); model.model_name = request["policy"]["model"]
+    monkeypatch.setenv("PACKAGE_EVIDENCE_MODEL_ENABLED", "true")
+    monkeypatch.setenv("REQUEST_ID", request["requestId"])
+    monkeypatch.setitem(sys.modules, "deterministic_api", SimpleNamespace(_storage_factory=lambda: service.storage))
+    monkeypatch.setattr(foundry, "create_foundry_evidence_model", lambda: model)
+    monkeypatch.setattr(evidence_job, "configured_policy", lambda: request["policy"])
+    assert evidence_job.main() == 1
+    out = capsys.readouterr().out
+    assert json.loads(out) == {"status": "error", "code": "EVIDENCE_WORKER_FAILED",
+                               "causes": ["EVIDENCE_JOB_FAILED", "MODEL_PROPOSAL_FAILED", "KeyError"]}
+    assert "CUSTOMER" not in out and "provider" not in out
+
+
+def test_failure_causes_honour_from_none_and_reject_unstructured_messages():
+    from evidence_job import failure_causes
+    try:
+        try:
+            raise RuntimeError("endpoint https://secret token")
+        except RuntimeError:
+            raise PackageEvidenceError("MODEL_REQUEST_FAILED") from None
+    except PackageEvidenceError as exc:
+        assert failure_causes(exc) == ["MODEL_REQUEST_FAILED"]
+    assert failure_causes(PackageEvidenceError("free text with data")) == ["UNSTRUCTURED_EVIDENCE_ERROR"]
+    assert failure_causes(ValueError("x"), limit=1) == ["ValueError"]
