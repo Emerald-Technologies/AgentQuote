@@ -39,6 +39,18 @@ def proposal(source, name):
             "findings": []}
 
 
+def roles(store, sources, role="bom"):
+    """Synthetic agent role proposals citing the 'Part' header cell of each workbook."""
+    from bom_processor.document_role import VERSION as ROLE_VERSION
+    result = {}
+    for source in sources:
+        result[source["sha256"]] = {"version": ROLE_VERSION, "source_sha256": source["sha256"], "role": role,
+            "rationale": "Synthetic: one row per part with quantity and manufacturer part number.",
+            "evidence": [{"value": "Part", "cell": {"sheet": "Customer", "row": 3, "column": 1}}],
+            "findings": []}
+    return result
+
+
 def setup(conflict=False):
     store = InMemoryStorage()
     sources, outputs, associations = [], {}, {}
@@ -188,8 +200,9 @@ def test_false_value_blocking_findings_and_incomplete_coverage_are_held():
 def test_complete_inventory_includes_late_rows_and_refuses_truncation():
     source = workbook([["row", index] for index in range(50)])
     context = json.loads(build_complete_inventory(source, "xlsx"))
-    assert context["coverage"] == "complete" and len(context["cells"]) == 100
-    assert any(cell["row"] == 50 for cell in context["cells"])
+    rows = context["sheets"][0]["rows"]
+    assert context["coverage"] == "complete" and sum(len(cells) for _, cells in rows) == 100
+    assert rows[-1] == [50, [[1, "row"], [2, 49]]]
     with pytest.raises(ValueError, match="AUTHORING_SOURCE_CONTEXT_LIMIT"):
         build_complete_inventory(workbook([["short words "*20] for _ in range(1000)]), "xlsx")
 

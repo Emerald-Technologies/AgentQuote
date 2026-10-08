@@ -134,8 +134,8 @@ def test_safe_diagnostics_survive_service_boundary(monkeypatch):
 
 
 def test_association_failure_has_safe_stage_and_preserves_artifacts(monkeypatch):
-    from test_source_assembly_association import setup
-    store, _, associations, _ = setup()
+    from test_source_assembly_association import roles, setup
+    store, sources, associations, _ = setup()
     path = "candidates/requests/xlsx-demo.json"
     request = json.loads(store.registry[path])
     request["version"] = "candidate-request.v2"
@@ -143,11 +143,14 @@ def test_association_failure_has_safe_stage_and_preserves_artifacts(monkeypatch)
     before = dict(store.candidates)
     class Model:
         def generate_bundle(self, *_):
-            return {"parser_code": "unused", "assembly_associations": associations}
+            return {"parser_code": "unused", "document_roles": roles(store, sources),
+                    "assembly_associations": associations}
     def fail(*_): raise ValueError(SECRET)
     monkeypatch.setattr("bom_processor.assembly_association.verify_association", fail)
     with pytest.raises(AuthoringError) as failed:
         CandidateAuthoringService("xlsx-demo", store, Model(), source_associations=True).author()
     assert failed.value.code == "MODEL_FAILED"
     assert failed.value.diagnostics == {"failure_stage": "association", "failure_category": "value_error"}
-    assert store.candidates == before
+    # Only the verified role record was added; no parser or association artifacts.
+    added = set(store.candidates) - set(before)
+    assert len(added) == 1 and next(iter(added)).startswith("candidates/xlsx-demo/document-roles/")

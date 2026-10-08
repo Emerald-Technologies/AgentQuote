@@ -6,7 +6,7 @@ Run: python -m pytest tests/test_author_failure.py.
 from contextlib import contextmanager
 import json
 
-STAGES = frozenset({"inventory", "invocation", "response", "association", "code_validation"})
+STAGES = frozenset({"inventory", "invocation", "response", "document_role", "association", "code_validation"})
 CATEGORIES = frozenset({"json_invalid", "timeout", "connection", "http_error", "value_error", "type_error", "unexpected"})
 # json.JSONDecodeError.msg is a fixed stdlib phrase (positions are separate attributes),
 # so mapping its prefix to an allowlisted code records the malformation kind, never content.

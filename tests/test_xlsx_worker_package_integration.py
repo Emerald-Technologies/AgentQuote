@@ -20,7 +20,7 @@ from bom_processor.core import CANONICAL_COLUMNS, OUTPUT_CONTENT_TYPE, _json_byt
 from bom_processor.foundry_author import FoundryModelAuthor
 from bom_processor.job_orchestrator import StartResult
 from worker.runtime import Limits, run_job
-from test_source_assembly_association import setup
+from test_source_assembly_association import roles, setup
 
 
 PARSER = '''import argparse
@@ -97,7 +97,8 @@ def execute_package(conflict=False):
         async def run(self, text, *, options):
             assert options == {"max_tokens": 8192, "response_format": {"type": "json_object"}}
             return SimpleNamespace(output_text=json.dumps({
-                "parser_code": PARSER, "assembly_associations": associations}))
+                "parser_code": PARSER, "document_roles": roles(store, sources),
+                "assembly_associations": associations}))
 
     authored = CandidateAuthoringService("xlsx-demo", store,
         FoundryModelAuthor(agent_factory=Agent), source_associations=True).author()

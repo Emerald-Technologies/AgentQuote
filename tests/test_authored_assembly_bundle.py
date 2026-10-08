@@ -11,7 +11,7 @@ from bom_processor.candidate_authoring import CandidateAuthoringService
 from bom_processor.candidate_validation import CandidateValidationService, CandidateValidationError
 from bom_processor.candidate_review import CandidateReviewService
 from bom_processor.foundry_author import FoundryModelAuthor
-from test_source_assembly_association import setup
+from test_source_assembly_association import roles, setup
 
 CODE = 'import argparse\np = argparse.ArgumentParser()\np.add_argument("--input")\np.add_argument("--output")\n'
 
@@ -32,6 +32,7 @@ def authored(parser_code=CODE):
             assert options == {"max_tokens": 8192, "response_format": {"type": "json_object"}}
             seen.append(json.loads(text))
             return SimpleNamespace(output_text=json.dumps({"parser_code": parser_code,
+                                                           "document_roles": roles(store, sources),
                                                            "assembly_associations": associations}))
 
     result = CandidateAuthoringService("xlsx-demo", store,

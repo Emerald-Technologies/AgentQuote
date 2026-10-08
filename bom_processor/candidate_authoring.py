@@ -219,8 +219,10 @@ class CandidateAuthoringService:
                     sources.append({"sha256": fixture["sha256"].lower(), "bytes": data,
                                     "extension": fixture["blob_path"].rsplit(".", 1)[-1].lower()})
                 bundle = self.model.generate_bundle(prompt, sources)
-                if not isinstance(bundle, dict) or set(bundle) != {"parser_code", "assembly_associations"}:
+                if not isinstance(bundle, dict) or set(bundle) != {
+                        "document_roles", "parser_code", "assembly_associations"}:
                     raise AuthoringError("AUTHORING_BUNDLE_INVALID")
+                roles = self._verified_roles(bundle["document_roles"], sources)
                 associations = bundle["assembly_associations"]
                 if not isinstance(associations, dict) or set(associations) != {item["sha256"] for item in sources}:
                     raise AuthoringError("ASSOCIATION_COVERAGE_INVALID")
@@ -279,6 +281,8 @@ class CandidateAuthoringService:
         if association_bytes is not None:
             manifest["assembly_associations"] = {"blob_path": f"{base}/assembly-associations.json",
                                                 "sha256": association_hash, "size_bytes": len(association_bytes)}
+        if getattr(self, "document_roles_ref", None) is not None:
+            manifest["document_roles"] = self.document_roles_ref
         manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         try:
             _write(self.storage, f"{base}/parse.py", code, "text/x-python")
@@ -292,6 +296,37 @@ class CandidateAuthoringService:
         except BlobConflictError:
             raise AuthoringError("CANDIDATE_CONFLICT") from None
         return AuthoringResult(self.request_id, candidate_id, f"{base}/candidate-manifest.json")
+
+    def _verified_roles(self, proposals: Any, sources: list[dict[str, Any]]) -> dict[str, Any]:
+        """Byte-verify agent role proposals; record them; only all-BOM requests continue.
+
+        Package plans cannot yet exclude a source, so a non-BOM role stops this
+        request with a stable code and durable evidence instead of a parser.
+        """
+        if not isinstance(proposals, dict) or set(proposals) != {item["sha256"] for item in sources}:
+            raise AuthoringError("DOCUMENT_ROLE_COVERAGE_INVALID")
+        from .document_role import verify_document_role
+        verified = {}
+        for item in sources:
+            with failure_stage("document_role"):
+                verified[item["sha256"]] = verify_document_role(
+                    item["bytes"], "." + item["extension"], proposals[item["sha256"]])
+        data = json.dumps(verified, sort_keys=True, separators=(",", ":")).encode()
+        if len(data) > 1_000_000:
+            raise AuthoringError("DOCUMENT_ROLE_ARTIFACT_LIMIT")
+        digest = hashlib.sha256(data).hexdigest()
+        path = f"candidates/{self.request_id}/document-roles/{digest}.json"
+        try:
+            _write(self.storage, path, data, "application/json")
+        except BlobConflictError:
+            pass  # Same bytes at a content-addressed path: an identical replay.
+        self.document_roles_ref = {"blob_path": path, "sha256": digest, "size_bytes": len(data)}
+        if any(item["has_blocking_findings"] for item in verified.values()):
+            raise AuthoringError("DOCUMENT_ROLE_REVIEW_REQUIRED")
+        kinds = {item["role"] for item in verified.values()}
+        if kinds != {"bom"}:
+            raise AuthoringError("SOURCE_NOT_BOM" if "bom" not in kinds else "SOURCE_ROLES_MIXED_REVIEW_REQUIRED")
+        return verified
 
     @staticmethod
     def _validate_request(value: Any) -> None:
