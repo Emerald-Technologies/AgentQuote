@@ -169,6 +169,28 @@ def test_two_assemblies_unrelated_filenames_documents_and_richer_bom_resolve():
     assert {item["assembly_identity"]["name"] for item in resolved["results"]} == {"asm-100", "asm-200"}
 
 
+def test_identifier_cited_within_a_labelled_cell():
+    source = workbook([["Assembly Part Number:ASM-100-01", "Customer:ACME", "Revision:013"]])
+    base = {"version": VERSION, "source_sha256": hashlib.sha256(source).hexdigest(),
+            "rationale": "Header block declares the assembly and revision.", "findings": []}
+    cell = lambda column: {"sheet": "Customer", "row": 1, "column": column}
+    verified = verify_association(source, ".xlsx", {**base,
+        "name": {"value": "ASM-100-01", "cell": cell(1)}, "revision": {"value": "013", "cell": cell(3)}})
+    assert verified["assembly_identity"] == {"name": "asm-100-01", "revision": "013"}
+    assert verified["within_cell_fields"] == ["name", "revision"]
+    for name, column in [("ASM-100-0", 1), ("SM-100-01", 1), ("ASM-100-01", 2), ("ACME Corp", 2)]:
+        with pytest.raises(AssociationError, match="ASSOCIATION_SOURCE_VALUE_CHANGED"):
+            verify_association(source, ".xlsx", {**base, "name": {"value": name, "cell": cell(column)},
+                                                 "revision": None})
+
+
+def test_whole_cell_citation_evidence_is_unchanged():
+    store, sources, associations, _ = setup()
+    verified = verify_association(store.sources[sources[0]["blob_path"]], ".xlsx",
+                                  associations[sources[0]["sha256"]])
+    assert "within_cell_fields" not in verified
+
+
 def test_material_conflict_is_an_exception_not_a_mapping_failure():
     store, _, _, service = setup(conflict=True)
     result = service.validate()

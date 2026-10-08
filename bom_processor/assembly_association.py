@@ -5,6 +5,7 @@ byte-bound association evidence, not semantic approval. Run association pytest.
 """
 from __future__ import annotations
 
+import re
 from hashlib import sha256
 from typing import Any
 
@@ -16,6 +17,16 @@ VERSION = "source-assembly-association.v1"
 
 class AssociationError(ValueError):
     """Stable failure without customer values."""
+
+
+def _within_cell(value: str, cell_text: str) -> bool:
+    """True when value appears in the cell as a whole token: not glued to letters/digits.
+
+    Accepts 'Assembly Part:006-002022-01' or 'Revision:013' for the cited value;
+    refuses '06' inside '006' and other partial tokens.
+    """
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(value) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, cell_text) is not None
 
 
 def verify_association(source: bytes, extension: str, proposal: Any) -> dict[str, Any]:
@@ -30,6 +41,7 @@ def verify_association(source: bytes, extension: str, proposal: Any) -> dict[str
             or len(proposal["findings"]) > 100):
         raise AssociationError("ASSOCIATION_BINDING_INVALID")
     inventory = extract_inventory(source, extension)
+    within_cell: list[str] = []
 
     def value(field: str) -> str:
         ref = proposal[field]
@@ -45,8 +57,12 @@ def verify_association(source: bytes, extension: str, proposal: Any) -> dict[str
                 or type(cell["row"]) is not int or type(cell["column"]) is not int):
             raise AssociationError("ASSOCIATION_LOCATOR_INVALID")
         actual = inventory.cells.get((cell["sheet"], cell["row"], cell["column"]))
-        if actual is None or str(actual).strip() != ref["value"]:
+        if actual is None:
             raise AssociationError("ASSOCIATION_SOURCE_VALUE_CHANGED")
+        if str(actual).strip() != ref["value"]:
+            if not _within_cell(ref["value"], str(actual)):
+                raise AssociationError("ASSOCIATION_SOURCE_VALUE_CHANGED")
+            within_cell.append(field)
         return ref["value"]
 
     name, revision = value("name"), value("revision")
@@ -62,7 +78,11 @@ def verify_association(source: bytes, extension: str, proposal: Any) -> dict[str
                 or not 0 < len(finding["rationale"]) <= 2000):
             raise AssociationError("ASSOCIATION_FINDING_INVALID")
         blocking |= finding["severity"] == "blocking"
-    return {"version": VERSION, "source_sha256": inventory.sha256,
-            "assembly_identity": {"name": normalized[0], "revision": normalized[1]},
-            "source_values_verified": True, "has_blocking_findings": blocking,
-            "semantic_acceptance": "not_evaluated", "proposal": proposal}
+    result = {"version": VERSION, "source_sha256": inventory.sha256,
+              "assembly_identity": {"name": normalized[0], "revision": normalized[1]},
+              "source_values_verified": True, "has_blocking_findings": blocking,
+              "semantic_acceptance": "not_evaluated", "proposal": proposal}
+    if within_cell:
+        # Only present for part-of-cell citations, so whole-cell evidence is unchanged.
+        result["within_cell_fields"] = within_cell
+    return result
