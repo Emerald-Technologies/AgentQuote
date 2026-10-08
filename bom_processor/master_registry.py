@@ -309,6 +309,24 @@ def _bounded_zip_read(archive: zipfile.ZipFile, name: str) -> bytes:
     return data
 
 
+def _internal_part(target: str, mode: str) -> str | None:
+    """Resolve a workbook relationship target to a part name inside the package, or None.
+
+    Targets are relative to `xl/` (the workbook's folder) or package-absolute (`/...`).
+    Any internal part is allowed, e.g. `xl/worksheets/...` or `../customXml/item1.xml`
+    (written by Office/SharePoint). Refused: external targets, empty targets,
+    backslashes, URI schemes or drive letters, and anything resolving outside the package.
+    Only worksheet targets that exist in the archive are ever read.
+    """
+    if mode != "Internal" or not target or "\\" in target or ":" in target:
+        return None
+    resolved = (posixpath.normpath(target.lstrip("/")) if target.startswith("/")
+                else posixpath.normpath(posixpath.join("xl", target)))
+    if resolved in (".", "..") or resolved.startswith(("../", "/")):
+        return None
+    return resolved
+
+
 def _column_index(reference: str) -> int:
     match = re.match(r"([A-Z]+)", reference.upper())
     if not match: return 0
@@ -337,13 +355,8 @@ def _xlsx_profile(data: bytes):
             targets = {}
             for relationship in relationships.findall("p:Relationship", namespace):
                 target = relationship.attrib.get("Target", "")
-                if relationship.attrib.get("TargetMode", "Internal") != "Internal" or target.startswith("\\"):
-                    raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "unsafe_relationship"})
-                # OOXML writers may use either package-absolute `/xl/...` or
-                # workbook-relative `worksheets/...` relationship targets.
-                resolved = (posixpath.normpath(target.lstrip("/")) if target.startswith("/")
-                            else posixpath.normpath(posixpath.join("xl", target)))
-                if resolved.startswith("../") or not resolved.startswith("xl/"):
+                resolved = _internal_part(target, relationship.attrib.get("TargetMode", "Internal"))
+                if resolved is None:
                     raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "unsafe_relationship"})
                 targets[relationship.attrib.get("Id", "")] = resolved
             shared = []
@@ -356,7 +369,8 @@ def _xlsx_profile(data: bytes):
             for sheet in workbook.findall("m:sheets/m:sheet", namespace)[:32]:
                 name = sheet.attrib.get("name", "Sheet")[:128]
                 target = targets.get(sheet.attrib.get(relation_attribute, ""))
-                if not target or target not in names: continue
+                # Sheets are only ever read from xl/ (unchanged rule); other internal parts are never read.
+                if not target or not target.startswith("xl/") or target not in names: continue
                 root = ElementTree.fromstring(_bounded_zip_read(archive, target))
                 rows = []
                 for row in root.findall(".//m:sheetData/m:row", namespace)[:MAX_HEADER_ROWS]:

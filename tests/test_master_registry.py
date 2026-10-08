@@ -90,6 +90,69 @@ def test_xlsx_rejects_unsafe_relationship_and_zip_bounds():
         profile_bytes(output.getvalue(), ".xlsx")
 
 
+def _with_extra_relationships(extra: str, extra_parts=()) -> bytes:
+    """Synthetic xlsx whose workbook rels carry extra relationships (Office/SharePoint shape)."""
+    data = xlsx_inline()
+    source = zipfile.ZipFile(io.BytesIO(data))
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for info in source.infolist():
+            value = source.read(info.filename)
+            if info.filename.endswith("workbook.xml.rels"):
+                value = value.replace(b"</Relationships>", extra.encode() + b"</Relationships>")
+            archive.writestr(info.filename, value)
+        for name, value in extra_parts:
+            archive.writestr(name, value)
+    return output.getvalue()
+
+
+def test_xlsx_accepts_internal_custom_xml_relationships_outside_xl():
+    # Regression (QQ-26-A030): Office/SharePoint workbooks link customXml parts at the
+    # package root via "../customXml/itemN.xml". These are internal and must not refuse the file.
+    extra = "".join(f'<Relationship Id="rId{n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml" Target="../customXml/item{n}.xml"/>' for n in (2, 3, 4))
+    parts = [(f"customXml/item{n}.xml", b'<?xml version="1.0"?><root/>') for n in (2, 3, 4)]
+    profile = profile_bytes(_with_extra_relationships(extra, parts), ".xlsx")
+    assert profile.sheet_names == ("BOM",)
+    assert profile.header_candidates["BOM"][0] == ("part_number", "description", "quantity")
+    assert profile.profile_hash == profile_bytes(xlsx_inline(), ".xlsx").profile_hash
+    absolute = '<Relationship Id="rId9" Type="customXml" Target="/customXml/item9.xml"/>'
+    assert profile_bytes(_with_extra_relationships(absolute), ".xlsx").sheet_names == ("BOM",)
+
+
+@pytest.mark.parametrize("relationship", [
+    '<Relationship Id="rId9" Type="customXml" Target="../../outside.xml"/>',
+    '<Relationship Id="rId9" Type="customXml" Target="/../outside.xml"/>',
+    '<Relationship Id="rId9" Type="customXml" Target=".."/>',
+    '<Relationship Id="rId9" Type="customXml" Target=""/>',
+    '<Relationship Id="rId9" Type="customXml" Target="..\\customXml\\item1.xml"/>',
+    '<Relationship Id="rId9" Type="customXml" Target="file:///C:/x.xml"/>',
+    '<Relationship Id="rId9" Type="customXml" Target="C:/x.xml"/>',
+    '<Relationship Id="rId9" Type="hyperlink" Target="https://example.invalid/x" TargetMode="External"/>',
+])
+def test_xlsx_still_refuses_external_escaping_and_malformed_relationships(relationship):
+    with pytest.raises(RegistryError, match="PARSER_FORMAT_NOT_RECOGNIZED") as error:
+        profile_bytes(_with_extra_relationships(relationship), ".xlsx")
+    assert error.value.details == {"reason": "unsafe_relationship"}
+
+
+def test_xlsx_never_reads_a_sheet_outside_xl():
+    data = xlsx_inline()
+    source = zipfile.ZipFile(io.BytesIO(data))
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for info in source.infolist():
+            value = source.read(info.filename)
+            name = info.filename
+            if name.endswith("workbook.xml.rels"):
+                value = value.replace(b"worksheets/sheet1.xml", b"../other/sheet1.xml")
+            if name == "xl/worksheets/sheet1.xml":
+                name = "other/sheet1.xml"
+            archive.writestr(name, value)
+    profile = profile_bytes(output.getvalue(), ".xlsx")
+    assert profile.sheet_names == ("Sheet1",)
+    assert profile.header_candidates == {"Sheet1": ()}
+
+
 def test_selection_is_parser_scoped_exact_one_no_match_and_ambiguous(tmp_path):
     sig = signature()
     code, _, candidate, approval = records()
