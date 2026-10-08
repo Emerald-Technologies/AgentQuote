@@ -39,6 +39,27 @@ ROLE_DEFINITIONS = (
 )
 
 
+# Heuristics for reading a BOM, given to the agent as judgment aids (Nick, 2026-10-08).
+# Deliberately not rules: every file is reasoned about case by case.
+BOM_READING_GUIDANCE = (
+    "Reading a BOM is judgment, not a fixed recipe; reason about each file case by case. "
+    "First work out, from the data, what identifies one BOM line in this file. It differs between files, "
+    "and every sign below is only usually true. A line or find number repeated on consecutive rows usually "
+    "marks one line with alternate manufacturers. An item or part number may repeat on every alternate row, "
+    "or appear only on the first row of the line. A numbered column does not necessarily give one number per "
+    "line: consecutive numbers can still be one line whose later rows only add alternate manufacturer part "
+    "numbers, while description, quantity and internal part number stay blank or unchanged. A row that only "
+    "adds a manufacturer and part number is usually an alternate of the line above. Columns may be unlabeled, "
+    "duplicated or misleadingly labeled; decide each column's meaning from its values. There may be several "
+    "quantity-like columns: choose the per-assembly quantity by reasoning from the values, for example a "
+    "numeric column derived from a text one; formula_cells shows which cells were computed by a formula, which "
+    "often explains such duplicates. Reference designators are often missing, present in only one of several "
+    "files, or unreliable; use them as supporting evidence only, never as the identity of a line. When a "
+    "choice is uncertain, make the most reasonable one and add a warning finding that explains it; never "
+    "guess silently and never invent values."
+)
+
+
 class DocumentRoleError(ValueError):
     """Stable failure without customer values."""
 

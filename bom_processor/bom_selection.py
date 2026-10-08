@@ -1,8 +1,11 @@
-"""Compare parsed BOMs by content and choose one primary BOM per assembly.
+"""Deterministic cross-check of parsed BOMs: alignment counts and a containment check.
 
-Inputs: canonical parsed rows (core.CANONICAL_COLUMNS) of BOMs. Output: bounded
-alignment evidence and a primary choice, or no choice. Pure, deterministic,
-stdlib only; no I/O. Run python -m pytest tests/test_bom_selection.py.
+Inputs: canonical parsed rows (core.CANONICAL_COLUMNS), i.e. after the agent's
+parser has decided what one BOM line is. Output: bounded evidence. Reading the
+source (line identity, alternates, quantity) is the agent's judgment; this
+module only checks the parsed results against each other and must not be the
+sole basis for a choice. Pure, stdlib only; no I/O.
+Run python -m pytest tests/test_bom_selection.py.
 
 Lines are matched by part identity, the way a person reads a BOM:
 1. manufacturer part number: lines sharing one, unique within each BOM;

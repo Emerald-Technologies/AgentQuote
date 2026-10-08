@@ -210,7 +210,7 @@ class FoundryModelAuthor:
             if context_chars > 120_000:
                 raise ValueError("AUTHORING_SOURCE_CONTEXT_LIMIT")
             contexts.append({"source_sha256": item["sha256"], "inventory": json.loads(inventory)})
-        from .document_role import ROLE_DEFINITIONS, VERSION as ROLE_VERSION
+        from .document_role import BOM_READING_GUIDANCE, ROLE_DEFINITIONS, VERSION as ROLE_VERSION
         user_text = json.dumps({"columns": prompt.canonical_columns, "rules": prompt.rules,
                                "sources": contexts}, ensure_ascii=False)
         if len(user_text) > 120_000:
@@ -227,7 +227,9 @@ class FoundryModelAuthor:
             "{sheet,row,column}} that show the role. findings is a list of {code,severity,rationale}. "
             + ROLE_DEFINITIONS + " "
             "Write parser_code and assembly associations for the bom sources; for a source that is not a bom, "
-            "its association may have null name and must not invent BOM rows. parser_code is a "
+            "its association may have null name and must not invent BOM rows. "
+            + BOM_READING_GUIDANCE + " Report such BOM-reading findings in that source's association "
+            "findings. parser_code is a "
             "Python source string obeying the supplied output rules. assembly_associations is an object keyed "
             "by every unique source_sha256. Each value has exactly version='source-assembly-association.v1', "
             "source_sha256, name, revision, rationale, findings. name is {value: original assembly identifier, "

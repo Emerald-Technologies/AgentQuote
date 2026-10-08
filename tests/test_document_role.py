@@ -33,6 +33,28 @@ def test_definitions_are_broad_guidance_for_bom_and_mpi():
         assert phrase in text
 
 
+def test_bom_reading_guidance_is_sent_with_every_bundle(monkeypatch):
+    from types import SimpleNamespace
+    from bom_processor.document_role import BOM_READING_GUIDANCE
+    from bom_processor.foundry_author import FoundryModelAuthor
+    monkeypatch.setattr("bom_processor.foundry_author.build_complete_inventory", lambda *_: '{"sheets":[]}')
+    seen = []
+
+    class Agent:
+        def __init__(self, **kwargs):
+            seen.append(kwargs["instructions"])
+
+        async def run(self, *_args, **_kwargs):
+            return SimpleNamespace(output_text="{}")
+    FoundryModelAuthor(agent_factory=Agent).generate_bundle(SimpleNamespace(canonical_columns=(), rules=()),
+        [{"bytes": b"synthetic", "extension": "xlsx", "sha256": "a" * 64}])
+    assert BOM_READING_GUIDANCE in seen[0] and ROLE_DEFINITIONS in seen[0]
+    text = BOM_READING_GUIDANCE.casefold()
+    for phrase in ("case by case", "identifies one bom line", "repeated on consecutive rows",
+                   "alternate", "formula_cells", "supporting evidence only", "warning finding"):
+        assert phrase in text
+
+
 def test_cited_values_are_verified_against_source_bytes():
     store, sources, _, _ = setup()
     source = store.sources[sources[0]["blob_path"]]
