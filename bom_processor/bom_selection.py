@@ -4,14 +4,15 @@ Inputs: canonical parsed rows (core.CANONICAL_COLUMNS) of BOMs. Output: bounded
 alignment evidence and a primary choice, or no choice. Pure, deterministic,
 stdlib only; no I/O. Run python -m pytest tests/test_bom_selection.py.
 
-Rows are aligned by data, not by column names or exact text:
-1. placed lines by their exact reference-designator set (simple ranges such as
-   R1-R4 are expanded);
-2. the item-number relation between aligned lines is learned (identical, or one
-   side carries a fixed prefix/suffix) and must hold one-to-one on every aligned
-   line before it is used;
-3. unplaced lines (no reference designators) by transformed item number, then
-   by manufacturer part number.
+Lines are matched by part identity, the way a person reads a BOM:
+1. manufacturer part number: lines sharing one, unique within each BOM;
+2. item number, after learning the relation between the two BOMs' item
+   numbers from the lines matched in step 1 (identical, or one side carries a
+   fixed prefix/suffix). The relation must hold one-to-one on every such line
+   before it is used.
+Reference designators are optional and not relied on: they may be missing from
+one or both BOMs. They never match lines and never cause a conflict; when both
+lines carry them, agreement is only counted as supporting evidence.
 A BOM is redundant only when every one of its lines is found in the primary
 with no conflicting quantity or part number. Anything else is never decided here.
 """
@@ -23,13 +24,14 @@ from typing import Any, Iterable, Mapping
 
 from .semantic import _norm, _number
 
-VERSION = "bom-content-alignment.v1"
+VERSION = "bom-content-alignment.v2"
 _RANGE = re.compile(r"^([a-z]+)(\d+)-([a-z]*)(\d+)$")
 _MAX_RANGE = 500
 _MAX_EXAMPLES = 10
 
 
 def _refdes(value: Any) -> frozenset[str]:
+    """Supporting evidence only; simple ranges such as R1-R4 are expanded."""
     tokens: set[str] = set()
     for token in re.split(r"[,;\s]+", _norm(value)):
         if not token:
@@ -50,7 +52,7 @@ def _mpns(row: Mapping[str, Any]) -> frozenset[str]:
 
 
 class _Line:
-    __slots__ = ("index", "item", "refdes", "mpns", "quantity", "category", "filled")
+    __slots__ = ("index", "item", "refdes", "mpns", "quantity", "filled")
 
     def __init__(self, index: int, row: Mapping[str, Any]):
         self.index = index
@@ -58,7 +60,6 @@ class _Line:
         self.refdes = _refdes(row.get("reference_designator"))
         self.mpns = _mpns(row)
         self.quantity = _number(row.get("quantity"))
-        self.category = _norm(row.get("item_category"))
         self.filled = sum(1 for value in row.values() if _norm(value))
 
 
@@ -67,8 +68,13 @@ def _lines(rows: Iterable[Mapping[str, Any]]) -> list[_Line]:
 
 
 def _transform(pairs: list[tuple[str, str]]) -> dict[str, Any] | None:
-    """Learn one item-number relation that holds one-to-one on every aligned pair."""
-    if not pairs or any(not left or not right for left, right in pairs):
+    """Learn one item-number relation that holds one-to-one on every pair.
+
+    Lines where either side has no item number carry no evidence and are skipped;
+    at least one pair with both item numbers is required.
+    """
+    pairs = [(left, right) for left, right in pairs if left and right]
+    if not pairs:
         return None
     if len({left for left, _ in pairs}) != len(pairs) or len({right for _, right in pairs}) != len(pairs):
         return None
@@ -93,25 +99,29 @@ def _transform(pairs: list[tuple[str, str]]) -> dict[str, Any] | None:
     return None
 
 
-def _apply(transform: dict[str, Any] | None, value: str, side: str) -> str | None:
-    """Map an item number to the left BOM's form; None when no relation is proven."""
+def _to_left(transform: dict[str, Any] | None, value: str) -> str | None:
+    """Map a right-side item number to the left BOM's form; None without a proven relation."""
     if transform is None or not value:
         return None
     if transform["kind"] == "identical":
         return value
-    affix = transform["affix"]
-    if transform["carried_by"] == side:
-        return value
-    return affix + value if transform["kind"] == "prefix" else value + affix
+    affix, prefix = transform["affix"], transform["kind"] == "prefix"
+    if transform["carried_by"] == "left":  # left = affix + right (or right + affix)
+        return affix + value if prefix else value + affix
+    if prefix:                              # right = affix + left
+        return value[len(affix):] if value.startswith(affix) else None
+    return value[:-len(affix)] if value.endswith(affix) else None
 
 
-def _same_line(left: _Line, right: _Line) -> str | None:
-    """None when consistent, else the conflicting attribute."""
-    if left.quantity and right.quantity and left.quantity != right.quantity:
-        return "quantity"
-    if left.mpns and right.mpns and not left.mpns & right.mpns:
-        return "manufacturer_part_number"
-    return None
+def _unique(lines: list[_Line], key) -> dict[Any, _Line]:
+    """Index lines by key, dropping any key that is not unique within the BOM."""
+    counts = Counter(k for line in lines for k in key(line))
+    result = {}
+    for line in lines:
+        for k in key(line):
+            if counts[k] == 1:
+                result[k] = line
+    return result
 
 
 def align_boms(left_rows: Iterable[Mapping[str, Any]],
@@ -122,75 +132,72 @@ def align_boms(left_rows: Iterable[Mapping[str, Any]],
     subset: the reverse. overlap: neither contains the other, no conflicts.
     """
     left, right = _lines(left_rows), _lines(right_rows)
-    matches: list[tuple[_Line, _Line]] = []
+    pairs: dict[int, _Line] = {}          # right index -> left line
+    taken: set[int] = set()               # left indexes already matched
+    basis: Counter = Counter()
+
+    def pair(a: _Line, b: _Line, how: str) -> None:
+        pairs[b.index] = a
+        taken.add(a.index)
+        basis[how] += 1
+
+    # 1. Manufacturer part number, unique within each BOM.
+    left_by_mpn = _unique(left, lambda line: line.mpns)
+    for line in right:
+        found = {left_by_mpn[mpn].index: left_by_mpn[mpn] for mpn in line.mpns if mpn in left_by_mpn}
+        if len(found) == 1:
+            candidate = next(iter(found.values()))
+            if candidate.index not in taken:
+                pair(candidate, line, "manufacturer_part_number")
+    # 2. Item number under the relation proven on the part-number matches; with
+    #    no part numbers at all, only identical item numbers are trusted.
+    learned = [(pairs[index].item, line.item) for index, line in enumerate(right) if index in pairs]
+    transform = _transform(learned) if learned else {"kind": "identical"}
+    relation_basis = ("learned_from_part_numbers" if learned and transform else
+                      "not_proven" if learned else "identical_only")
+    left_by_item = _unique(left, lambda line: (line.item,) if line.item else ())
+    for line in right:
+        if line.index in pairs:
+            continue
+        key = _to_left(transform, line.item)
+        candidate = left_by_item.get(key) if key else None
+        if candidate is not None and candidate.index not in taken:
+            pair(candidate, line, "item_number")
     conflicts: list[dict[str, Any]] = []
-    split_refdes = 0
-    left_placed = {line.refdes: line for line in left if line.refdes}
-    used_left: set[int] = set()
-    used_right: set[int] = set()
-    duplicates = (len(left_placed) != sum(1 for line in left if line.refdes)
-                  or len({line.refdes for line in right if line.refdes})
-                  != sum(1 for line in right if line.refdes))
-    for line in right:
-        if not line.refdes:
-            continue
-        other = left_placed.get(line.refdes)
-        if other is None:
-            if any(line.refdes & candidate for candidate in left_placed):
-                split_refdes += 1  # Same placements grouped differently: never guessed.
-            continue
-        matches.append((other, line))
-        used_left.add(other.index)
-        used_right.add(line.index)
-    transform = _transform([(a.item, b.item) for a, b in matches])
-    # Unplaced lines: item number under the proven relation, else part numbers.
-    remaining_left = [line for line in left if line.index not in used_left and not line.refdes]
-    by_item: dict[str, list[_Line]] = {}
-    by_mpn: dict[frozenset[str], list[_Line]] = {}
-    for line in remaining_left:
-        by_item.setdefault(line.item, []).append(line)
-        if line.mpns:
-            by_mpn.setdefault(line.mpns, []).append(line)
-    for line in right:
-        if line.index in used_right or line.refdes:
-            continue
-        key = _apply(transform, line.item, "right")
-        candidates = [item for item in by_item.get(key or "", []) if item.index not in used_left]
-        if not candidates and line.mpns:
-            candidates = [item for item in by_mpn.get(line.mpns, []) if item.index not in used_left]
-        if len(candidates) >= 1:
-            matches.append((candidates[0], line))
-            used_left.add(candidates[0].index)
-            used_right.add(line.index)
-    for a, b in matches:
-        attribute = _same_line(a, b)
-        if attribute is not None:
+    refdes_agree = refdes_compared = 0
+    for index, a in sorted(pairs.items()):
+        b = right[index]
+        attribute = None
+        if a.quantity and b.quantity and a.quantity != b.quantity:
+            attribute = "quantity"
+        elif a.mpns and b.mpns and not a.mpns & b.mpns:
+            attribute = "manufacturer_part_number"
+        if attribute:
             conflicts.append({"left_line": a.index + 1, "right_line": b.index + 1, "attribute": attribute})
-    left_only = [line.index + 1 for line in left if line.index not in used_left]
-    right_only = [line.index + 1 for line in right if line.index not in used_right]
-    left_refs = set().union(*(line.refdes for line in left)) if left else set()
-    right_refs = set().union(*(line.refdes for line in right)) if right else set()
-    if conflicts or split_refdes or duplicates:
+        if a.refdes and b.refdes:
+            refdes_compared += 1
+            refdes_agree += a.refdes == b.refdes
+    left_only = [line.index + 1 for line in left if line.index not in taken]
+    right_only = [line.index + 1 for line in right if line.index not in pairs]
+    if conflicts:
         relation = "conflict"
     elif not left_only and not right_only:
         relation = "identical"
-    elif not right_only and right_refs <= left_refs:
+    elif not right_only:
         relation = "superset"
-    elif not left_only and left_refs <= right_refs:
+    elif not left_only:
         relation = "subset"
     else:
         relation = "overlap"
-    placed_matches = sum(1 for a, _ in matches if a.refdes)
     return {"version": VERSION, "relation": relation,
-            "left_lines": len(left), "right_lines": len(right),
-            "matched_lines": len(matches), "matched_placed_lines": placed_matches,
+            "left_lines": len(left), "right_lines": len(right), "matched_lines": len(pairs),
+            "matched_by": dict(sorted(basis.items())),
             "left_only_lines": len(left_only), "right_only_lines": len(right_only),
             "left_only_examples": left_only[:_MAX_EXAMPLES], "right_only_examples": right_only[:_MAX_EXAMPLES],
-            "left_refdes": len(left_refs), "right_refdes": len(right_refs),
-            "left_only_refdes": len(left_refs - right_refs), "right_only_refdes": len(right_refs - left_refs),
             "conflicting_lines": len(conflicts), "conflict_examples": conflicts[:_MAX_EXAMPLES],
-            "split_refdes_lines": split_refdes, "duplicate_refdes_sets": duplicates,
-            "item_number_relation": transform}
+            "item_number_relation": transform, "item_number_relation_basis": relation_basis,
+            # Supporting only: counted where both matched lines carry designators.
+            "refdes_compared_lines": refdes_compared, "refdes_agreeing_lines": refdes_agree}
 
 
 def _completeness(rows: list[Mapping[str, Any]]) -> int:
@@ -218,8 +225,8 @@ def select_primary(boms: Mapping[str, list[Mapping[str, Any]]]) -> dict[str, Any
     def relation(a: str, b: str) -> str:
         if (a, b) in comparisons:
             return comparisons[(a, b)]["relation"]
-        return {"superset": "subset", "subset": "superset"}.get(comparisons[(b, a)]["relation"],
-                                                                comparisons[(b, a)]["relation"])
+        reverse = comparisons[(b, a)]["relation"]
+        return {"superset": "subset", "subset": "superset"}.get(reverse, reverse)
 
     containers = [key for key in keys
                   if all(relation(key, other) in ("identical", "superset") for other in keys if other != key)]
@@ -241,8 +248,8 @@ def attribute_undeclared(undeclared: list[Mapping[str, Any]],
     """Attribute a BOM that names no assembly to the one declared BOM that contains it.
 
     declared maps an assembly key to its candidate primary rows. Returns
-    {assembly: key or None, comparisons}; None unless exactly one assembly's BOM
-    contains (identical or superset) every line of the undeclared BOM.
+    {assembly: key or None, reason, comparisons}; None unless exactly one
+    assembly's BOM contains (identical or superset) every line of the undeclared BOM.
     """
     comparisons = {key: align_boms(rows, undeclared) for key, rows in sorted(declared.items())}
     containing = [key for key, value in comparisons.items() if value["relation"] in ("identical", "superset")]
