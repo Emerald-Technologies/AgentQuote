@@ -191,6 +191,19 @@ def test_duplicate_root_and_root_size_limit():
         build_inventory([supplied], limits=InventoryLimits(root_bytes=1))
 
 
+def test_default_limits_accept_root_over_previous_50mb_and_mirror_quickquote():
+    # Regression: a real 59 MB two-assembly package was refused at the old 50 MB root limit.
+    # Values must equal QuickQuote PACKAGE_EVIDENCE_INVENTORY_LIMITS.
+    limits = InventoryLimits()
+    assert (limits.root_bytes, limits.member_bytes, limits.aggregate_bytes) == (100_000_000, 50_000_000, 500_000_000)
+    big = b"\x01" * 60_000_000
+    assert len(build_inventory([root(big, "package.bin")])) == 1
+    with pytest.raises(PackageEvidenceError, match="BYTE_LIMIT"):
+        build_inventory([root(b"\x01" * (limits.root_bytes + 1), "package.bin")])
+    with pytest.raises(PackageEvidenceError):
+        InventoryLimits(root_bytes=limits.root_bytes + 1)
+
+
 def test_combined_root_expansion_budget_and_malformed_workbook_zip():
     data = archive([("member", b"x" * 100)])
     with pytest.raises(PackageEvidenceError, match="AGGREGATE"):

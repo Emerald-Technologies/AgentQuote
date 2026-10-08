@@ -7,6 +7,7 @@ tests/test_package_evidence_retention.py. No network or storage writes.
 import re
 
 from .package_evidence_contracts import hash_value, integer, require, strict, uuid_value
+from .package_evidence_inventory import ROOT_BYTES_LIMIT
 
 
 def validate_retained_sources(value, roots):
@@ -21,7 +22,7 @@ def validate_retained_sources(value, roots):
         strict(source, {"documentId", "sha256", "sizeBytes"})
         identity = uuid_value(source["documentId"])
         hash_value(source["sha256"])
-        integer(source["sizeBytes"], 0, 50_000_000)
+        integer(source["sizeBytes"], 0, ROOT_BYTES_LIMIT)
         root = by_id.get(identity)
         require(identity not in seen and root is not None
                 and all(root[k] == source[k] for k in ("sha256", "sizeBytes"))

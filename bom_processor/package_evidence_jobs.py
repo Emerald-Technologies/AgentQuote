@@ -15,6 +15,7 @@ from .package_evidence_contracts import (
     assemblies_metadata, detached, digest, failure_causes, hash_value, integer, json_bytes, object_hash, require,
     strict, text, uuid_value,
 )
+from .package_evidence_inventory import AGGREGATE_BYTES_LIMIT, ROOT_BYTES_LIMIT
 from .package_evidence_proposal import produce_proposal
 
 VERSION = "package-evidence-request.v1"
@@ -76,7 +77,7 @@ def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], po
             require(identity not in seen, "DUPLICATE_REFERENCE")
             seen.add(identity)
             sha = hash_value(item["sha256"])
-            integer(item["sizeBytes"], 0, 50_000_000)
+            integer(item["sizeBytes"], 0, ROOT_BYTES_LIMIT)
             require(item["blobPath"] == f"{prefix}{identity}/{sha}", "INVALID_BLOB_REFERENCE")
             if files:
                 name = text(item["fileName"])
@@ -92,7 +93,7 @@ def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], po
     require({w["documentId"] for w in workbooks} == set(expected), "WORKBOOK_COVERAGE")
     for book in workbooks:
         require({k: book[k] for k in ("documentId", "sha256", "sizeBytes")} == expected[book["documentId"]], "WORKBOOK_BINDING")
-    require(sum(r["sizeBytes"] for r in locations.values()) <= 200_000_000, "REQUEST_BYTE_LIMIT")
+    require(sum(r["sizeBytes"] for r in locations.values()) <= AGGREGATE_BYTES_LIMIT, "REQUEST_BYTE_LIMIT")
     body = {"version": VERSION, "context": context, "roots": roots, "workbooks": workbooks, "policy": detached(policy)}
     require((policy["policyVersion"] in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
     if retained_bom_sources is not None:

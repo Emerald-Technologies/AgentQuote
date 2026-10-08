@@ -18,19 +18,26 @@ from .package_evidence_contracts import (
 )
 
 
+# Single source for evidence byte limits; mirrors QuickQuote PACKAGE_EVIDENCE_INVENTORY_LIMITS
+# (plan 2026-10-07 section 5.2, Phase L1). Whole buffers are held, so these bound memory.
+ROOT_BYTES_LIMIT = 100_000_000
+MEMBER_BYTES_LIMIT = 50_000_000
+AGGREGATE_BYTES_LIMIT = 500_000_000
+
+
 @dataclass(frozen=True)
 class InventoryLimits:
     depth: int = 5
     members: int = 10_000
-    root_bytes: int = 50_000_000
-    member_bytes: int = 50_000_000
-    aggregate_bytes: int = 200_000_000
+    root_bytes: int = ROOT_BYTES_LIMIT
+    member_bytes: int = MEMBER_BYTES_LIMIT
+    aggregate_bytes: int = AGGREGATE_BYTES_LIMIT
     ratio: int = 200
     evidence: int = 10_000
     excerpt_chars: int = 2000
 
     def __post_init__(self) -> None:
-        ceilings = (5, 10_000, 50_000_000, 50_000_000, 200_000_000, 200, 10_000, 2000)
+        ceilings = (5, 10_000, ROOT_BYTES_LIMIT, MEMBER_BYTES_LIMIT, AGGREGATE_BYTES_LIMIT, 200, 10_000, 2000)
         for value, ceiling in zip(self.__dict__.values(), ceilings):
             integer(value, 1, ceiling)
 
