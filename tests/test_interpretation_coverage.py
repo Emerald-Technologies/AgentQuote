@@ -132,7 +132,8 @@ def test_inventory_includes_every_sheet_and_never_evaluates_formula():
     inventory = extract_inventory(source, ".xlsx")
     assert inventory.sheets == ("BOM", "Notes")
     assert inventory.cells[("Notes", 1, 1)] == "Supporting evidence"
-    with pytest.raises(InventoryError, match="SOURCE_FORMULA_OR_ERROR"):
+    # openpyxl writes no stored result, so the value is unknowable without evaluation.
+    with pytest.raises(InventoryError, match="SOURCE_FORMULA_RESULT_MISSING"):
         extract_inventory(xlsx([["=1+1"]]), ".xlsx")
     with pytest.raises(InventoryError, match="SOURCE_FORMAT_UNSUPPORTED"):
         extract_inventory(source, ".xlsm")
@@ -183,6 +184,52 @@ def test_sparse_dimensions_rejected_before_workbook_materialization():
         extract_inventory(stream.getvalue(), ".xlsx")
 
 
-def test_binary_xls_rejected_without_reader_allocation():
-    with pytest.raises(InventoryError, match="BINARY_XLS_FORMULA_PROVENANCE_UNSUPPORTED"):
+def _with_stored_results(source, results):
+    """Add Excel-style stored results (<v>) to formula cells, as Excel does on save."""
+    import re
+    import zipfile
+    archive = zipfile.ZipFile(io.BytesIO(source))
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as output:
+        for name in archive.namelist():
+            data = archive.read(name)
+            if name.startswith("xl/worksheets/"):
+                text = data.decode()
+                for ref, (kind, value) in results.items():
+                    text = re.sub(rf'<c r="{ref}"([^>]*)><f>([^<]*)</f><v\s*/>',
+                                  rf'<c r="{ref}"\1 t="{kind}"><f>\2</f><v>{value}</v>', text)
+                    text = re.sub(rf'<c r="{ref}"([^>]*)><f>([^<]*)</f></c>',
+                                  rf'<c r="{ref}"\1 t="{kind}"><f>\2</f><v>{value}</v></c>', text)
+                data = text.encode()
+            output.writestr(name, data)
+    return stream.getvalue()
+
+
+def test_formula_cells_use_stored_result_and_are_recorded():
+    source = _with_stored_results(xlsx([["Part", "Qty"], ["A", "=1+1"]]), {"B2": ("n", "2")})
+    inventory = extract_inventory(source, ".xlsx")
+    assert inventory.cells[("BOM", 2, 2)] == 2
+    assert inventory.formula_cells == frozenset({("BOM", 2, 2)})
+    assert inventory.formula_cells_known is True
+
+
+def test_formula_with_stored_error_is_refused():
+    source = _with_stored_results(xlsx([["Part", "Qty"], ["A", "=1/0"]]), {"B2": ("e", "#DIV/0!")})
+    with pytest.raises(InventoryError, match="SOURCE_ERROR_CELL"):
+        extract_inventory(source, ".xlsx")
+
+
+def test_parser_output_with_formula_is_refused():
+    source, output, proposal = fixture()
+    from openpyxl import load_workbook
+    book = load_workbook(io.BytesIO(output)); book["Parsed"].cell(2, 7).value = "=0+1"
+    stream = io.BytesIO(); book.save(stream); book.close()
+    output = _with_stored_results(stream.getvalue(), {"G2": ("n", "1")})
+    proposal["output"].update(sha256=sha256(output).hexdigest(), size_bytes=len(output))
+    with pytest.raises(CoverageError, match="OUTPUT_FORMULA_PRESENT"):
+        verify(source, output, proposal)
+
+
+def test_invalid_binary_xls_is_refused():
+    with pytest.raises(InventoryError, match="SOURCE_WORKBOOK_INVALID"):
         extract_inventory(b"\xd0\xcf\x11\xe0" + b"unused", ".xls")

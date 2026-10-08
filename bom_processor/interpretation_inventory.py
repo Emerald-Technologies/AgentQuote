@@ -1,6 +1,8 @@
 """Offline inert spreadsheet inventory; input bytes, output cell facts only.
 
-No network, formulas, macros or parser execution. Run interpretation tests with
+No network, macros or parser execution, and formulas are never evaluated: a
+formula cell contributes the result Excel stored in the file, and its location
+is recorded in formula_cells. Run interpretation tests with
 python -m pytest tests/test_interpretation_coverage.py from repository root.
 """
 from __future__ import annotations
@@ -15,7 +17,9 @@ from typing import Any
 
 from .master_registry import html_table_raw_rows, RegistryError
 
-EXTRACTION_VERSION = "bom-source-inventory.v1"
+# v2: formula cells carry their stored (cached) result and are listed in
+# formula_cells; v1 refused every workbook containing a formula.
+EXTRACTION_VERSION = "bom-source-inventory.v2"
 MAX_BYTES = 32 * 1024 * 1024
 MAX_ROWS = 100_000
 MAX_COLUMNS = 512
@@ -34,6 +38,11 @@ class SourceInventory:
     sheets: tuple[str, ...]
     cells: dict[tuple[str, int, int], str | int | float | bool]
     merged_ranges: tuple[tuple[str, str], ...] = ()
+    # Cells whose value is the stored result of a formula (never evaluated here).
+    formula_cells: frozenset[tuple[str, int, int]] = frozenset()
+    # False for binary .xls: the reader exposes stored values only, so which
+    # cells held formulas is unknown (never assumed to be none).
+    formula_cells_known: bool = True
 
 
 def _zip_guard(data: bytes) -> None:
@@ -78,6 +87,42 @@ def _zip_guard(data: bytes) -> None:
         raise InventoryError("SOURCE_WORKBOOK_INVALID") from exc
 
 
+def _binary_xls(data: bytes, add_sheet: Any) -> None:
+    """Stored values of a binary (OLE2) workbook; no macros, formulas or links run."""
+    import xlrd
+    try:
+        book = xlrd.open_workbook(file_contents=data, on_demand=True, formatting_info=False)
+    except Exception as exc:
+        raise InventoryError("SOURCE_WORKBOOK_INVALID") from exc
+    try:
+        if book.nsheets > MAX_SHEETS:
+            raise InventoryError("SOURCE_DIMENSION_LIMIT")
+        traversal = 0
+        for index in range(book.nsheets):
+            sheet = book.sheet_by_index(index)
+            traversal += sheet.nrows * sheet.ncols
+            if sheet.nrows > MAX_ROWS or sheet.ncols > MAX_COLUMNS or traversal > MAX_CELLS:
+                raise InventoryError("SOURCE_TRAVERSAL_LIMIT")
+            rows = []
+            for row in range(sheet.nrows):
+                values: list[Any] = []
+                for column in range(sheet.ncols):
+                    kind, value = sheet.cell_type(row, column), sheet.cell_value(row, column)
+                    if kind == xlrd.XL_CELL_ERROR:
+                        raise InventoryError("SOURCE_ERROR_CELL")
+                    if kind == xlrd.XL_CELL_BOOLEAN:
+                        value = bool(value)
+                    elif kind in (xlrd.XL_CELL_NUMBER, xlrd.XL_CELL_DATE) and float(value).is_integer():
+                        # The format stores every number as a float; 13.0 is shown as 13.
+                        value = int(value)
+                    values.append(value)
+                rows.append(values)
+            add_sheet(sheet.name, rows, sheet.nrows, sheet.ncols)
+            book.unload_sheet(index)
+    finally:
+        book.release_resources()
+
+
 def extract_inventory(data: bytes, extension: str) -> SourceInventory:
     """Read every supported sheet; limit/unsupported content is never truncated."""
     if not isinstance(data, bytes) or not 0 < len(data) <= MAX_BYTES:
@@ -85,6 +130,7 @@ def extract_inventory(data: bytes, extension: str) -> SourceInventory:
     cells: dict[tuple[str, int, int], Any] = {}
     sheets: list[str] = []
     merged: list[tuple[str, str]] = []
+    formulas: set[tuple[str, int, int]] = set()
     total_rows = 0
 
     def add_sheet(name: str, rows: Any, row_count: int, column_count: int) -> None:
@@ -112,20 +158,40 @@ def extract_inventory(data: bytes, extension: str) -> SourceInventory:
         # ZIP/dimension bounds precede cell traversal; merged anchors remain
         # explicit, never silently filled into other cells.
         book = load_workbook(io.BytesIO(data), data_only=False, keep_links=False)
+        # The same bytes opened for stored results; formulas are never evaluated.
+        cached = load_workbook(io.BytesIO(data), data_only=True, keep_links=False)
         try:
             for sheet in book.worksheets:
                 if sheet.max_row > MAX_ROWS or sheet.max_column > MAX_COLUMNS:
                     raise InventoryError("SOURCE_DIMENSION_LIMIT")
-                if any(cell.data_type in {"f", "e"} for row in sheet for cell in row):
-                    raise InventoryError("SOURCE_FORMULA_OR_ERROR")
+                stored = cached[sheet.title]
+                rows: list[list[Any]] = []
+                for row in sheet.iter_rows():
+                    values: list[Any] = []
+                    for cell in row:
+                        if cell.data_type == "e":
+                            raise InventoryError("SOURCE_ERROR_CELL")
+                        if cell.data_type != "f":
+                            values.append(cell.value)
+                            continue
+                        result = stored.cell(cell.row, cell.column)
+                        # A missing stored result is unknowable without evaluation.
+                        if result.value is None or result.value == "":
+                            raise InventoryError("SOURCE_FORMULA_RESULT_MISSING")
+                        if result.data_type == "e":
+                            raise InventoryError("SOURCE_ERROR_CELL")
+                        formulas.add((sheet.title, cell.row, cell.column))
+                        values.append(result.value)
+                    rows.append(values)
                 merged.extend((sheet.title, str(region)) for region in sheet.merged_cells.ranges)
-                add_sheet(sheet.title, sheet.iter_rows(values_only=True), sheet.max_row, sheet.max_column)
+                add_sheet(sheet.title, rows, sheet.max_row, sheet.max_column)
         finally:
             book.close()
+            cached.close()
     elif extension == ".xls" and data.startswith(b"\xd0\xcf\x11\xe0"):
-        # Reject before allocating binary workbook structures: cached values
-        # are not sufficient formula provenance in this first slice.
-        raise InventoryError("BINARY_XLS_FORMULA_PROVENANCE_UNSUPPORTED")
+        _binary_xls(data, add_sheet)
+        return SourceInventory(sha256(data).hexdigest(), len(data), tuple(sheets), cells, (),
+                               frozenset(), formula_cells_known=False)
     elif extension == ".xls":
         try:
             rows = html_table_raw_rows(data)
@@ -134,4 +200,5 @@ def extract_inventory(data: bytes, extension: str) -> SourceInventory:
         add_sheet("HTML_TABLE_1", rows, len(rows), max(map(len, rows), default=0))
     else:
         raise InventoryError("SOURCE_FORMAT_UNSUPPORTED")
-    return SourceInventory(sha256(data).hexdigest(), len(data), tuple(sheets), cells, tuple(merged))
+    return SourceInventory(sha256(data).hexdigest(), len(data), tuple(sheets), cells, tuple(merged),
+                           frozenset(formulas))

@@ -97,6 +97,8 @@ def verify_coverage(source: bytes, extension: str, output: bytes, sidecar: bytes
              and proposal["output"]["size_bytes"] == len(output), "OUTPUT_BINDING_INVALID")
     sheet = proposal["output"]["sheet"]
     _require(parsed.sheets == (sheet,), "OUTPUT_SHEETS_INVALID")
+    # Parser output must hold literal values; only customer sources may carry formulas.
+    _require(not parsed.formula_cells, "OUTPUT_FORMULA_PRESENT")
     _require(tuple(parsed.cells.get((sheet, 1, col)) for col in range(1, 26)) == tuple(CANONICAL_COLUMNS),
              "OUTPUT_HEADERS_INVALID")
     _require(all(column <= 25 for _, _, column in parsed.cells), "OUTPUT_COLUMNS_INVALID")
