@@ -106,6 +106,49 @@ def test_mixed_roles_and_blocking_findings_require_review():
                                   source_associations=True).author()
 
 
+def _bind_package_choice(store, sources, *, processed=True):
+    """Bind the request to a completed package choice covering its sources (plan 8.8 step 2)."""
+    from bom_processor.bom_package_choice import RESULT_VERSION, _hash, _json_bytes
+    record = {"version": "bom-package-choice-request.v1", "customer_key": "customer"}
+    rid = _hash(record)
+    record["request_id"] = rid
+    result = {"version": RESULT_VERSION, "request_id": rid, "documents": [
+        {"document_id": item["document_id"], "sha256": item["sha256"],
+         "decision": "process" if processed else "excluded"} for item in sources]}
+    store.registry[f"package-choice/{rid}/request.json"] = _json_bytes(record)
+    store.registry[f"package-choice/{rid}/result.json"] = _json_bytes(result)
+    store.registry[f"package-choice/{rid}/completed.json"] = _json_bytes(
+        {"request_id": rid, "result_sha256": _hash(result)})
+    path = "candidates/requests/xlsx-demo.json"
+    request = json.loads(store.registry[path])
+    request["package_choice"] = {"request_id": rid, "result_sha256": _hash(result)}
+    store.registry[path] = json.dumps(request).encode()
+
+
+def test_package_choice_bound_request_records_roles_but_is_not_stopped_by_them():
+    store, sources, associations, _ = setup()
+    _request_v2(store)
+    _bind_package_choice(store, sources)
+    proposals = roles(store, sources)
+    proposals[sources[-1]["sha256"]]["role"] = "work_instruction"
+    before = set(store.candidates)
+    # The roles no longer stop the request; the parser code is then checked as usual.
+    with pytest.raises(AuthoringError) as failure:
+        CandidateAuthoringService("xlsx-demo", store, Model(proposals, associations),
+                                  source_associations=True).author()
+    assert failure.value.code not in {"SOURCE_NOT_BOM", "SOURCE_ROLES_MIXED_REVIEW_REQUIRED"}
+    assert any("/document-roles/" in path for path in set(store.candidates) - before)
+
+
+def test_package_choice_binding_must_match_a_completed_choice_that_keeps_the_sources():
+    store, sources, associations, _ = setup()
+    _request_v2(store)
+    _bind_package_choice(store, sources, processed=False)
+    with pytest.raises(AuthoringError, match="PACKAGE_CHOICE_BINDING"):
+        CandidateAuthoringService("xlsx-demo", store, Model(roles(store, sources), associations),
+                                  source_associations=True).author()
+
+
 def test_role_coverage_must_match_every_source():
     store, sources, associations, _ = setup()
     _request_v2(store)

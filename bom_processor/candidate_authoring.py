@@ -222,7 +222,10 @@ class CandidateAuthoringService:
                 if not isinstance(bundle, dict) or set(bundle) != {
                         "document_roles", "parser_code", "assembly_associations"}:
                     raise AuthoringError("AUTHORING_BUNDLE_INVALID")
-                roles = self._verified_roles(bundle["document_roles"], sources)
+                # With a completed package choice the survey already chose the BOM files
+                # (plan 8.8 step 2): roles are still recorded, a non-BOM role no longer stops.
+                roles = self._verified_roles(bundle["document_roles"], sources,
+                                             surveyed=self._package_choice_bound(request))
                 associations = bundle["assembly_associations"]
                 if not isinstance(associations, dict) or set(associations) != {item["sha256"] for item in sources}:
                     raise AuthoringError("ASSOCIATION_COVERAGE_INVALID")
@@ -297,11 +300,30 @@ class CandidateAuthoringService:
             raise AuthoringError("CANDIDATE_CONFLICT") from None
         return AuthoringResult(self.request_id, candidate_id, f"{base}/candidate-manifest.json")
 
-    def _verified_roles(self, proposals: Any, sources: list[dict[str, Any]]) -> dict[str, Any]:
+    def _package_choice_bound(self, request: dict[str, Any]) -> bool:
+        """True only when the request names a completed package choice that processes every source."""
+        ref = request.get("package_choice")
+        if ref is None:
+            return False
+        from .bom_package_choice import PackageChoiceError, PackageChoiceService
+        try:
+            state = PackageChoiceService(self.storage).status(ref.get("request_id", ""))
+        except PackageChoiceError:
+            raise AuthoringError("PACKAGE_CHOICE_BINDING") from None
+        processed = {item["sha256"] for item in state.get("result", {}).get("documents", [])
+                     if item.get("decision") == "process"}
+        if (state["status"] != "completed" or state["result_sha256"] != ref.get("result_sha256")
+                or any(item["sha256"].lower() not in processed for item in request["source_evidence"])):
+            raise AuthoringError("PACKAGE_CHOICE_BINDING")
+        return True
+
+    def _verified_roles(self, proposals: Any, sources: list[dict[str, Any]], *,
+                        surveyed: bool = False) -> dict[str, Any]:
         """Byte-verify agent role proposals; record them; only all-BOM requests continue.
 
-        Package plans cannot yet exclude a source, so a non-BOM role stops this
-        request with a stable code and durable evidence instead of a parser.
+        Without a package choice a non-BOM role stops this request with a stable code and
+        durable evidence instead of a parser. With one (surveyed), the survey chose the BOM
+        files, so the roles are recorded but do not stop the request.
         """
         if not isinstance(proposals, dict) or set(proposals) != {item["sha256"] for item in sources}:
             raise AuthoringError("DOCUMENT_ROLE_COVERAGE_INVALID")
@@ -321,6 +343,8 @@ class CandidateAuthoringService:
         except BlobConflictError:
             pass  # Same bytes at a content-addressed path: an identical replay.
         self.document_roles_ref = {"blob_path": path, "sha256": digest, "size_bytes": len(data)}
+        if surveyed:
+            return verified
         if any(item["has_blocking_findings"] for item in verified.values()):
             raise AuthoringError("DOCUMENT_ROLE_REVIEW_REQUIRED")
         kinds = {item["role"] for item in verified.values()}

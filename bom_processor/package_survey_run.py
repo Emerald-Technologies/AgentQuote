@@ -26,7 +26,11 @@ Caller = Callable[[str, str], Any]
 
 def survey_package(roots: list[tuple[str, bytes]], call: Caller, *, max_calls: int | None = None) -> dict[str, Any]:
     """call(instructions, user_text) returns the parsed JSON reply for one batch."""
-    view = build_view(expand_package(roots))
+    return survey_view(build_view(expand_package(roots)), call, max_calls=max_calls)
+
+
+def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dict[str, Any]:
+    """The survey of an already built view (stage 2 reuses the same view)."""
     batches = plan_batches(view)
     ceiling = max_calls if max_calls is not None else len(batches) * ATTEMPTS_PER_BATCH
     calls = 0

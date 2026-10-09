@@ -1,0 +1,303 @@
+"""Package choice job (plan 8.8 step 2): survey the package, choose one primary BOM per contested
+assembly, and decide which request BOM documents are processed and which are set aside.
+
+Inputs: a ProcessingRequest that carries package_files (uploaded root files staged by QuickQuote
+under evidence-inputs/). Output: immutable artifacts under package-choice/<request_id>/ in the
+registry container - request.json, start/worker markers, result.json and completed.json (written
+last) or failed.json. Model calls run only in the job (choice_job.py), never in the API process.
+
+Decisions are fail-safe: a document is set aside only when the survey has no blocking finding
+and either the survey calls it a non-BOM (plan 8.2-2) or the agent's primary choice for its
+assembly agreed with the column-read cross-check (plan 8.2-8). Anything else is processed as
+before, so a doubtful choice reaches the existing human review instead of dropping a file.
+Run python -m pytest tests/test_bom_package_choice.py.
+"""
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from typing import Any, Callable
+
+from .core import BlobConflictError, BlobNotFoundError, ProcessingRequest
+
+REQUEST_VERSION = "bom-package-choice-request.v1"
+RESULT_VERSION = "bom-package-choice.v1"
+MAX_METADATA = 8 * 1024 * 1024
+_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}")
+_HASH = re.compile(r"[0-9a-f]{64}")
+
+Caller = Callable[[str, str], Any]
+
+
+class PackageChoiceError(ValueError):
+    """Stable failure code without customer values."""
+
+
+class PackageChoicePendingError(Exception):
+    """The request carries package_files and its choice is not completed yet."""
+
+    def __init__(self, request_id: str, state: str, code: str | None = None):
+        self.request_id, self.state, self.code = request_id, state, code
+        super().__init__("package choice pending")
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False).encode("utf-8")
+
+
+def _hash(value: Any) -> str:
+    import hashlib
+    return hashlib.sha256(_json_bytes(value)).hexdigest()
+
+
+def choice_request(request: ProcessingRequest) -> dict[str, Any]:
+    """Request identity: the package files and the BOM documents; nothing else."""
+    request.validate()
+    if request.package_files is None:
+        raise PackageChoiceError("PACKAGE_FILES_REQUIRED")
+    body = {"version": REQUEST_VERSION, "customer_key": request.customer_key,
+            "rfq_uuid": request.rfq_uuid.lower(), "package_version": request.package_version,
+            "package_files": [{"document_id": item.document_id, "file_name": item.file_name,
+                               "blob_path": item.blob_path, "size_bytes": item.size_bytes,
+                               "sha256": item.sha256} for item in request.package_files],
+            "documents": [{"document_id": item.document_id, "blob_path": item.blob_path,
+                           "size_bytes": item.size_bytes, "sha256": item.sha256.lower()}
+                          for item in request.documents]}
+    return {**body, "request_id": _hash(body)}
+
+
+def _stable_code(exc: BaseException) -> str:
+    message = str(exc)
+    return message if _CODE.fullmatch(message) else "PACKAGE_CHOICE_FAILED"
+
+
+def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller) -> dict[str, Any]:
+    """Survey, choose and decide per request document. Pure apart from model calls."""
+    from .bom_candidate_choice import run_choice, set_aside_digests
+    from .bom_candidate_view import build_candidate_view
+    from .package_survey import build_view, expand_package
+    from .package_survey_run import survey_view
+
+    view = build_view(expand_package(roots))
+    survey = survey_view(view, call)
+    calls = survey["model_calls"]
+    choices = []
+    for group in survey["assemblies"]:
+        boms = group["files"]["bom"]
+        if len(boms) < 2:
+            continue
+        candidate_view = build_candidate_view(view, group["name"], boms)
+        choice, used = run_choice(candidate_view, call)
+        calls += used
+        choices.append({"assembly": group["name"], "view_sha256": candidate_view.sha256,
+                        "choice": choice, "set_aside_digests": set_aside_digests(choice, candidate_view)})
+    records = {record["file_id"]: record for record in survey["files"]}
+    by_hash: dict[str, list[str]] = {}
+    for file_id, item in view.files.items():
+        by_hash.setdefault(item.sha256, []).append(file_id)
+    labels: dict[str, tuple[dict[str, Any], str]] = {}
+    for entry in choices:
+        for item in entry["choice"]["files"]:
+            labels[item["file_id"]] = (entry, item["disposition"])
+    documents, findings = [], []
+    for document in request["documents"]:
+        file_ids = sorted(by_hash.get(document["sha256"], []), key=lambda value: int(value[1:]))
+        roles = sorted({records[file_id]["role"] for file_id in file_ids})
+        decision, reason, disposition = "process", "only_bom", None
+        if not file_ids:
+            reason = "not_in_package"
+            findings.append({"code": "CHOICE_DOCUMENT_NOT_IN_PACKAGE", "severity": "warning",
+                             "rationale": "A BOM document of the request is not among the package files; it is processed.",
+                             "document_id": document["document_id"], "raised_by": "code"})
+        elif survey["has_blocking_findings"]:
+            reason = "survey_blocking"
+        elif "bom" not in roles:
+            decision, reason = "excluded", roles[0] if len(roles) == 1 else "not_bom"
+        else:
+            labelled = [labels[file_id] for file_id in file_ids if file_id in labels]
+            if labelled:
+                agreed = all(entry["choice"]["automatic_selection_allowed"] for entry, _ in labelled)
+                values = sorted({value for _, value in labelled})
+                if not agreed:
+                    reason = "choice_needs_review"
+                elif "primary" in values:
+                    # Identical bytes that are the primary anywhere stay in.
+                    reason, disposition = "primary", "primary"
+                elif len(labelled) < len(file_ids) or len(values) != 1:
+                    # A copy outside the choice, or copies labelled differently: not proven.
+                    reason = "labels_not_consistent"
+                else:
+                    decision, reason, disposition = "excluded", values[0], values[0]
+        assemblies = sorted({records[file_id]["assembly"]["name"] for file_id in file_ids
+                             if records[file_id]["assembly"] is not None})
+        documents.append({"document_id": document["document_id"], "sha256": document["sha256"],
+                          "decision": decision, "reason": reason, "disposition": disposition,
+                          "survey_file_ids": file_ids, "roles": roles, "assemblies": assemblies})
+    processed = [item["document_id"] for item in documents if item["decision"] == "process"]
+    if not processed:
+        raise PackageChoiceError("PACKAGE_NO_BOM")
+    primaries = []
+    for entry in choices:
+        if not entry["choice"]["automatic_selection_allowed"]:
+            continue
+        ids = {file_id for item in entry["choice"]["files"] for file_id in [item["file_id"]]}
+        members = [item for item in documents if set(item["survey_file_ids"]) & ids]
+        primaries.append({"assembly": entry["assembly"],
+                          "primary_document_ids": sorted(item["document_id"] for item in members
+                                                         if item["decision"] == "process"),
+                          "excluded_document_ids": sorted(item["document_id"] for item in members
+                                                          if item["decision"] == "excluded")})
+    return {"version": RESULT_VERSION, "request_id": request["request_id"], "model_calls": calls,
+            "survey": survey, "choices": choices, "documents": documents,
+            "primary_selections": primaries, "findings": findings}
+
+
+class PackageChoiceService:
+    """Immutable request/marker/result artifacts, same pattern as EvidenceJobService.
+
+    starter.start receives only REQUEST_ID. No retries or claim stealing; an ambiguous start or
+    an interrupted worker needs explicit reconciliation, never a silent second model run.
+    """
+
+    def __init__(self, storage: Any, starter: Any = None):
+        self.storage, self.starter = storage, starter
+
+    @staticmethod
+    def _path(request_id: str, artifact: str) -> str:
+        if not _HASH.fullmatch(str(request_id)):
+            raise PackageChoiceError("PACKAGE_CHOICE_ID_INVALID")
+        return f"package-choice/{request_id}/{artifact}.json"
+
+    def _write(self, request_id: str, artifact: str, value: dict) -> None:
+        self.storage.upload_registry_immutable(self._path(request_id, artifact), _json_bytes(value),
+                                               "application/json")
+
+    def _read(self, request_id: str, artifact: str) -> dict | None:
+        try:
+            raw = self.storage.download_registry(self._path(request_id, artifact), MAX_METADATA)
+        except BlobNotFoundError:
+            return None
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise PackageChoiceError("PACKAGE_CHOICE_ARTIFACT_CORRUPT") from exc
+        if type(value) is not dict or _json_bytes(value) != raw:
+            raise PackageChoiceError("PACKAGE_CHOICE_ARTIFACT_CORRUPT")
+        return value
+
+    def submit(self, request: ProcessingRequest) -> dict[str, Any]:
+        record = choice_request(request)
+        try:
+            self._write(record["request_id"], "request", record)
+        except BlobConflictError:
+            if self._read(record["request_id"], "request") != record:
+                raise PackageChoiceError("PACKAGE_CHOICE_CONFLICT") from None
+        return record
+
+    def request(self, request_id: str) -> dict[str, Any]:
+        value = self._read(request_id, "request")
+        if value is None:
+            raise PackageChoiceError("PACKAGE_CHOICE_NOT_FOUND")
+        body = {key: item for key, item in value.items() if key != "request_id"}
+        if value.get("version") != REQUEST_VERSION or value.get("request_id") != request_id or _hash(body) != request_id:
+            raise PackageChoiceError("PACKAGE_CHOICE_ARTIFACT_CORRUPT")
+        return value
+
+    def status(self, request_id: str) -> dict[str, Any]:
+        self.request(request_id)
+        completed = self._read(request_id, "completed")
+        if completed is not None:
+            result = self._read(request_id, "result")
+            if (result is None or set(completed) != {"request_id", "result_sha256"}
+                    or completed["request_id"] != request_id or _hash(result) != completed["result_sha256"]
+                    or result.get("version") != RESULT_VERSION or result.get("request_id") != request_id):
+                raise PackageChoiceError("PACKAGE_CHOICE_RESULT_CORRUPT")
+            return {"request_id": request_id, "status": "completed",
+                    "result_sha256": completed["result_sha256"], "result": result}
+        failed = self._read(request_id, "failed")
+        if failed is not None:
+            code = failed.get("code")
+            return {"request_id": request_id, "status": "failed",
+                    "code": code if isinstance(code, str) and _CODE.fullmatch(code) else "PACKAGE_CHOICE_FAILED"}
+        for artifact, state in (("worker-claim", "running"), ("start-unknown", "start_unknown"),
+                                ("started", "started"), ("start-claim", "start_unknown")):
+            if self._read(request_id, artifact) is not None:
+                return {"request_id": request_id, "status": state}
+        return {"request_id": request_id, "status": "requested"}
+
+    def start(self, request_id: str) -> dict[str, Any]:
+        existing = self.status(request_id)
+        if existing["status"] != "requested":
+            return existing
+        if self.starter is None:
+            raise PackageChoiceError("PACKAGE_CHOICE_STARTER_UNAVAILABLE")
+        try:
+            # A unique nonce: two callers writing the same marker can never both own the start.
+            self._write(request_id, "start-claim", {"request_id": request_id, "claim_id": uuid.uuid4().hex})
+        except BlobConflictError:
+            return self.status(request_id)
+        try:
+            execution = self.starter.start({"REQUEST_ID": request_id})
+            if not isinstance(execution, str) or not 0 < len(execution) <= 256:
+                raise RuntimeError("execution name invalid")
+            self._write(request_id, "started", {"request_id": request_id, "execution": execution})
+        except Exception:
+            # A transport failure may still have started the job: never start a second one.
+            self._write(request_id, "start-unknown", {"request_id": request_id, "code": "START_UNKNOWN"})
+        return self.status(request_id)
+
+    def ensure(self, request: ProcessingRequest) -> dict[str, Any]:
+        """API side: submit and start once; return the current status. No model calls."""
+        record = self.submit(request)
+        state = self.status(record["request_id"])
+        if state["status"] == "requested":
+            state = self.start(record["request_id"])
+        return state
+
+    def run(self, request_id: str, call: Caller) -> dict[str, Any]:
+        """Worker side: download and verify the package files, then decide."""
+        request = self.request(request_id)
+        existing = self.status(request_id)
+        if existing["status"] in {"completed", "failed", "running"}:
+            return existing
+        try:
+            self._write(request_id, "worker-claim", {"request_id": request_id, "claim_id": uuid.uuid4().hex})
+        except BlobConflictError:
+            return self.status(request_id)
+        try:
+            import hashlib
+            roots = []
+            for item in request["package_files"]:
+                try:
+                    data = self.storage.download_source(item["blob_path"], item["size_bytes"])
+                except Exception:
+                    # Missing, unreadable or larger than recorded: never read past the recorded size.
+                    raise PackageChoiceError("PACKAGE_FILE_UNAVAILABLE") from None
+                if (type(data) is not bytes or len(data) != item["size_bytes"]
+                        or hashlib.sha256(data).hexdigest() != item["sha256"]):
+                    raise PackageChoiceError("PACKAGE_FILE_IDENTITY_MISMATCH")
+                roots.append((item["file_name"], data))
+            result = decide(request, roots, call)
+            self._write(request_id, "result", result)
+            self._write(request_id, "completed", {"request_id": request_id, "result_sha256": _hash(result)})
+        except Exception as exc:
+            self._write(request_id, "failed", {"request_id": request_id, "code": _stable_code(exc)})
+        return self.status(request_id)
+
+
+def excluded_assignments(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Package-plan assignments for the documents a completed choice set aside."""
+    result = state["result"]
+    reference = {"request_id": state["request_id"], "result_sha256": state["result_sha256"]}
+    return [{"kind": "excluded", "document_ids": [item["document_id"]], "package_choice": reference,
+             "reason": item["reason"], "roles": item["roles"], "assemblies": item["assemblies"]}
+            for item in result["documents"] if item["decision"] == "excluded"]
+
+
+def create_choice_caller() -> Caller:
+    """The same Government model client as the parser author (lazy; offline imports stay offline)."""
+    from .foundry_author import create_foundry_author
+    from .package_survey_run import foundry_caller
+    return foundry_caller(create_foundry_author().client)

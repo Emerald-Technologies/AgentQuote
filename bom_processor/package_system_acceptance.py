@@ -110,10 +110,14 @@ class SystemPackageService(ParentPackageService):
         actual = []
         covered = []
         for group in review["groups"]:
+            if group.get("status") == "excluded" and group.get("kind") == "excluded":
+                # Set aside by a completed package choice that code cross-checked.
+                covered.extend(group["document_ids"])
+                continue
             evidence = group.get("evidence", {})
             if (group.get("status") != "ready" or group.get("mapping_keys")
                     or group.get("disposition_keys")
-                    or evidence.get("reconciliation") not in {"equivalent", "merged"}
+                    or evidence.get("reconciliation") not in {"equivalent", "merged", "primary_selected"}
                     or not isinstance(evidence.get("assembly_identity"), dict)
                     or not evidence.get("fixtures")):
                 if _guard is not None:

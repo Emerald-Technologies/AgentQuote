@@ -44,6 +44,7 @@ from bom_processor import (
     PackageResolutionError,
     ParentPackageService,
 )
+from bom_processor.bom_package_choice import PackageChoicePendingError
 from bom_processor.core import CONTRACT_VERSION
 from bom_processor.master_registry import RegistryError
 from bom_processor.package_system_acceptance import SystemPackageService
@@ -219,6 +220,14 @@ class ProcessingApi:
             return 409, _error("immutable_conflict", "Job output conflicts with existing data.", request_id)
         except BlobNotFoundError:
             return 404, _error("artifact_not_found", "A required source or parser was not found.", request_id)
+        except PackageChoicePendingError as exc:
+            # Survey and primary-BOM choice run in their own job; the caller repeats the same request.
+            payload = {"version": CONTRACT_VERSION, "status": "package_choice_pending",
+                       "job_id": request.job_id, "request_fingerprint": request.fingerprint(),
+                       "package_choice": {"request_id": exc.request_id, "state": exc.state}}
+            if exc.code:
+                payload["package_choice"]["code"] = exc.code
+            return 202, payload
         except CandidateRequiredError as exc:
             payload = {"version": CONTRACT_VERSION, "status": "candidate_required", "candidate": {
                 "request_id": exc.request_id, "parser_key": exc.parser_key,
@@ -635,11 +644,36 @@ def _processor_factory(config: ApiConfig) -> BomProcessor:
     if budget_policy not in {"true", "false"}:
         raise RuntimeError("invalid author budget policy")
     return RemoteBomProcessor(storage, JobOrchestrator(Reader(), sas, starter),
+                               package_choice=_package_choice_factory(storage),
                                author_budget_enabled=budget_policy == "true",
                                author_budget_quote_ids=_author_budget_quote_ids(),
                                registry_reader=BlobRegistryReader(storage.download_registry,
                                                                    max_bytes=config.processor_options["max_parser_bytes"]),
                                **config.processor_options)
+
+
+def _package_choice_factory(storage: Any):
+    """Choice job service, only when its job is configured; requests with package_files fail otherwise."""
+    job_name = os.environ.get("PACKAGE_CHOICE_JOB_NAME", "").strip()
+    if not job_name:
+        return None
+    from bom_processor.bom_package_choice import PackageChoiceService
+    required = ("BOM_JOB_SUBSCRIPTION_ID", "BOM_JOB_RESOURCE_GROUP", "PACKAGE_CHOICE_JOB_IMAGE")
+    if any(not os.environ.get(name, "").strip() for name in required):
+        raise RuntimeError("package choice job configuration is not set")
+    from azure.identity import ManagedIdentityCredential
+    job_credential = ManagedIdentityCredential(
+        client_id=os.environ.get("BOM_JOB_MANAGED_IDENTITY_CLIENT_ID") or None)
+    starter = AzureCandidateJobStarter(
+        subscription_id=os.environ["BOM_JOB_SUBSCRIPTION_ID"],
+        resource_group=os.environ["BOM_JOB_RESOURCE_GROUP"], job_name=job_name,
+        credential=job_credential,
+        container_name=os.environ.get("PACKAGE_CHOICE_JOB_CONTAINER_NAME", "choice-worker"),
+        image=os.environ["PACKAGE_CHOICE_JOB_IMAGE"], resources={"cpu": 1, "memory": "2Gi"},
+        base_environment={key: os.environ.get(key, "") for key in (
+            "AZURE_CLIENT_ID", "BOM_STORAGE_ACCOUNT_URL", "FOUNDRY_PROJECT_ENDPOINT",
+            "AZURE_AI_MODEL_DEPLOYMENT_NAME_FLASH")})
+    return PackageChoiceService(storage, starter)
 
 
 def _candidate_automation_factory(config: ApiConfig, storage: Any):

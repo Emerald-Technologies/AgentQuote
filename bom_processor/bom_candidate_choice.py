@@ -16,6 +16,7 @@ python -m pytest tests/test_bom_candidate_choice.py.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
@@ -238,19 +239,39 @@ def _parsed_sets(rows: Iterable[Mapping[str, Any]]) -> dict[str, set[str]]:
     return {"item_number": items, "manufacturer_item_number": mpns}
 
 
-def post_parse_check(choice: Mapping[str, Any], view: CandidateView,
-                     primary_rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+def value_digest(value: str) -> str:
+    """Stored instead of the value itself, so set comparisons need no customer text at rest."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def set_aside_digests(choice: Mapping[str, Any], view: CandidateView) -> dict[str, list[str]]:
+    """Digests of the identity column of every file set aside, over every row of the read range."""
+    return {item["file_id"]: sorted({value_digest(value) for value, _ in
+                                     _column_rows(view, item["file_id"], item["columns"])})
+            for item in choice["files"]
+            if item["file_id"] != choice["primary"] and item["columns"] is not None}
+
+
+def post_parse_check(choice: Mapping[str, Any], view: CandidateView | None,
+                     primary_rows: Iterable[Mapping[str, Any]],
+                     digests: Mapping[str, Iterable[str]] | None = None) -> dict[str, Any]:
     """Compare the parsed primary with the full identity column of every file set aside.
 
     The parsed field compared is the one that shares most values with that column (item number or
     manufacturer part number), so the check follows the agent's column read, not a fixed field.
+    digests (set_aside_digests) replaces the view when the check runs later from stored results.
     """
-    parsed = _parsed_sets(primary_rows)
+    if digests is None:
+        if view is None:
+            raise ChoiceError("POST_PARSE_INPUT_INVALID")
+        digests = set_aside_digests(choice, view)
+    parsed = {name: {value_digest(value) for value in values}
+              for name, values in _parsed_sets(primary_rows).items()}
     checks, reasons = [], []
     for item in choice["files"]:
         if item["file_id"] == choice["primary"] or item["columns"] is None:
             continue
-        column = {value for value, _ in _column_rows(view, item["file_id"], item["columns"])}
+        column = set(digests.get(item["file_id"], ()))
         field = max(sorted(parsed), key=lambda name: len(parsed[name] & column))
         primary_set = parsed[field]
         missing = column - primary_set

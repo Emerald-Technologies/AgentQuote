@@ -35,7 +35,8 @@ class RemoteBomProcessor:
                  author_budget_enabled: bool = False,
                  author_budget_quote_ids: frozenset[str] = frozenset(),
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 package_choice: Any = None) -> None:
         limits = (timeout_seconds, poll_interval_seconds, max_source_bytes, max_total_source_bytes,
                   max_parser_bytes, max_output_bytes, max_rows)
         if any(type(value) is not int or value <= 0 for value in limits):
@@ -53,6 +54,24 @@ class RemoteBomProcessor:
         self.author_budget_quote_ids = parse_quote_scope(",".join(sorted(author_budget_quote_ids)))
         reader = getattr(storage, "download_registry", None)
         self.registry_reader = registry_reader or (BlobRegistryReader(reader, max_bytes=max_parser_bytes) if reader else None)
+        # bom_package_choice.PackageChoiceService with a job starter; used only for requests that
+        # carry package_files (plan 8.8 step 2). Model calls run in that job, never here.
+        self.package_choice = package_choice
+
+    def _package_choice(self, request: ProcessingRequest) -> dict[str, Any] | None:
+        """Completed choice for a request with package_files, else None. Raises while pending."""
+        if request.package_files is None:
+            return None
+        if self.package_choice is None:
+            raise ProcessingError("package choice unavailable")
+        from .bom_package_choice import PackageChoiceError, PackageChoicePendingError
+        try:
+            state = self.package_choice.ensure(request)
+        except PackageChoiceError as exc:
+            raise ProcessingError("package choice invalid") from exc
+        if state["status"] != "completed":
+            raise PackageChoicePendingError(state["request_id"], state["status"], state.get("code"))
+        return state
 
     def _budget_enabled(self, request: ProcessingRequest) -> bool:
         return self.author_budget_enabled or request.rfq_uuid.lower() in self.author_budget_quote_ids
@@ -66,19 +85,25 @@ class RemoteBomProcessor:
         prefix = f"{request.customer_key}/rfq-{request.rfq_uuid}/package-{request.package_version}/processed/{request.job_id}"
         manifest_path, claim_path = f"{prefix}/manifest.json", f"{prefix}/claim.json"
         fingerprint = request.fingerprint()
+        choice = self._package_choice(request)
+        self._choice = choice
+        # Without a package choice every request document is processed, exactly as before.
+        kept = request.documents if choice is None else tuple(
+            document for document in request.documents if document.document_id in {
+                item["document_id"] for item in choice["result"]["documents"] if item["decision"] == "process"})
         if request.force_candidate:
             verified_sources = {}
-            for document in request.documents:
+            for document in kept:
                 source = self.storage.download_source(document.blob_path, self.max_source_bytes)
                 if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                     raise ProcessingError("source integrity check failed")
                 verified_sources[document.document_id] = source
-            self._require_candidate(request, verified_sources, ProcessingError("replacement requested"))
+            self._require_candidate(request, verified_sources, ProcessingError("replacement requested"), kept)
         existing = self.storage.download_output(manifest_path, self.max_output_bytes)
         if existing is not None:
             return self._validate_manifest(existing, request, fingerprint)
         verified_sources: dict[str, bytes] = {}
-        for document in request.documents:
+        for document in kept:
             source = self.storage.download_source(document.blob_path, self.max_source_bytes)
             if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                 raise ProcessingError("source integrity check failed")
@@ -90,7 +115,7 @@ class RemoteBomProcessor:
         try:
             if self.registry_reader is None:
                 raise RegistryError("REGISTRY_ABSENT")
-            for document in request.documents:
+            for document in kept:
                 try:
                     current = self.registry_reader.select(
                         request.parser_key, request.customer_key,
@@ -116,7 +141,7 @@ class RemoteBomProcessor:
                 else:
                     exc = RegistryError("PARSER_FORMAT_NOT_RECOGNIZED")
             if exc.code == "PARSER_FORMAT_NOT_RECOGNIZED" and legacy_parser is None:
-                for document in request.documents:
+                for document in kept:
                     if document.document_id in selections:
                         continue
                     try:
@@ -131,13 +156,14 @@ class RemoteBomProcessor:
                                      for d in documents)
                     candidate = persist_candidate(self.storage, request.parser_key,
                                                   request.customer_key, profile, evidence,
-                                                self.candidate_clock, stable_order=self._budget_enabled(request))
+                                                self.candidate_clock, stable_order=self._budget_enabled(request),
+                                                package_choice=self._choice_ref())
                     pending.append(CandidateRequiredError(
                         candidate.request_id, request.parser_key, profile.profile_hash,
                         tuple(d.document_id for d in documents)))
                 if (len(pending) == 1 and not selections
                         and len(pending[0].document_ids) == 1
-                        and len(request.documents) == 1):
+                        and len(request.documents) == 1 and choice is None):
                     if not self._budget_enabled(request):
                         raise pending[0] from exc
                 self._raise_grouped(request, selections, pending, exc)
@@ -151,18 +177,23 @@ class RemoteBomProcessor:
                                  for d in documents)
                 candidate = persist_candidate(self.storage, request.parser_key,
                                               request.customer_key, profile, evidence,
-                                            self.candidate_clock, stable_order=self._budget_enabled(request))
+                                            self.candidate_clock, stable_order=self._budget_enabled(request),
+                                            package_choice=self._choice_ref())
                 pending.append(CandidateRequiredError(
                     candidate.request_id, request.parser_key, profile.profile_hash,
                     tuple(d.document_id for d in documents)))
             if (len(pending) == 1 and not selections
                     and len(pending[0].document_ids) == 1
-                    and len(request.documents) == 1):
+                    and len(request.documents) == 1 and choice is None):
                 if not self._budget_enabled(request):
                     raise pending[0]
             self._raise_grouped(request, selections, pending)
         if pending:
             raise AggregateCandidateRequiredError(tuple(pending))
+        if choice is not None and len(kept) != len(request.documents):
+            # Every kept BOM already has an approved parser: the direct manifest would omit the set-aside
+            # files, which the processing contract does not allow. Not built yet; stop loudly.
+            raise ProcessingError("package choice approved-only path unsupported")
         claim = {"version": CONTRACT_VERSION, "job_id": request.job_id,
                  "request_fingerprint": fingerprint, "status": "started"}
         prior = self.storage.download_output(claim_path, self.max_output_bytes)
@@ -255,7 +286,8 @@ class RemoteBomProcessor:
                 approved_assignments=self._approved_assignments(selections),
                 pending_assignments=[{"request_id": item.request_id,
                                       "document_ids": list(item.document_ids)}
-                                     for item in pending])
+                                     for item in pending],
+                package_choice=getattr(self, "_choice", None))
         if self._budget_enabled(request):
             from .author_budget import Budget, enroll
             for item in pending:
@@ -267,10 +299,17 @@ class RemoteBomProcessor:
             raise error from cause
         raise error
 
+    def _choice_ref(self) -> dict[str, str] | None:
+        choice = getattr(self, "_choice", None)
+        return None if choice is None else {"request_id": choice["request_id"],
+                                            "result_sha256": choice["result_sha256"]}
+
     def _require_candidate(self, request: ProcessingRequest,
-                           verified_sources: dict[str, bytes], cause: Exception) -> None:
+                           verified_sources: dict[str, bytes], cause: Exception,
+                           documents: tuple[Any, ...] | None = None) -> None:
+        documents = request.documents if documents is None else documents
         groups: dict[str, tuple[Any, list[Any]]] = {}
-        for document in request.documents:
+        for document in documents:
             profile = profile_bytes(verified_sources[document.document_id],
                                     PurePosixPath(document.blob_path).suffix)
             groups.setdefault(profile.profile_hash, (profile, []))[1].append(document)
@@ -281,11 +320,13 @@ class RemoteBomProcessor:
                              for d in documents)
             candidate = persist_candidate(self.storage, request.parser_key,
                                           request.customer_key, profile, evidence,
-                                          self.candidate_clock, stable_order=self._budget_enabled(request))
+                                          self.candidate_clock, stable_order=self._budget_enabled(request),
+                                          package_choice=self._choice_ref())
             errors.append(CandidateRequiredError(candidate.request_id, request.parser_key,
                                                   profile.profile_hash,
                                                   tuple(d.document_id for d in documents)))
-        if len(errors) == 1 and len(request.documents) == 1 and not self._budget_enabled(request):
+        if (len(errors) == 1 and len(request.documents) == 1 and not self._budget_enabled(request)
+                and getattr(self, "_choice", None) is None):
             raise errors[0] from cause
         self._raise_grouped(request, {}, errors, cause)
 

@@ -17,7 +17,7 @@ from .semantic_facts import SemanticFactsError, facts_from_xlsx
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_METADATA = 1_000_000
-_RECONCILIATIONS = frozenset({"equivalent", "merged", "human_selected_conflict"})
+_RECONCILIATIONS = frozenset({"equivalent", "merged", "human_selected_conflict", "primary_selected"})
 _ZIP_EPOCH = (2000, 1, 1, 0, 0, 0)
 _WORKBOOK_EPOCH = datetime(2000, 1, 1)
 
@@ -70,13 +70,30 @@ class ParentPackageService:
 
     def plan(self, request: ProcessingRequest, *,
              approved_assignments: list[dict[str, Any]],
-             pending_assignments: list[dict[str, Any]]) -> dict[str, Any]:
-        """Persist an immutable inventory after independently verifying every source."""
+             pending_assignments: list[dict[str, Any]],
+             package_choice: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Persist an immutable inventory after independently verifying every source.
+
+        package_choice is a completed bom_package_choice status; the documents it set aside
+        become excluded assignments. Without it the plan is exactly as before.
+        """
         request.validate()
         sources = self._verified_sources(request)
         processed_prefix = self._request_processed_prefix(request)
         assignments: list[dict[str, Any]] = []
         covered: list[str] = []
+        choice_ref = None
+        if package_choice is not None:
+            from .bom_package_choice import excluded_assignments
+            if package_choice.get("status") != "completed" or request.package_files is None:
+                raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
+            choice_ref = {"request_id": package_choice["request_id"],
+                          "result_sha256": package_choice["result_sha256"]}
+            for item in excluded_assignments(package_choice):
+                document_ids = self._documents(item, sources)
+                assignments.append({key: value for key, value in item.items() if key != "package_choice"}
+                                   | {"document_ids": document_ids})
+                covered.extend(document_ids)
         for supplied in approved_assignments:
             document_ids = self._documents(supplied, sources)
             manifest_path = supplied.get("manifest_path")
@@ -113,6 +130,8 @@ class ParentPackageService:
                     "parser_key": request.parser_key, "rfq_uuid": request.rfq_uuid.lower(),
                     "package_version": request.package_version,
                     "sources": [sources[key] for key in sorted(sources)], "assignments": assignments}
+        if choice_ref is not None:
+            identity["package_choice"] = choice_ref
         plan_id = _hash(identity)
         plan = {**identity, "plan_id": plan_id}
         path = self._plan_path(plan_id)
@@ -131,7 +150,15 @@ class ParentPackageService:
         dispositions = self._dispositions(conflict_dispositions or {})
         groups: list[dict[str, Any]] = []
         complete = True
+        primaries = self._primary_selections(plan)
         for assignment in plan["assignments"]:
+            if assignment["kind"] == "excluded":
+                # Set aside by the package choice; recorded, never parsed (plan 8.2-2, 8.2-9).
+                groups.append({"kind": "excluded", "document_ids": assignment["document_ids"],
+                               "status": "excluded", "reason": assignment["reason"],
+                               "roles": assignment["roles"], "assemblies": assignment["assemblies"],
+                               "mapping_keys": [], "disposition_keys": []})
+                continue
             if assignment["kind"] == "approved_manifest":
                 try:
                     groups.extend(self._approved_outputs(plan, assignment, mappings))
@@ -166,8 +193,8 @@ class ParentPackageService:
                 complete &= all(item["status"] == "ready" for item in candidate_groups)
                 continue
             groups.append(projected)
-        groups = self._reconcile_review_groups(groups, dispositions)
-        complete &= all(group.get("status") == "ready" for group in groups)
+        groups = self._reconcile_review_groups(groups, dispositions, primaries)
+        complete &= all(group.get("status") in ("ready", "excluded") for group in groups)
         used_mappings = {key for group in groups for key in group.get("mapping_keys", [])}
         used_dispositions = {key for group in groups for key in group.get("disposition_keys", [])}
         if used_mappings != set(mappings) or used_dispositions != set(dispositions):
@@ -254,6 +281,8 @@ class ParentPackageService:
         processed_prefix = self._processed_prefix(plan)
         results = []
         for group in review["groups"]:
+            if group.get("status") == "excluded":
+                continue
             evidence = group["evidence"]
             fixtures = evidence["fixtures"]
             row_sets = [self._rows(self._candidate_bytes(item["output"], item["prefix"])
@@ -274,6 +303,8 @@ class ParentPackageService:
                 relation = "human_selected_conflict"
             else:
                 rows, relation = list(reconciliation.rows), reconciliation.relation
+                if evidence.get("reconciliation") == "primary_selected" and relation == "equivalent":
+                    relation = "primary_selected"
             output = self._workbook(rows)
             digest = hashlib.sha256(output).hexdigest()
             output_path = f"{prefix}/objects/{digest}.xlsx"
@@ -376,8 +407,33 @@ class ParentPackageService:
                 "sha256": hashlib.sha256(data).hexdigest()}
         return result
 
+    def _primary_selections(self, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Primary document id -> selection, from the plan's package choice (re-verified)."""
+        ref = plan.get("package_choice")
+        if ref is None:
+            return {}
+        from .bom_package_choice import PackageChoiceError, PackageChoiceService, excluded_assignments
+        try:
+            state = PackageChoiceService(self.storage).status(ref["request_id"])
+        except PackageChoiceError as exc:
+            raise PackageResolutionError("PACKAGE_CHOICE_BINDING") from exc
+        expected = [{key: value for key, value in item.items() if key != "package_choice"}
+                    for item in excluded_assignments(state)] if state["status"] == "completed" else None
+        recorded = [item for item in plan["assignments"] if item["kind"] == "excluded"]
+        if (state["status"] != "completed" or state["result_sha256"] != ref["result_sha256"]
+                or sorted(expected, key=lambda item: item["document_ids"]) != recorded):
+            raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
+        selections = {}
+        for entry in state["result"]["primary_selections"]:
+            if entry["excluded_document_ids"] and len(entry["primary_document_ids"]) == 1:
+                selections[entry["primary_document_ids"][0]] = {
+                    "assembly": entry["assembly"], "excluded_document_ids": entry["excluded_document_ids"],
+                    "package_choice": dict(ref)}
+        return selections
+
     def _reconcile_review_groups(self, groups: list[dict[str, Any]],
-                                 dispositions: dict[str, str]) -> list[dict[str, Any]]:
+                                 dispositions: dict[str, str],
+                                 primaries: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         """Merge all ready groups with the same assembly before approval."""
         passthrough = [item for item in groups if item.get("status") != "ready"]
         by_assembly: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -431,6 +487,11 @@ class ParentPackageService:
                             for member in members]}
             if disposition is not None:
                 evidence["conflict_disposition"] = disposition
+            selection = (primaries or {}).get(evidence["sources"][0]) if len(evidence["sources"]) == 1 else None
+            if selection is not None and reconciliation.relation == "equivalent":
+                # One primary chosen by the package choice and agreed by the cross-check (plan 8.2-8).
+                evidence["reconciliation"] = "primary_selected"
+                evidence["primary_selection"] = selection
             candidate_ids = {member.get("candidate_id") for member in members
                              if member.get("candidate_id") is not None}
             merged.append({"group_id": group_id, "kind": "assembly",
@@ -943,7 +1004,9 @@ class ParentPackageService:
                 self._output_bytes(output, f"{prefix}/objects/")
             except PackageResolutionError as exc:
                 raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT") from exc
-        expected = [item["document_id"] for item in plan["sources"]]
+        excluded = {doc for item in plan["assignments"] if item["kind"] == "excluded"
+                    for doc in item["document_ids"]}
+        expected = [item["document_id"] for item in plan["sources"] if item["document_id"] not in excluded]
         if (results != sorted(results, key=lambda item: item["document_ids"])
                 or sorted(covered) != sorted(expected) or len(covered) != len(set(covered))
             or seen_groups != set(review_groups)):

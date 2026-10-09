@@ -1,0 +1,13 @@
+# Package choice worker (plan 8.8 step 2): survey and primary-BOM choice. No model calls during build.
+# Inputs: REQUEST_ID and server-owned job configuration; outputs: immutable package-choice artifacts.
+# Build with Dockerfile.choice; deploy only as an approved change (plan 8.8 step 7).
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY bom_processor ./bom_processor
+COPY deterministic_api.py .
+COPY choice_job.py .
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER 10001
+ENTRYPOINT ["python", "choice_job.py"]
