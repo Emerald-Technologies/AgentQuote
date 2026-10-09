@@ -39,6 +39,16 @@ _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB]
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _SOURCE_EXTENSIONS = {".xls", ".xlsx", ".csv"}
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,254}$")
+# Package files (plan 8.8 step 2, Nick 2026-10-08): the uploaded root files for the
+# survey, staged content-addressed by QuickQuote. Limits mirror package evidence.
+_PACKAGE_FILE_PATH = re.compile(
+    r"^evidence-inputs/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
+    r"/package-(0|[1-9][0-9]*)/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
+    r"/([0-9a-f]{64})$")
+_PACKAGE_FILE_NAME = re.compile(r"^[^\\/:\x00-\x1f\x7f]{1,256}$")
+MAX_PACKAGE_FILES = 100
+MAX_PACKAGE_FILE_BYTES = 100_000_000
+MAX_PACKAGE_FILES_BYTES = 500_000_000
 
 
 class ProcessingError(ValueError):
@@ -380,6 +390,16 @@ class SourceDocument:
 
 
 @dataclass(frozen=True)
+class PackageFile:
+    """One uploaded root file of the package (ZIP, PDF, spreadsheet), for the survey."""
+    document_id: str
+    file_name: str
+    blob_path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class ProcessingRequest:
     job_id: str
     customer_key: str
@@ -388,6 +408,8 @@ class ProcessingRequest:
     package_version: str
     documents: tuple[SourceDocument, ...]
     force_candidate: bool = False
+    # None: field absent (requests from before 2026-10-08 keep their fingerprint).
+    package_files: tuple[PackageFile, ...] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ProcessingRequest":
@@ -395,15 +417,22 @@ class ProcessingRequest:
             raise ProcessingError("invalid request")
         try:
             unknown = set(value) - {"job_id", "customer_key", "parser_key", "rfq_uuid",
-                                    "package_version", "documents", "force_candidate"}
+                                    "package_version", "documents", "force_candidate",
+                                    "package_files"}
             if unknown or value.get("force_candidate", False) not in {False, True}:
                 raise ProcessingError("invalid request")
+            files = value.get("package_files")
+            if "package_files" in value and (not isinstance(files, list) or any(
+                    not isinstance(item, dict) or set(item) != {
+                        "document_id", "file_name", "blob_path", "size_bytes", "sha256"} for item in files)):
+                raise ProcessingError("invalid package files")
             request = cls(
                 value.get("job_id", ""), value.get("customer_key", ""),
                 value.get("parser_key", ""), value.get("rfq_uuid", ""),
                 value.get("package_version", ""),
                 tuple(SourceDocument(**document) for document in value["documents"]),
                 value.get("force_candidate", False),
+                None if files is None else tuple(PackageFile(**item) for item in files),
             )
         except (TypeError, KeyError) as exc:
             raise ProcessingError("invalid request") from exc
@@ -442,6 +471,33 @@ class ProcessingRequest:
                     or not isinstance(document.sha256, str)
                     or not _SHA256.fullmatch(document.sha256)):
                 raise ProcessingError("invalid source metadata")
+        if self.package_files is not None:
+            self._validate_package_files()
+
+    def _validate_package_files(self) -> None:
+        files = self.package_files or ()
+        if not 1 <= len(files) <= MAX_PACKAGE_FILES:
+            raise ProcessingError("invalid package files")
+        ids: set[str] = set()
+        total = 0
+        for item in files:
+            match = _PACKAGE_FILE_PATH.fullmatch(item.blob_path) if isinstance(item.blob_path, str) else None
+            if (not isinstance(item.document_id, str) or not _UUID.fullmatch(item.document_id)
+                    or item.document_id != item.document_id.lower() or item.document_id in ids
+                    or not isinstance(item.file_name, str) or not _PACKAGE_FILE_NAME.fullmatch(item.file_name)
+                    or not item.file_name.strip()
+                    or type(item.size_bytes) is not int or not 0 <= item.size_bytes <= MAX_PACKAGE_FILE_BYTES
+                    or not isinstance(item.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", item.sha256)
+                    or match is None or match.group(1) != self.rfq_uuid.lower()
+                    or match.group(2) != self.package_version
+                    or match.group(3) != item.document_id or match.group(4) != item.sha256):
+                raise ProcessingError("invalid package files")
+            ids.add(item.document_id)
+            total += item.size_bytes
+        if total > MAX_PACKAGE_FILES_BYTES:
+            raise ProcessingError("invalid package files")
+        if [item.document_id for item in files] != sorted(ids):
+            raise ProcessingError("invalid package files")
 
     def fingerprint(self) -> str:
         payload = {
@@ -455,6 +511,12 @@ class ProcessingRequest:
                 for document in self.documents
             ],
         }
+        if self.package_files is not None:
+            payload["package_files"] = [
+                {"document_id": item.document_id, "file_name": item.file_name,
+                 "blob_path": item.blob_path, "size_bytes": item.size_bytes, "sha256": item.sha256}
+                for item in self.package_files
+            ]
         return _sha256(_json_bytes(payload))
 
 
