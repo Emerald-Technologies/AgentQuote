@@ -28,12 +28,10 @@ from .candidates import CandidateRequiredError, persist_candidate
 
 CONTRACT_VERSION = "1"
 OUTPUT_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-CANONICAL_COLUMNS = [
-    "line_number", "item_number", "item_name", "revision", "item_category",
-    "unit_of_measure", "quantity", "reference_designator", "bom_notes",
-] + [column for index in range(1, 9) for column in (
-    f"manufacturer_{index}", f"manufacturer_item_number_{index}"
-)]
+# Canonical workbook columns and the variable manufacturer/MPN pair rules (plan 8.12).
+from .canonical_format import (  # noqa: E402  (re-exported for existing importers)
+    BASE_COLUMNS, CANONICAL_COLUMNS, MAX_MANUFACTURER_PAIRS, MIN_MANUFACTURER_PAIRS,
+    canonical_columns, canonical_pair_count, pair_indexes, row_pair_count)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -720,13 +718,15 @@ def _validate_xlsx(path: Path, max_rows: int) -> None:
         frame = pd.read_excel(path, engine="openpyxl")
     except Exception as exc:
         raise ProcessingError("parsed workbook invalid") from exc
-    if list(frame.columns) != CANONICAL_COLUMNS or frame.empty or len(frame) > max_rows:
+    pair_count = canonical_pair_count(frame.columns)
+    if pair_count is None or frame.empty or len(frame) > max_rows:
         raise ProcessingError("parsed schema invalid")
+    columns = canonical_columns(pair_count)
     line_numbers = pd.to_numeric(frame["line_number"], errors="coerce")
     if (line_numbers.isna().any() or not line_numbers.map(lambda value: float(value).is_integer()).all()
             or line_numbers.astype(int).tolist() != list(range(1, len(frame) + 1))):
         raise ProcessingError("invalid line numbers")
-    string_columns = [column for column in CANONICAL_COLUMNS if column not in {"line_number", "quantity"}]
+    string_columns = [column for column in columns if column not in {"line_number", "quantity"}]
     required_strings = {"item_number", "item_name", "item_category"}
     for column in string_columns:
         for value in frame[column].tolist():
@@ -752,7 +752,7 @@ def _validate_xlsx(path: Path, max_rows: int) -> None:
     quantities = pd.to_numeric(frame.loc[required_quantity, "quantity"], errors="coerce")
     if quantities.isna().any() or not quantities.map(math.isfinite).all():
         raise ProcessingError("quantity invalid")
-    for index in range(1, 9):
+    for index in range(1, pair_count + 1):
         manufacturers = frame[f"manufacturer_{index}"].map(_is_present)
         part_numbers = frame[f"manufacturer_item_number_{index}"].map(_is_present)
         if not manufacturers.equals(part_numbers):

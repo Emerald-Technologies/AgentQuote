@@ -14,6 +14,8 @@ from typing import Any
 
 from openpyxl import load_workbook
 
+from .canonical_format import pair_indexes
+
 POLICY_VERSION = "xlsx-document-roles.v2"
 MAX_ROWS = 100_000
 MAX_COLUMNS = 256
@@ -133,7 +135,7 @@ def check_document_roles(source: bytes, parsed_rows: list[dict[str, Any]]) -> di
         for row in parsed_rows:
             if _key(row.get("item_category")) != "document":
                 continue
-            if any(_text(row.get(f"{prefix}_{index}")) for index in range(1, 9)
+            if any(_text(row.get(f"{prefix}_{index}")) for index in pair_indexes(row)
                    for prefix in ("manufacturer", "manufacturer_item_number")):
                 return {**evidence, "result": "document_manufacturer_fields"}
             actual[(_text(row.get("item_number")), _text(row.get("revision")),

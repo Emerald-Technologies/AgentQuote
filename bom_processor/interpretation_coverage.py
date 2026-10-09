@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Any
 
-from .core import CANONICAL_COLUMNS
+from .canonical_format import canonical_columns, canonical_pair_count
 from .interpretation_inventory import EXTRACTION_VERSION, MAX_CELLS, extract_inventory
 
 VERSION = "bom-interpretation.v1"
@@ -99,9 +99,11 @@ def verify_coverage(source: bytes, extension: str, output: bytes, sidecar: bytes
     _require(parsed.sheets == (sheet,), "OUTPUT_SHEETS_INVALID")
     # Parser output must hold literal values; only customer sources may carry formulas.
     _require(not parsed.formula_cells, "OUTPUT_FORMULA_PRESENT")
-    _require(tuple(parsed.cells.get((sheet, 1, col)) for col in range(1, 26)) == tuple(CANONICAL_COLUMNS),
-             "OUTPUT_HEADERS_INVALID")
-    _require(all(column <= 25 for _, _, column in parsed.cells), "OUTPUT_COLUMNS_INVALID")
+    width = max([column for name, row_number, column in parsed.cells if name == sheet and row_number == 1] or [0])
+    pair_count = canonical_pair_count(parsed.cells.get((sheet, 1, col)) for col in range(1, width + 1))
+    _require(pair_count is not None, "OUTPUT_HEADERS_INVALID")
+    columns = canonical_columns(pair_count)
+    _require(all(column <= len(columns) for _, _, column in parsed.cells), "OUTPUT_COLUMNS_INVALID")
     records, coverage, findings = proposal["records"], proposal["coverage"], proposal["findings"]
     _require(isinstance(records, list) and 0 < len(records) <= 100_000
              and isinstance(coverage, list) and len(coverage) <= MAX_CELLS
@@ -121,23 +123,23 @@ def verify_coverage(source: bytes, extension: str, output: bytes, sidecar: bytes
         _require(type(line) is int and line == row - 1, "OUTPUT_LINE_NUMBER_INVALID")
         _require(parsed.cells.get((sheet, row, 5)) == record["category"], "OUTPUT_CATEGORY_INVALID")
         fields = record["fields"]
-        _require(isinstance(fields, dict) and set(fields) <= set(CANONICAL_COLUMNS) - {"line_number", "item_category"},
+        _require(isinstance(fields, dict) and set(fields) <= set(columns) - {"line_number", "item_category"},
                  "FIELD_KEYS_INVALID")
         for required in ("item_number", "item_name"):
-            _require(bool(parsed.cells.get((sheet, row, CANONICAL_COLUMNS.index(required) + 1))), "OUTPUT_IDENTITY_MISSING")
+            _require(bool(parsed.cells.get((sheet, row, columns.index(required) + 1))), "OUTPUT_IDENTITY_MISSING")
         quantity = parsed.cells.get((sheet, row, 7))
         if record["category"] == "Part":
             _require(quantity is not None and _same(quantity, quantity, True), "PART_QUANTITY_INVALID")
-        populated = {field for col, field in enumerate(CANONICAL_COLUMNS, 1)
+        populated = {field for col, field in enumerate(columns, 1)
                      if col not in (1, 5) and (sheet, row, col) in parsed.cells}
         _require(set(fields) == populated, "OUTPUT_FIELD_COVERAGE_INVALID")
         for field, ref in fields.items():
             location = _locator(ref)
             _require(location in original.cells, "SOURCE_CELL_MISSING")
-            target = parsed.cells[(sheet, row, CANONICAL_COLUMNS.index(field) + 1)]
+            target = parsed.cells[(sheet, row, columns.index(field) + 1)]
             _require(_same(original.cells[location], target, field == "quantity"), "SOURCE_VALUE_CHANGED")
             links.append((location, record["id"], field))
-        for slot in range(1, 9):
+        for slot in range(1, pair_count + 1):
             manufacturer = f"manufacturer_{slot}"
             mpn = f"manufacturer_item_number_{slot}"
             _require((manufacturer in fields) == (mpn in fields), "MANUFACTURER_PAIR_INCOMPLETE")

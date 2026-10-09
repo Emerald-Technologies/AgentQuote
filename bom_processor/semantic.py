@@ -15,8 +15,13 @@ from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
+from .canonical_format import MAX_MANUFACTURER_PAIRS, pair_indexes
+
 _MAX_EVIDENCE = 40
 _MAX_VALUE_LENGTH = 160
+# Numbered manufacturer/MPN column, matched against _key(name) so every alias _component reads
+# (manufacturer_N, mfr_N, manufacturer_item_number_N, mpn_N, part_number_N) is found.
+_NUMBERED_PAIR = re.compile(r"(?:manufacturer|mfr|manufactureritemnumber|mpn|partnumber)([1-9][0-9]{0,3})")
 
 
 def _norm(value: Any) -> str:
@@ -152,7 +157,11 @@ def _component(row: Mapping[str, Any]) -> Component:
         ("install", _norm(_first(row, ("install", "installation", "install_type", "mount_type")))),
     )
     pairs: set[tuple[str, str]] = set()
-    for index in range(1, 65):
+    # Every numbered pair present is read, whatever its index, so a count above the format
+    # maximum reaches the limit check in reconcile_boms instead of being dropped here.
+    highest = max([0, *(int(match.group(1)) for key in row
+                        if (match := _NUMBERED_PAIR.fullmatch(_key(key))))])
+    for index in range(1, highest + 1):
         manufacturer = _first(row, (f"manufacturer_{index}", f"mfr_{index}", f"manufacturer {index}"))
         mpn = _first(row, (f"manufacturer_item_number_{index}", f"mpn_{index}", f"mpn {index}", f"part_number_{index}"))
         if _norm(manufacturer) or _norm(mpn):
@@ -269,7 +278,7 @@ def reconcile_boms(row_sets: Iterable[Iterable[Mapping[str, Any]]], *,
 
     Every input is normalized as a multiset. Material differences block the
     operation. Compatible manufacturer/MPN alternatives are unioned in sorted
-    order, with the output schema's eight-pair limit enforced fail closed.
+    order, with the output schema's MAX_MANUFACTURER_PAIRS limit enforced fail closed.
     """
     sets = [[dict(row) for row in rows] for rows in row_sets]
     if not sets:
@@ -300,10 +309,10 @@ def reconcile_boms(row_sets: Iterable[Iterable[Mapping[str, Any]]], *,
             pair_sets = [set(dict(component.optional).get("manufacturer_mpn", ()))
                          for component in components]
             pairs = sorted(set().union(*pair_sets))
-            if len(pairs) > 8:
+            if len(pairs) > MAX_MANUFACTURER_PAIRS:
                 return BomReconciliation("conflict", (), ({
                     "kind": "manufacturer_mpn_limit", "identity": _safe(key[0]),
-                    "pair_count": len(pairs), "maximum": 8,
+                    "pair_count": len(pairs), "maximum": MAX_MANUFACTURER_PAIRS,
                 },))
             if any(values != pair_sets[0] for values in pair_sets[1:]):
                 relation = "merged"
@@ -313,7 +322,7 @@ def reconcile_boms(row_sets: Iterable[Iterable[Mapping[str, Any]]], *,
             representative = min((entry[1] for entry in entries),
                                  key=lambda row: json.dumps(row, sort_keys=True, default=str))
             row = dict(representative)
-            for index in range(1, 9):
+            for index in pair_indexes(row):
                 row[f"manufacturer_{index}"] = None
                 row[f"manufacturer_item_number_{index}"] = None
             for index, (manufacturer, mpn) in enumerate(pairs, 1):

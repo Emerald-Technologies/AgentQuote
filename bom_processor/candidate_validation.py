@@ -555,7 +555,8 @@ class CandidateValidationService:
         version = manifest.get("version")
         if isinstance(version, str) and version.startswith("candidate-authoring."):
             identity["authoring_version"] = version
-        if version in {"candidate-authoring.v6", ASSOCIATION_AUTHORING_VERSION}:
+        # Every association-authoring version (v6, v8, current) carries an association artifact.
+        if version in {"candidate-authoring.v6", "candidate-authoring.v8", ASSOCIATION_AUTHORING_VERSION}:
             ref = manifest.get("assembly_associations")
             if (not isinstance(ref, dict) or set(ref) != {"blob_path", "sha256", "size_bytes"}
                     or ref["blob_path"] != f"{base}/assembly-associations.json"

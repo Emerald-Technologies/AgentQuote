@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from .core import CANONICAL_COLUMNS
+from .canonical_format import MAX_MANUFACTURER_PAIRS, canonical_pair_count
 from .master_registry import html_table_raw_rows
 
 POLICY_VERSION = "arena-html-policy.v2"
@@ -108,16 +108,17 @@ def validate(source: bytes, output: bytes, *, source_sha256: str, candidate_code
         source_items.append({"item_number": item, "quantity": quantity, "pairs": populated,
                              "document": document})
         decisions.append({"row": row_number, "item_number": item, "decision": "include"})
+        # Every pair is carried and compared below (plan 8.12); none is omitted. Above the format maximum
+        # the result is invalid. A half-filled pair above 8 stays invalid, as before.
         for index, name, mpn in populated:
-            if index > 8 and name and mpn:
-                decisions.append({"row": row_number, "item_number": item, "pair": index, "decision": "omitted_by_contract"})
-            elif index > 8:
+            if index > MAX_MANUFACTURER_PAIRS:
+                return {**base, "valid": False, "reason": "manufacturer_pair_limit", "row": row_number, "pair": index, "decisions": decisions}
+            if index > 8 and not (name and mpn):
                 return {**base, "valid": False, "reason": "half_populated_manufacturer_pair", "row": row_number, "pair": index, "decisions": decisions}
 
     frame = pd.read_excel(io.BytesIO(output), engine="openpyxl", dtype=object)
     out_headers = {str(name): index for index, name in enumerate(frame.columns)}
-    required = set(CANONICAL_COLUMNS)
-    if set(frame.columns) != required:
+    if canonical_pair_count(frame.columns) is None:
         return {**base, "valid": False, "reason": "output_schema", "decisions": decisions}
     output_items = {}
     for row_index, row in frame.iterrows():
@@ -143,8 +144,6 @@ def validate(source: bytes, output: bytes, *, source_sha256: str, candidate_code
                 return {**base, "valid": False, "reason": "document_quantity_changed",
                         "item_number": item["item_number"], "decisions": decisions}
         for index, name, mpn in item["pairs"]:
-            if index > 8:
-                continue
             out_name, out_mpn = _text(row.get(f"manufacturer_{index}")), _text(row.get(f"manufacturer_item_number_{index}"))
             if out_name.casefold() != name.casefold() or out_mpn != mpn:
                 return {**base, "valid": False, "reason": "manufacturer_pair_mismatch", "item_number": item["item_number"], "pair": index, "decisions": decisions}

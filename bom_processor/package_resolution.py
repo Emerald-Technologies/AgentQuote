@@ -903,14 +903,20 @@ class ParentPackageService:
         always produce identical bytes.
         """
         import pandas as pd
+        from .canonical_format import PairCountError, canonical_columns, row_pair_count
+        try:
+            # 8 pairs (today's 25 columns) unless a row needs more (plan 8.12); never truncated.
+            columns = canonical_columns(row_pair_count(rows))
+        except PairCountError as exc:
+            raise PackageResolutionError("MANUFACTURER_PAIR_LIMIT") from exc
         normalized = []
         for index, item in enumerate(rows, 1):
-            row = {column: item.get(column) for column in CANONICAL_COLUMNS}
+            row = {column: item.get(column) for column in columns}
             row["line_number"] = index
             normalized.append(row)
         stream = io.BytesIO()
         with pd.ExcelWriter(stream, engine="openpyxl") as writer:
-            pd.DataFrame(normalized, columns=CANONICAL_COLUMNS).to_excel(writer, index=False)
+            pd.DataFrame(normalized, columns=columns).to_excel(writer, index=False)
             writer.book.properties.created = _WORKBOOK_EPOCH
             writer.book.properties.modified = _WORKBOOK_EPOCH
         return ParentPackageService._normalized_xlsx(stream.getvalue())

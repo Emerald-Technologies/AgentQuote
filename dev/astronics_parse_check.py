@@ -76,6 +76,7 @@ TARGET_COLUMNS = [
     'manufacturer_7', 'manufacturer_item_number_7',
     'manufacturer_8', 'manufacturer_item_number_8',
 ]
+MAX_PAIRS = 50  # canonical maximum; more is a failure, never a truncation
 
 
 def get_engine(filepath):
@@ -263,6 +264,7 @@ def parse_astronics_bom(input_path, output_path):
 
     # Build output rows
     output_rows = []
+    widest = 8
     for item_number, item_data in grouped.items():
         # Determine item_category based on description keywords
         if is_document_item(item_data['item_name']):
@@ -285,32 +287,32 @@ def parse_astronics_bom(input_path, output_path):
             'bom_notes': item_data['bom_notes'],
         }
 
-        # Add up to 8 manufacturer fields
+        # Every manufacturer pair is kept; columns widen past 8 below (never truncated).
         mfrs = item_data['manufacturers']
-        for idx in range(8):
-            if idx < len(mfrs):
-                row_out[f'manufacturer_{idx + 1}'] = mfrs[idx][0]
-                row_out[f'manufacturer_item_number_{idx + 1}'] = mfrs[idx][1]
-            else:
-                row_out[f'manufacturer_{idx + 1}'] = ''
-                row_out[f'manufacturer_item_number_{idx + 1}'] = ''
-
-        if len(mfrs) > 8:
-            logger.warning(f"Item {item_number} has {len(mfrs)} manufacturer alternates, "
-                           f"only first 8 included")
+        if len(mfrs) > MAX_PAIRS:
+            logger.error(f"Item {item_number} has {len(mfrs)} manufacturer pairs; "
+                         f"the canonical maximum is {MAX_PAIRS}")
+            return 1
+        for idx, (mfg, mfg_num) in enumerate(mfrs):
+            row_out[f'manufacturer_{idx + 1}'] = mfg
+            row_out[f'manufacturer_item_number_{idx + 1}'] = mfg_num
+        widest = max(widest, len(mfrs))
 
         output_rows.append(row_out)
 
     # Create DataFrame with canonical column order
     output_df = pd.DataFrame(output_rows)
 
-    # Ensure all required columns exist
-    for col in TARGET_COLUMNS:
+    # Canonical header: 8 pairs unless a line needs more (format/SCHEMA.md "Pair count").
+    columns = TARGET_COLUMNS + [col for idx in range(9, widest + 1) for col in (
+        f'manufacturer_{idx}', f'manufacturer_item_number_{idx}')]
+    for col in columns:
         if col not in output_df.columns:
             output_df[col] = ''
+    output_df[columns] = output_df[columns].fillna('')
 
     # Reorder columns to match canonical schema
-    output_df = output_df[TARGET_COLUMNS]
+    output_df = output_df[columns]
 
     # Sort by line_number
     output_df = output_df.sort_values('line_number').reset_index(drop=True)

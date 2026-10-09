@@ -25,6 +25,7 @@ import re
 from collections import Counter
 from typing import Any, Iterable, Mapping
 
+from .canonical_format import pair_indexes
 from .semantic import _norm, _number
 
 VERSION = "bom-content-alignment.v2"
@@ -50,7 +51,7 @@ def _refdes(value: Any) -> frozenset[str]:
 
 
 def _mpns(row: Mapping[str, Any]) -> frozenset[str]:
-    return frozenset(value for index in range(1, 9)
+    return frozenset(value for index in pair_indexes(row)
                      if (value := _norm(row.get(f"manufacturer_item_number_{index}"))))
 
 

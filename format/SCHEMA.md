@@ -34,6 +34,15 @@ Reference file: `format/finalformat.xlsx`
 | 23 | `manufacturer_item_number_7` | str | No | Alternate MPN 6 |
 | 24 | `manufacturer_8` | str | No | Alternate manufacturer 7 |
 | 25 | `manufacturer_item_number_8` | str | No | Alternate MPN 7 |
+| 26+ | `manufacturer_N`, `manufacturer_item_number_N` | str | No | Further pairs, only when needed (see below) |
+
+### Pair count
+
+A workbook always has pairs 1..N in order with no gaps. N is 8 (exactly the 25 columns above)
+unless a line has more than 8 pairs; then N is the highest pair used by any line, and every row
+has the same columns. The maximum is 50 pairs (109 columns). A line with more than 50 pairs is a
+`manufacturer_pair_limit` / `MANUFACTURER_PAIR_LIMIT` failure, never a truncation. Source of
+truth: `bom_processor/canonical_format.py`.
 
 ## Data Type Notes
 
@@ -44,7 +53,7 @@ Reference file: `format/finalformat.xlsx`
 - `quantity`: Float — supports fractional values (e.g. 0.04 for bulk solder by weight)
 - All string fields: UTF-8, no leading/trailing whitespace after normalization
 - Empty cells should be `NaN`/`None` in the output, not empty strings
-- `manufacturer_N` and `manufacturer_item_number_N` come in pairs: if manufacturer_N is populated, its corresponding MPN should also be populated
+- `manufacturer_N` and `manufacturer_item_number_N` come in pairs: if manufacturer_N is populated, its corresponding MPN should also be populated (checked for every pair N, not only 1-8)
 
 ## Example Row
 

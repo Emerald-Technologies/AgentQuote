@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .canonical_format import pair_indexes
 from .semantic import AssemblyIdentity, normalize_bom
 
 
@@ -64,7 +65,7 @@ def facts_from_rows(rows: list[dict[str, Any]], *, output_sha256: str = "",
     mpn_count = sum(
         1
         for row in rows
-        for index in range(1, 9)
+        for index in pair_indexes(row)
         if not _missing(row.get(f"manufacturer_item_number_{index}"))
         and bool(str(row.get(f"manufacturer_item_number_{index}")).strip())
     )

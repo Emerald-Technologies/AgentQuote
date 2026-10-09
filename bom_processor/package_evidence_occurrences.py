@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 
 import openpyxl
 
-from .core import CANONICAL_COLUMNS
+from .canonical_format import MAX_MANUFACTURER_PAIRS, canonical_columns, canonical_pair_count
 from .package_evidence_contracts import (
     PackageEvidenceError, assemblies_metadata, detached, integer, nullable_text,
     occurrence_id, require, semantic_key, text,
@@ -145,8 +145,8 @@ def _preflight(data: bytes, *, max_sheets: int, max_rows: int) -> None:
                 column = 0
                 for char in match.group(1):
                     column = column * 26 + ord(char) - ord("A") + 1
-                require(column <= len(CANONICAL_COLUMNS) and int(match.group(2)) <= max_rows + 1,
-                        "WORKBOOK_ROW_SCHEMA")
+                require(column <= len(canonical_columns(MAX_MANUFACTURER_PAIRS))
+                        and int(match.group(2)) <= max_rows + 1, "WORKBOOK_ROW_SCHEMA")
                 require(locator not in cell_locations, "WORKBOOK_DUPLICATE_CELL")
                 cell_locations.add(locator)
     require(sheets > 0, "WORKBOOK_INVALID")
@@ -183,7 +183,9 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                 sheet.reset_dimensions()
                 iterator = sheet.iter_rows()
                 header = next(iterator, ())
-                require([cell.value for cell in header] == CANONICAL_COLUMNS, "WORKBOOK_HEADER")
+                pair_count = canonical_pair_count(cell.value for cell in header)
+                require(pair_count is not None, "WORKBOOK_HEADER")
+                columns = canonical_columns(pair_count)
                 line = 0
                 for row_number, cells in enumerate(iterator, 2):
                     require(row_number <= max_rows + 1, "WORKBOOK_ROW_LIMIT")
@@ -192,13 +194,13 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                         continue
                     count += 1
                     require(count <= max_rows, "WORKBOOK_ROW_LIMIT")
-                    require(len(values) <= len(CANONICAL_COLUMNS), "WORKBOOK_ROW_SCHEMA")
-                    values += [None] * (len(CANONICAL_COLUMNS) - len(values))
+                    require(len(values) <= len(columns), "WORKBOOK_ROW_SCHEMA")
+                    values += [None] * (len(columns) - len(values))
                     require(all(cell.data_type not in {"f", "e"} for cell in cells),
                             "WORKBOOK_CELL_INVALID")
                     require(not any(isinstance(value, (bool, date, datetime, time)) for value in values),
                             "WORKBOOK_CELL_INVALID")
-                    row = dict(zip(CANONICAL_COLUMNS, values))
+                    row = dict(zip(columns, values))
                     line += 1
                     require(type(row["line_number"]) in {int, float}
                             and row["line_number"] == line, "WORKBOOK_LINE_NUMBER")
@@ -207,13 +209,13 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                     text(row["item_name"], 2000, controls=True)
                     nullable_text(row["revision"])
                     nullable_text(row["reference_designator"], 2000, controls=True)
-                    for key in CANONICAL_COLUMNS:
+                    for key in columns:
                         if key not in {"line_number", "quantity", "item_number", "item_name",
                                        "revision", "reference_designator", "item_category"}:
                             nullable_text(row[key], 2000, controls=True)
                     row["quantity"] = quantity_text(row["quantity"])
                     output.append({"sheet": sheet.title, "row": row_number, **row,
-                                   "_source_cells": values})
+                                   "_source_cells": values, "_pairs": pair_count})
             require(bool(output), "WORKBOOK_EMPTY")
             parsed[document_id] = output
         except PackageEvidenceError:
@@ -248,7 +250,7 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                 "bomNotes": row["bom_notes"], "unitOfMeasure": row["unit_of_measure"],
                 "manufacturerPairs": [{f"manufacturer_{index}": row[f"manufacturer_{index}"],
                     f"manufacturer_item_number_{index}": row[f"manufacturer_item_number_{index}"]}
-                    for index in range(1, 9)],
+                    for index in range(1, row["_pairs"] + 1)],
             })
             if row["item_category"] == "Document":
                 documents.append(common)

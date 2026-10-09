@@ -4,7 +4,7 @@ import io
 import pandas as pd
 
 from bom_processor.arena_policy import is_arena_source, validate, verify_evidence
-from bom_processor.core import CANONICAL_COLUMNS
+from bom_processor.core import CANONICAL_COLUMNS, canonical_columns
 
 
 def sha(data: bytes) -> str:
@@ -28,8 +28,8 @@ def arena(rows: list[list[str]], extra_pairs: int = 0) -> bytes:
             "".join(body) + "</table></body></html>").encode()
 
 
-def output(rows: list[dict]) -> bytes:
-    frame = pd.DataFrame(rows, columns=CANONICAL_COLUMNS)
+def output(rows: list[dict], pairs: int = 8) -> bytes:
+    frame = pd.DataFrame(rows, columns=canonical_columns(pairs))
     stream = io.BytesIO()
     frame.to_excel(stream, index=False, engine="openpyxl")
     return stream.getvalue()
@@ -98,7 +98,8 @@ def test_parent_omission_requires_first_row_and_exact_evidence():
     assert evidence["reason"] == "blank_quantity"
 
 
-def test_preserves_first_eight_pairs_and_discloses_later_pairs():
+def test_carries_every_pair_above_eight_and_refuses_an_output_that_drops_one():
+    # Regression (plan 8.12): pairs above 8 used to be recorded as omitted while the result stayed valid.
     base = ["P1", "Component", "A", "Resistor", "EA", "1", "R1", "SMT"]
     pairs = []
     for index in range(1, 10):
@@ -108,10 +109,12 @@ def test_preserves_first_eight_pairs_and_discloses_later_pairs():
     for index in range(1, 9):
         row[f"manufacturer_{index}"] = f"Maker {index}"
         row[f"manufacturer_item_number_{index}"] = f"MPN-{index}"
-    evidence = validate_fixture(source, output([row]))
-    assert evidence["valid"] is True
-    assert any(item.get("decision") == "omitted_by_contract" and item.get("pair") == 9
-               for item in evidence["decisions"])
+    dropped = validate_fixture(source, output([row]))
+    assert dropped["valid"] is False and dropped["reason"] == "manufacturer_pair_mismatch" and dropped["pair"] == 9
+    assert not any(item.get("decision") == "omitted_by_contract" for item in dropped["decisions"])
+    row["manufacturer_9"], row["manufacturer_item_number_9"] = "Maker 9", "MPN-9"
+    evidence = validate_fixture(source, output([row], pairs=9))
+    assert evidence["valid"] is True and evidence["omitted_count"] == 0
 
 
 def test_rejects_missing_component_or_changed_manufacturer_pair():

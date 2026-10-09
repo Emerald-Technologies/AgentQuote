@@ -16,11 +16,12 @@ MAX_CODE_BYTES = 1_000_000
 MAX_SOURCE_BYTES = 50_000_000
 # Version changes are identity changes: a replacement cannot reuse a
 # contained candidate produced by an older authoring policy.
-AUTHORING_VERSION = "candidate-authoring.v7"
-ASSOCIATION_AUTHORING_VERSION = "candidate-authoring.v8"
+# v9/v10 (plan 8.12): output rules carry manufacturer/MPN pairs beyond 8 and fail above 50.
+AUTHORING_VERSION = "candidate-authoring.v9"
+ASSOCIATION_AUTHORING_VERSION = "candidate-authoring.v10"
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
-    "write exactly the supplied canonical columns in the supplied order and at least one data row",
+    "write exactly the supplied canonical columns in the supplied order and at least one data row; when any line has more than 8 manufacturer/MPN pairs, append manufacturer_9, manufacturer_item_number_9, and so on in that order up to the widest line (at most 50 pairs), the same columns for every row, never dropping a pair",
     "line_number must be consecutive integers starting at 1",
     "item_number, item_name, and item_category must be non-empty trimmed strings",
     "map source component taxonomy such as Capacitor, Resistor, or PCB assembly to canonical item_category='Part'; reserve item_category='Document' for document, drawing, or specification rows; do not require the source category to already be Part or Document",
@@ -30,7 +31,8 @@ CANONICAL_OUTPUT_RULES = (
     "overloaded Manufacturer / Document ID and MPN / Revision columns contain document identity and revision on document rows, not manufacturer/MPN pairs; leave all manufacturer fields empty for those rows, preserve description and quantity, and fail on ambiguous roles rather than guess",
     "preserve actual Part quantities and all supplied primary and alternate manufacturer/MPN pairs independently of document references",
     "all populated strings must be trimmed; use None for unavailable optional values",
-    "manufacturer_N and manufacturer_item_number_N must either both be populated or both be empty for N 1 through 8",
+    "manufacturer_N and manufacturer_item_number_N must either both be populated or both be empty for every pair N written",
+    "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
     "read only --input and write only --output; do not access network",
 )

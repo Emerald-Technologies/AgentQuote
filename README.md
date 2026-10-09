@@ -120,8 +120,12 @@ The quoting module expects BOMs in the format defined by `format/finalformat.xls
 | `quantity` | float | Per-assembly quantity |
 | `reference_designator` | str | PCB refdes (e.g. R1,R2,C1-C5) |
 | `bom_notes` | str | Production notes, RoHS status |
-| `manufacturer_1`..`manufacturer_8` | str | Manufacturer names |
-| `manufacturer_item_number_1`..`manufacturer_item_number_8` | str | Manufacturer part numbers |
+| `manufacturer_1`..`manufacturer_N` | str | Manufacturer names |
+| `manufacturer_item_number_1`..`manufacturer_item_number_N` | str | Manufacturer part numbers |
+
+N is 8 (the classic 25 columns) unless a line has more pairs; then N is the widest line,
+at most 50. More than 50 pairs is refused, never truncated. See `format/SCHEMA.md` and
+`bom_processor/canonical_format.py`.
 
 ## Using This Agent from Other Repos
 
