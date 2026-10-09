@@ -11,7 +11,7 @@ from typing import Any
 
 from .core import BlobConflictError, BlobNotFoundError
 from .package_evidence_contracts import (
-    ASSESSED_POLICIES, CLASSIFIED_POLICIES, PackageEvidenceError, RETAINED_POLICIES, REVIEWED_POLICIES,
+    ASSESSED_POLICIES, CLASSIFIED_POLICIES, COMPACT_POLICIES, PackageEvidenceError, RETAINED_POLICIES, REVIEWED_POLICIES,
     assemblies_metadata, detached, digest, failure_causes, hash_value, integer, json_bytes, object_hash, require,
     strict, text, uuid_value,
 )
@@ -113,6 +113,37 @@ def evidence_request(context: dict, roots: list[dict], workbooks: list[dict], po
         body.update(version=V4, retry=validate_retry(retry))
     require(len(json_bytes(body)) <= MAX_METADATA, "REQUEST_METADATA_LIMIT")
     return {**body, "requestId": object_hash(body)}
+
+
+class CallAnswerStore:
+    """Checked answers of v6 model calls, keyed by a hash of the exact call input and policy.
+
+    AgentQuote-internal (QuickQuote never reads it). A rerun of the same package repeats only the
+    calls whose input changed or that failed; a stored answer is still re-checked before use.
+    """
+
+    def __init__(self, storage: Any):
+        self.storage = storage
+
+    @staticmethod
+    def _path(key: str) -> str:
+        return f"package-evidence-calls/{hash_value(key)}.json"
+
+    def get(self, key: str) -> Any:
+        try:
+            raw = self.storage.download_registry(self._path(key), MAX_GRAPH)
+            value = json.loads(raw.decode("utf-8"))
+        except BlobNotFoundError:
+            return None
+        except (ValueError, UnicodeError, RecursionError):
+            return None
+        return value if type(value) is dict and json_bytes(value) == raw else None
+
+    def put(self, key: str, value: dict) -> None:
+        try:
+            self.storage.upload_registry_immutable(self._path(key), json_bytes(value), "application/json")
+        except BlobConflictError:
+            pass  # an identical-input answer already stored; it is re-checked when read
 
 
 class EvidenceJobService:
@@ -377,7 +408,9 @@ class EvidenceJobService:
             classified = policy["policyVersion"] in CLASSIFIED_POLICIES
             assessed = policy["policyVersion"] in ASSESSED_POLICIES
             reviewed = policy["policyVersion"] in REVIEWED_POLICIES
+            compact = policy["policyVersion"] in COMPACT_POLICIES
             review_inputs: dict | None = {} if reviewed else None
+            call_store = CallAnswerStore(self.storage) if compact else None
             successor = request.get("successor")
             context = request["context"] if successor is None else {
                 **request["context"], "predecessorProposalSha256": successor["predecessorProposalSha256"]}
@@ -388,10 +421,16 @@ class EvidenceJobService:
                 include_classification=classified, include_manufacturing=assessed,
                 retained_bom_sources=request.get("retainedBomSources"),
                 correction=None if successor is None else {"attempt": successor["attempt"], "feedback": successor["feedback"]},
-                review_inputs=review_inputs)
+                review_inputs=review_inputs, **({"call_store": call_store} if compact else {}))
             graph = produced["proposal"] if classified else produced
             review = None
-            if reviewed:
+            if reviewed and compact:
+                # Same file views and split as the producer; a failed review call leaves its claims
+                # uncertain, and a review that fails entirely is published as failed (as for v5).
+                from .package_evidence_compact import review_compact
+                review = review_compact(review_inputs, graph, produced["classification"],
+                                        produced["manufacturingAssessment"], model, call_store)
+            elif reviewed:
                 # Second, independent model call. Its failure never discards the paid proposal:
                 # a failed review artifact is published and QuickQuote routes the package to a human.
                 from .package_evidence_review import review_artifact, review_packet

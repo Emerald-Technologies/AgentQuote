@@ -32,6 +32,15 @@ def assessment_artifact(graph, classification, sources, hints):
     associations = {a["associationId"]: a for a in graph["associations"]}
     source_map = {(s["evidenceId"], s["page"]): s["text"] for s in sources}
 
+    from .package_evidence_contracts import COMPACT_POLICIES
+    # v6 (plan 8.8 step 5, Nick 2026-10-09): a requirement code left open after a failed call has no
+    # quote to give. Allowed only as unknown with the code-owned conflict; model replies cannot use it.
+    open_allowed = graph["provenance"]["policyVersion"] in COMPACT_POLICIES
+
+    def code_open(item):
+        return (open_allowed and item["determination"] == "unknown" and item["citations"] == []
+                and "EVIDENCE_CALL_FAILED" in item["conflicts"])
+
     def citations(values):
         # The model supplies evidenceId, page and the exact quoted text. Code locates the text
         # in that source and records start/end itself (UTF16 units, as the QuickQuote consumer
@@ -73,8 +82,9 @@ def assessment_artifact(graph, classification, sources, hints):
                 and len(set(roles)) == len(roles), "ASSESSMENT_ROLES_INVALID")
         require(item["determination"] in {"determined", "unknown"}, "ASSESSMENT_DETERMINATION_INVALID")
         require(text(item["rationale"], 2000, controls=True) == item["rationale"].strip(), "ASSESSMENT_TEXT_INVALID")
-        citations(item["citations"])
         conflicts(item["conflicts"])
+        if not code_open(item):
+            citations(item["citations"])
     relationships = hints["relationships"]
     require(type(relationships) is list and len(relationships) == len(associations), "ASSESSMENT_RELATIONSHIP_COVERAGE_INVALID")
     seen = set()

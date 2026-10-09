@@ -8,17 +8,28 @@ import pytest
 
 from bom_processor.package_evidence_contracts import PackageEvidenceError, digest
 from bom_processor.package_evidence_foundry import (
-    FoundryEvidenceProposalModel, SYSTEM_INSTRUCTION, PROMPT_SHA256,
-    MAX_PACKET_BYTES, MAX_RESPONSE_BYTES, parse_response, create_foundry_evidence_model,
+    FoundryEvidenceProposalModel, SYSTEM_INSTRUCTION, PROMPT_SHA256, POLICY_VERSION, V5_PROMPT_SHA256,
+    MAX_PACKET_BYTES, MAX_RESPONSE_BYTES, parse_response, parse_call_reply, create_foundry_evidence_model,
     MAX_MODEL_INPUT_BYTES, MAX_OUTPUT_TOKENS, MODEL_DEADLINE_SECONDS,
 )
+from compact_evidence_fixtures import ScriptedModel, package, source_proof as compact_source_proof
 from test_package_evidence_proposal import inputs, FakeModel
 from test_package_part_classification import ClassifiedModel
 from test_package_manufacturing_assessment import AssessedModel, assessed_inputs
 
 
+def test_v6_limits_and_prompt_identity():
+    # Nick 2026-10-09 (plan 8.8 step 5): 256 KB per call, 16,384-token reply, 300-second deadline.
+    assert POLICY_VERSION == "package-evidence-foundry.v6"
+    assert MAX_MODEL_INPUT_BYTES == 256 * 1024 and MAX_OUTPUT_TOKENS == 16_384 and MODEL_DEADLINE_SECONDS == 300
+    assert PROMPT_SHA256 == digest(SYSTEM_INSTRUCTION.encode()) != V5_PROMPT_SHA256
+    # The v5 prompt text is kept byte for byte: its hash is the one recorded on existing v5 results.
+    assert V5_PROMPT_SHA256 == "0ab599532259930b7ba3e09e7d7857cc5a8552ada0df5fe50838299d8987db18"
+
+
 def test_tool_free_packet_and_exact_prompt_provenance():
-    seen = {}
+    seen = {"packets": []}
+    scripted = ScriptedModel()
 
     class Agent:
         def __init__(self, **kwargs):
@@ -26,16 +37,12 @@ def test_tool_free_packet_and_exact_prompt_provenance():
 
         async def run(self, packet, *, options):
             seen["options"] = options
-            seen["packet"] = json.loads(packet)
-            from test_package_evidence_retention import RetentionModel
-            return SimpleNamespace(output_text=json.dumps(RetentionModel().propose(seen["packet"])))
+            seen["packets"].append(json.loads(packet))
+            return SimpleNamespace(output_text=json.dumps(scripted.propose(seen["packets"][-1])))
 
     model = FoundryEvidenceProposalModel(object(), model_name="explicit-deployment", agent_factory=Agent)
-    context, roots, books = assessed_inputs()
-    from test_package_evidence_inventory import root
-    from test_package_evidence_retention import source_proof
-    roots.append(root(b"original BOM source bytes", "original.xlsx", "12345678-1234-4234-8234-123456789080"))
-    result = model.produce(context, roots, books, run_id="test-run", retained_bom_sources=source_proof(roots))
+    context, roots, books = package([("ASM-100200", None), ("ASM-100300", None)], shared_pcb="PCB-777001", lines=5)
+    result = model.produce(context, roots, books, run_id="test-run", retained_bom_sources=compact_source_proof(roots))
     graph = result["proposal"]
     assert len(result["classification"]["classifications"]) == len(graph["occurrences"])
     assert result["manufacturingAssessment"]["proposalSha256"] == graph["proposalSha256"]
@@ -43,10 +50,19 @@ def test_tool_free_packet_and_exact_prompt_provenance():
     assert seen["options"] == {"max_tokens": MAX_OUTPUT_TOKENS, "store": False,
                                "response_format": {"type": "json_object"}}
     assert seen["instructions"] == SYSTEM_INSTRUCTION
-    assert graph["provenance"]["promptSha256"] == PROMPT_SHA256 == digest(SYSTEM_INSTRUCTION.encode())
+    assert graph["provenance"]["promptSha256"] == PROMPT_SHA256
+    assert graph["provenance"]["policyVersion"] == POLICY_VERSION
     assert graph["provenance"]["model"] == "explicit-deployment"
-    assert "rowObservations" in seen["packet"]
+    assert len(seen["packets"]) == 1 and seen["packets"][0]["version"] == "package-evidence-compact-packet.v1"
     assert any(link["scope"] == "shared" for link in graph["associations"])
+
+
+def test_call_reply_parse_is_syntax_only():
+    assert parse_call_reply('{"files": []}') == {"files": []}
+    for value, code in (('[]', "MODEL_SHAPE_NOT_OBJECT_ARRAY"), ("not json", "MODEL_JSON_INVALID"),
+                        ('{"a":1,"a":2}', "MODEL_DUPLICATE_KEY")):
+        with pytest.raises(PackageEvidenceError, match=code):
+            parse_call_reply(value)
 
 
 @pytest.mark.parametrize("value", [None, [], "[]", "null", "```json\n{}\n```", "{} trailing",
@@ -122,25 +138,8 @@ def test_shape_details_are_bounded_and_fit_the_worker_cause_limit():
     assert chain[-1] == "MODEL_SHAPE_MORE" and len(chain) == 8
 
 
-def test_propose_preserves_shape_causes_through_agent_call():
-    from evidence_job import failure_causes
-
-    class Agent:
-        def __init__(self, **kwargs):
-            pass
-
-        async def run(self, packet, *, options):
-            return SimpleNamespace(output_text=json.dumps({"proposal": VALID}))
-
-    model = FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=Agent)
-    with pytest.raises(PackageEvidenceError) as caught:
-        model.propose({"small": "packet"})
-    assert failure_causes(caught.value) == [
-        "MODEL_RESPONSE_INVALID", "MODEL_SHAPE_WRAPPED_PROPOSAL", "MODEL_SHAPE_INNER_VALID"]
-
-
 def test_propose_records_raw_reply_even_when_parsing_fails():
-    replies = iter(['{"proposal": {}}', "not json"])
+    replies = iter(['["not an object"]', "not json"])
 
     class Agent:
         def __init__(self, **kwargs):
@@ -151,7 +150,7 @@ def test_propose_records_raw_reply_even_when_parsing_fails():
 
     model = FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=Agent)
     assert model.last_producer_reply is None
-    for expected, code in (('{"proposal": {}}', "MODEL_RESPONSE_INVALID"), ("not json", "MODEL_JSON_INVALID")):
+    for expected, code in (('["not an object"]', "MODEL_SHAPE_NOT_OBJECT_ARRAY"), ("not json", "MODEL_JSON_INVALID")):
         with pytest.raises(PackageEvidenceError, match=code):
             model.propose({"small": "packet"})
         assert model.last_producer_reply == expected
@@ -211,7 +210,7 @@ def test_timeout_and_provider_failure_do_not_retry_or_expose_details():
         FoundryEvidenceProposalModel(object(), model_name="test", agent_factory=TimedAgent).propose({})
 
 
-@pytest.mark.parametrize("seconds", [True, 0, 121, 301, 1.5])
+@pytest.mark.parametrize("seconds", [True, 0, 301, 1.5])
 def test_invalid_deadline(seconds):
     with pytest.raises(PackageEvidenceError):
         FoundryEvidenceProposalModel(object(), model_name="test", timeout_seconds=seconds)

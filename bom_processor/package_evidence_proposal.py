@@ -147,47 +147,34 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      include_manufacturing: bool = False,
                      retained_bom_sources: dict | None = None,
                      correction: dict | None = None,
-                     review_inputs: dict | None = None) -> dict:
+                     review_inputs: dict | None = None,
+                     call_store=None) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
     truncated; insufficient budgets reject before model invocation.
     """
-    context = _context(context)
-    # Correction feedback is code-generated qualification output, bound to a
-    # predecessor. It never accompanies an initial proposal.
-    require(correction is None or "predecessorProposalSha256" in context, "SUCCESSOR_BINDING")
-    provenance = {"kind": "agent", "producer": text(producer), "model": text(model_name),
-                  "policyVersion": text(policy_version), "promptSha256": hash_value(prompt_sha256),
-                  "runId": text(run_id)}
+    from .package_evidence_contracts import COMPACT_POLICIES
+    if policy_version in COMPACT_POLICIES:
+        # Plan 8.8 step 5: compact packet, file views, per-assembly calls and code merge.
+        from .package_evidence_compact import produce_compact
+        require(include_classification and include_manufacturing, "COMPACT_POLICY_BINDING")
+        return produce_compact(context, roots, workbooks, model=model, producer=producer,
+                               model_name=model_name, policy_version=policy_version,
+                               prompt_sha256=prompt_sha256, run_id=run_id,
+                               inventory_limits=inventory_limits,
+                               retained_bom_sources=retained_bom_sources, correction=correction,
+                               review_inputs=review_inputs, call_store=call_store)
+    prepared = prepare(context, roots, workbooks, producer=producer, model_name=model_name,
+                       policy_version=policy_version, prompt_sha256=prompt_sha256, run_id=run_id,
+                       inventory_limits=inventory_limits, include_manufacturing=include_manufacturing,
+                       include_classification=include_classification,
+                       retained_bom_sources=retained_bom_sources, correction=correction)
+    context, inventory, rows, sources = (prepared[k] for k in ("context", "inventory", "rows", "sources"))
+    retained_objects = prepared["retained"]
     integer(max_text_chars_per_file, 1, 2000)
     integer(max_total_text_chars, 1, 2_000_000)
     integer(max_packet_bytes, 1, 8 * 1024 * 1024)
-    sources = []
-    retained = 0
-    def observe(identity, payload, file_name):
-        nonlocal retained
-        from .package_manufacturing_assessment import complete_source
-        source = complete_source(identity, payload, file_name)
-        if source is not None:
-            retained += len(payload)
-            require(retained <= 8_000_000, "ASSESSMENT_SOURCE_LIMIT")
-            sources.append(source)
-    require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
-    inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
-    from .package_evidence_contracts import RETAINED_POLICIES
-    require((policy_version in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
-    retained_objects = {}
-    if retained_bom_sources is not None:
-        from .package_evidence_retention import retained_inventory
-        retained_objects = retained_inventory(inventory, roots, retained_bom_sources)
-    root_metadata = {item["documentId"]: {key: item[key] for key in ("documentId", "sha256", "sizeBytes")}
-                     for item in inventory if not item["archiveChain"]}
-    for assembly in context["assemblies"]:
-        bom = assembly["canonicalBom"]
-        if bom is not None and bom["documentId"] in root_metadata:
-            require(root_metadata[bom["documentId"]] == bom, "CONFLICTING_SOURCE_BOM_IDENTITY")
-    rows = read_occurrences(context["assemblies"], workbooks)
     packet_evidence = []
     # Count every observation string, including manufacturer alternatives, without
     # truncating rows or borrowing the excerpt budget. Byte budget covers all JSON.
@@ -224,9 +211,7 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
             for identity, kind in sorted(retained_objects.items())]
         packet["retentionInstruction"] = "These verified objects are structural provenance only. Do not associate them or assign manufacturing relationships. Give dispositions only for every other object; every child remains independently checked."
     if correction is not None:
-        from .package_evidence_successor import CORRECTION_INSTRUCTION, MAX_ATTEMPT
-        strict(correction, {"attempt", "feedback"}, "SUCCESSOR_BINDING")
-        integer(correction["attempt"], 2, MAX_ATTEMPT)
+        from .package_evidence_successor import CORRECTION_INSTRUCTION
         packet["correctionInstruction"] = CORRECTION_INSTRUCTION
         packet["correctionFeedback"] = {"attempt": correction["attempt"],
                                         "findings": detached(correction["feedback"]["findings"])}
@@ -245,7 +230,66 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
     if include_manufacturing:
         require(type(hints) is dict and "manufacturing" in hints, "ASSESSMENT_OUTPUT_REQUIRED")
         manufacturing = hints.pop("manufacturing")
+    return finish(prepared, hints, classifications, manufacturing, review_inputs=review_inputs)
+
+
+def prepare(context: dict, roots: list[dict], workbooks: dict[str, bytes], *, producer: str,
+            model_name: str, policy_version: str, prompt_sha256: str, run_id: str,
+            inventory_limits: InventoryLimits | None = None, include_classification: bool = False,
+            include_manufacturing: bool = False, retained_bom_sources: dict | None = None,
+            correction: dict | None = None) -> dict:
+    """Verified inputs shared by every producer path: checkpoint, inventory, rows, complete text."""
+    context = _context(context)
+    # Correction feedback is code-generated qualification output, bound to a
+    # predecessor. It never accompanies an initial proposal.
+    require(correction is None or "predecessorProposalSha256" in context, "SUCCESSOR_BINDING")
+    if correction is not None:
+        from .package_evidence_successor import MAX_ATTEMPT
+        strict(correction, {"attempt", "feedback"}, "SUCCESSOR_BINDING")
+        integer(correction["attempt"], 2, MAX_ATTEMPT)
+    provenance = {"kind": "agent", "producer": text(producer), "model": text(model_name),
+                  "policyVersion": text(policy_version), "promptSha256": hash_value(prompt_sha256),
+                  "runId": text(run_id)}
+    sources = []
+    retained = 0
+    def observe(identity, payload, file_name):
+        nonlocal retained
+        from .package_manufacturing_assessment import complete_source
+        source = complete_source(identity, payload, file_name)
+        if source is not None:
+            retained += len(payload)
+            require(retained <= 8_000_000, "ASSESSMENT_SOURCE_LIMIT")
+            sources.append(source)
+    require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
+    inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
+    from .package_evidence_contracts import RETAINED_POLICIES
+    require((policy_version in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
+    retained_objects = {}
     if retained_bom_sources is not None:
+        from .package_evidence_retention import retained_inventory
+        retained_objects = retained_inventory(inventory, roots, retained_bom_sources)
+    root_metadata = {item["documentId"]: {key: item[key] for key in ("documentId", "sha256", "sizeBytes")}
+                     for item in inventory if not item["archiveChain"]}
+    for assembly in context["assemblies"]:
+        bom = assembly["canonicalBom"]
+        if bom is not None and bom["documentId"] in root_metadata:
+            require(root_metadata[bom["documentId"]] == bom, "CONFLICTING_SOURCE_BOM_IDENTITY")
+    rows = read_occurrences(context["assemblies"], workbooks)
+    return {"context": context, "provenance": provenance, "inventory": inventory, "rows": rows,
+            "sources": sources, "retained": retained_objects,
+            "retained_bom_sources": retained_bom_sources,
+            "include_classification": include_classification,
+            "include_manufacturing": include_manufacturing}
+
+
+def finish(prepared: dict, hints, classifications, manufacturing, *, review_inputs: dict | None = None) -> dict:
+    """Code-owned graph, classification and assessment from validated hints (every producer path)."""
+    context, provenance, inventory, rows, sources = (
+        prepared[k] for k in ("context", "provenance", "inventory", "rows", "sources"))
+    retained_objects = prepared["retained"]
+    include_classification = prepared["include_classification"]
+    include_manufacturing = prepared["include_manufacturing"]
+    if prepared["retained_bom_sources"] is not None:
         require(type(hints) is dict and type(hints.get("associations")) is list
                 and type(hints.get("dispositions")) is list, "INVALID_MODEL_OUTPUT")
         # Reject attempted engineering permission rather than silently pruning it.

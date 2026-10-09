@@ -177,8 +177,11 @@ def test_foundry_reviewer_uses_fresh_client_tool_free_and_exact_prompt():
     assert model.review({"claims": []})["verdict"] == "stop"
     assert model.review({"claims": []})["verdict"] == "stop"
     assert [s["client"] for s in seen] == ["client-1", "client-2"]
-    assert all(s["tools"] == [] and s["instructions"] == REVIEW_INSTRUCTION for s in seen)
+    from bom_processor.package_evidence_compact import REVIEW_INSTRUCTION as V6_REVIEW_INSTRUCTION
+    assert all(s["tools"] == [] and s["instructions"] == V6_REVIEW_INSTRUCTION for s in seen)
     assert model.reviewer_identity == {"model": "explicit", "promptSha256": REVIEW_PROMPT_SHA256}
+    with pytest.raises(PackageEvidenceError, match="REVIEW_PACKET_LIMIT"):
+        model.review({"text": "x" * 256 * 1024})
 
 
 @pytest.mark.parametrize("value", [None, "", "[]", "```json\n{}\n```", '{"a":1,"a":2}', "{} x"])

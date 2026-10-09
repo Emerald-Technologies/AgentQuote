@@ -39,11 +39,15 @@ def failure_causes(exc: BaseException, limit: int = 8) -> list[str]:
 
 
 # Producer policy capability sets. v5 = v4 (retained provenance) plus independent reviewer artifact.
+# v6 = v5 with the compact packet, file views, grouped replies and per-assembly calls (plan 8.8 step 5).
 CLASSIFIED_POLICIES = frozenset({"package-evidence-foundry.v2", "package-evidence-foundry.v3",
-                                 "package-evidence-foundry.v4", "package-evidence-foundry.v5"})
-ASSESSED_POLICIES = frozenset({"package-evidence-foundry.v3", "package-evidence-foundry.v4", "package-evidence-foundry.v5"})
-RETAINED_POLICIES = frozenset({"package-evidence-foundry.v4", "package-evidence-foundry.v5"})
-REVIEWED_POLICIES = frozenset({"package-evidence-foundry.v5"})
+                                 "package-evidence-foundry.v4", "package-evidence-foundry.v5",
+                                 "package-evidence-foundry.v6"})
+ASSESSED_POLICIES = frozenset({"package-evidence-foundry.v3", "package-evidence-foundry.v4", "package-evidence-foundry.v5",
+                               "package-evidence-foundry.v6"})
+RETAINED_POLICIES = frozenset({"package-evidence-foundry.v4", "package-evidence-foundry.v5", "package-evidence-foundry.v6"})
+REVIEWED_POLICIES = frozenset({"package-evidence-foundry.v5", "package-evidence-foundry.v6"})
+COMPACT_POLICIES = frozenset({"package-evidence-foundry.v6"})
 
 
 def require(condition: bool, code: str) -> None:
