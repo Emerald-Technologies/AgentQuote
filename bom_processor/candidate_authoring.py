@@ -17,8 +17,29 @@ MAX_SOURCE_BYTES = 50_000_000
 # Version changes are identity changes: a replacement cannot reuse a
 # contained candidate produced by an older authoring policy.
 # v9/v10 (plan 8.12): output rules carry manufacturer/MPN pairs beyond 8 and fail above 50.
+# v9/v10 also (plan 8.8 step 4a, Nick 2026-10-09): the parser writes a --row-map that
+# validation checks against every source row.
 AUTHORING_VERSION = "candidate-authoring.v9"
 ASSOCIATION_AUTHORING_VERSION = "candidate-authoring.v10"
+ROW_MAP_AUTHORING_VERSIONS = frozenset({AUTHORING_VERSION, ASSOCIATION_AUTHORING_VERSION})
+ROW_MAP_RULE = (
+    "also accept an optional --row-map PATH argument (never required: approved parsers run without it); "
+    "whenever it is given, write it as UTF-8 JSON: {\"version\": \"bom-row-map.v1\", \"lines\": [...], "
+    "\"skipped\": [...], \"ignored_columns\": [...]}. Sheet names, rows and columns refer to the --input "
+    "workbook (1-based, the row numbers a spreadsheet shows; for HTML tables the n-th table row). "
+    "lines has one entry per output data row: {\"output_row\": the output worksheet row number (first data "
+    "row is 2), \"sheet\", \"rows\": every source row that makes this line, including alternate-manufacturer "
+    "rows, \"fields\": {output column name: [source row, source column] of the cell the value came from}}. "
+    "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
+    "when the value is one separated part of a combined cell; use {\"derived\": reason} only for "
+    "unit_of_measure or bom_notes values not copied from one cell. Every listed row must supply at least "
+    "one linked value, and both halves of a manufacturer/MPN pair come from the same source row. skipped "
+    "lists every other non-empty source row: {\"sheet\", \"rows\": [[first, last], ...], \"reason\": one of header, "
+    "title, blank, total, note, section, signature, other_sheet, other, \"rationale\"}. ignored_columns lists "
+    "every source column holding data in BOM lines that feeds no output field: {\"sheet\", \"column\", \"reason\"}. "
+    "Build the row map from the same reading that writes the output; validation checks it against every "
+    "row of the source and fails on any unaccounted, double-counted or mis-cited row"
+)
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
     "write exactly the supplied canonical columns in the supplied order and at least one data row; when any line has more than 8 manufacturer/MPN pairs, append manufacturer_9, manufacturer_item_number_9, and so on in that order up to the widest line (at most 50 pairs), the same columns for every row, never dropping a pair",
@@ -34,7 +55,8 @@ CANONICAL_OUTPUT_RULES = (
     "manufacturer_N and manufacturer_item_number_N must either both be populated or both be empty for every pair N written",
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
-    "read only --input and write only --output; do not access network",
+    "read only --input and write only --output and, when given, --row-map; do not access network",
+    ROW_MAP_RULE,
 )
 HTML_XLS_RULES = (
     "for source_subtype html_table_xls, use only stdlib html.parser.HTMLParser with bounded inert table extraction",
@@ -132,7 +154,7 @@ def _validate_code(code: str, source_subtype: str = "") -> bytes:
         raise AuthoringError("CANDIDATE_CODE_INVALID") from None
     if len(data) > MAX_CODE_BYTES:
         raise _policy("code_size_limit")
-    if "--input" not in code or "--output" not in code:
+    if "--input" not in code or "--output" not in code or "--row-map" not in code:
         raise _policy("missing_io_markers")
     for node in ast.walk(ast_tree):
         if isinstance(node, ast.ExceptHandler) and (node.type is None or

@@ -19,7 +19,8 @@ from .candidates import unique_fixtures
 from .arena_policy import is_arena_source, validate as validate_arena
 from .semantic_facts import SemanticFactsError, facts_from_rows
 from .document_roles import POLICY_VERSION as DOCUMENT_ROLE_POLICY, check_document_roles
-from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION
+from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION, ROW_MAP_AUTHORING_VERSIONS
+from .row_accounting import MAX_ROW_MAP_BYTES, ROW_MAP_NAME, RowMapError, verify_row_map
 
 VALIDATION_VERSION = "candidate-validation.v3"
 FAILURE_FEEDBACK_POLICY = "candidate-failure-feedback.v1"
@@ -117,7 +118,24 @@ def _semantic_feedback(semantic: dict[str, Any]) -> str:
         return (f"xlsx_document_roles:{roles['result']}; preserve each source document ID, revision, "
                 "description and quantity in Document fields, not manufacturer/MPN fields; "
                 "do not drop references or guess ambiguous roles")
+    accounting = semantic.get("row_accounting")
+    if isinstance(accounting, dict) and accounting.get("valid") is False:
+        return _row_feedback(accounting)
     return f"semantic_output_invalid coverage_basis={semantic.get('coverage_basis', 'unknown')}"
+
+
+def _row_feedback(accounting: dict[str, Any]) -> str:
+    """Bounded locations and codes only; the author re-reads values from the source itself."""
+    if "error" in accounting:
+        return f"row_map_invalid:{accounting['error']}; write --row-map as the bom-row-map.v1 rule describes"
+    rows = "; ".join(f"{item['sheet']}!{item['row']}:{item['code']}" for item in accounting.get("failed_rows", [])[:20])
+    columns = ", ".join(f"{item['sheet']}!col{item['column']}" for item in accounting.get("unmapped_columns", [])[:10])
+    parts = [f"row_accounting_failed rows={accounting.get('failed_row_count', 0)}"]
+    if rows:
+        parts.append(f"failed rows: {rows}")
+    if columns:
+        parts.append(f"unmapped columns with data in BOM lines: {columns}")
+    return "; ".join(parts)
 
 
 def _source_subtype(request: dict[str, Any]) -> str:
@@ -197,6 +215,8 @@ class CandidateValidationService:
         self.serial_owner = serial_owner
         self.validation_version = ("candidate-validation.v4" if assembly_associations is not None
                                    else VALIDATION_VERSION)
+        # Set from the candidate manifest: v9/v10 parsers must write a row map (plan 8.8 step 4a).
+        self.row_map_required = False
 
     def _association(self, source: bytes, evidence: dict[str, Any]) -> dict[str, Any] | None:
         if self.assembly_associations is None:
@@ -289,6 +309,7 @@ class CandidateValidationService:
             manifest["code_sha256"], len(code), worker_prefix,
             f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}",
             "output.xlsx", "result.json",
+            row_map_name=ROW_MAP_NAME if self.row_map_required else None,
         )
         raw_result = None
         try:
@@ -324,6 +345,8 @@ class CandidateValidationService:
                 semantic = {"valid": False, "result": "semantic_output_invalid",
                             "source_rows": 0, "output_rows": 0,
                             "coverage_basis": "semantic_validation_failed"}
+        if schema_valid and self.row_map_required:
+            semantic = self._with_row_accounting(semantic, source, source_evidence, item, output, worker)
         validation_valid = schema_valid and semantic["valid"] is True
         arena_evidence = None
         if (schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls"
@@ -429,7 +452,8 @@ class CandidateValidationService:
                             f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
                             source_evidence["sha256"].lower(), source_evidence["size_bytes"],
                             manifest["code_sha256"], len(code), f"{base}/worker/attempt-{int(time.time()*1000)}-{index}/{job_id}",
-                            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}", "output.xlsx", "result.json")
+                            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}", "output.xlsx", "result.json",
+                            row_map_name=ROW_MAP_NAME if self.row_map_required else None)
             record = {"fixture_sha256": source_evidence["sha256"].lower(), "document_id": source_evidence["document_id"],
                       "source_aliases": source_evidence.get("source_aliases", []), "status": "failed"}
             try:
@@ -444,6 +468,8 @@ class CandidateValidationService:
                     schema_valid = False
                 semantic = _semantic_output(output, source, _source_subtype(request),
                     infer_document_assembly=association is None) if schema_valid else {"valid": False, "result": "schema_invalid"}
+                if schema_valid and self.row_map_required:
+                    semantic = self._with_row_accounting(semantic, source, source_evidence, item, output, worker)
                 policy = None
                 if schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls" and is_arena_source(source):
                     policy = validate_arena(source, output, source_sha256=source_evidence["sha256"].lower(),
@@ -572,6 +598,10 @@ class CandidateValidationService:
             self.assembly_associations = associations
             self.validation_version = "candidate-validation.v4"
             identity["association_sha256"] = ref["sha256"]
+        if version in ROW_MAP_AUTHORING_VERSIONS:
+            # Evidence keeps its v3/v4 shape (consumers read v4 as association evidence); the row
+            # accounting is recorded inside it, and candidate identity already binds v9/v10.
+            self.row_map_required = True
         expected_id = _sha256(_json_bytes(identity))
         if (manifest.get("status") != "generated_unvalidated"
                 or manifest.get("request_id") != self.request_id
@@ -609,7 +639,8 @@ class CandidateValidationService:
 
     def _verify_worker_result(self, raw: bytes, item: WorkItem) -> dict[str, Any]:
         value = _load_json(raw, "WORKER_RESULT_INVALID")
-        expected_contract = "remote-worker.v2" if item.interpretation_name else "remote-worker.v1"
+        expected_contract = ("remote-worker.v2" if item.interpretation_name
+                             else "remote-worker.v3" if item.row_map_name else "remote-worker.v1")
         if (value.get("contract_version") != expected_contract
             or value.get("job") != item.job_id or value.get("status") not in {"completed", "failed"}):
             raise CandidateValidationError("WORKER_RESULT_INVALID")
@@ -671,7 +702,43 @@ class CandidateValidationService:
             value["interpretation"] = {"blob_path": item.interpretation_blob,
                                        "sha256": _sha256(sidecar), "size": len(sidecar),
                                        "content_type": "application/json", "verification": verified}
+        if item.row_map_name:
+            # Bind the row map bytes only; row accounting is judged later as a repairable outcome.
+            row_map = value.get("row_map")
+            if (not isinstance(row_map, dict) or row_map.get("content_type") != "application/json"
+                    or type(row_map.get("size")) is not int or not 0 < row_map["size"] <= MAX_ROW_MAP_BYTES
+                    or not isinstance(row_map.get("sha256"), str) or not _SHA.fullmatch(row_map["sha256"])):
+                raise CandidateValidationError("WORKER_ROW_MAP_INVALID")
+            try:
+                mapped = self.storage.download_candidate(item.row_map_blob, MAX_ROW_MAP_BYTES)
+            except Exception:
+                raise CandidateValidationError("WORKER_ROW_MAP_MISSING") from None
+            if len(mapped) != row_map["size"] or _sha256(mapped) != row_map["sha256"]:
+                raise CandidateValidationError("WORKER_ROW_MAP_INTEGRITY")
+            value["row_map"] = {"blob_path": item.row_map_blob, "sha256": row_map["sha256"],
+                                "size": row_map["size"], "content_type": "application/json", "bytes": mapped}
         return value
+
+    def _with_row_accounting(self, semantic: dict[str, Any], source: bytes, source_evidence: dict[str, Any],
+                             item: WorkItem, output: bytes, worker: dict[str, Any]) -> dict[str, Any]:
+        """Fold the row-map check into the semantic result (plan 8.8 step 4a).
+
+        A failed or malformed row map is a repairable semantic failure whose bounded feedback lists
+        the failing source-row locations; it never trusts a worker-supplied verdict.
+        """
+        bound = worker.pop("row_map")
+        try:
+            accounting = verify_row_map(source, PurePosixPath(source_evidence["blob_path"]).suffix.lower(),
+                                        output, bound["bytes"])
+        except RowMapError as exc:
+            accounting = {"version": "bom-row-accounting.v1", "valid": False, "error": str(exc)}
+        except Exception:
+            accounting = {"version": "bom-row-accounting.v1", "valid": False, "error": "ROW_MAP_UNVERIFIABLE"}
+        accounting["row_map"] = {key: bound[key] for key in ("blob_path", "sha256", "size")}
+        result = {**semantic, "row_accounting": accounting}
+        if semantic.get("valid") is True and accounting["valid"] is not True:
+            result.update(valid=False, result="semantic_output_invalid", coverage_basis="row_accounting")
+        return result
 
     def _existing_result(self, evidence: dict[str, Any], validation_id: str,
                          evidence_path: str) -> CandidateValidationResult:

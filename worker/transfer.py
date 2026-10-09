@@ -14,7 +14,8 @@ from urllib.request import Request, urlopen
 REQUIRED = ("WORKER_JOB_ID", "INPUT_URL", "PARSER_URL", "OUTPUT_URL", "RESULT_URL",
             "INPUT_SHA256", "INPUT_SIZE", "PARSER_SHA256", "PARSER_SIZE", "WORKER_INPUT_NAME",
             "WORKER_OUTPUT_NAME", "WORKER_OUTPUT_CONTENT_TYPE")
-ALLOWED_WORKER = {"WORKER_JOB_ID", "WORKER_INPUT_NAME", "WORKER_OUTPUT_NAME", "WORKER_OUTPUT_CONTENT_TYPE", "WORKER_INTERPRETATION_NAME"}
+ALLOWED_WORKER = {"WORKER_JOB_ID", "WORKER_INPUT_NAME", "WORKER_OUTPUT_NAME", "WORKER_OUTPUT_CONTENT_TYPE",
+                  "WORKER_INTERPRETATION_NAME", "WORKER_ROW_MAP_NAME"}
 OUTPUT_CONTENT_TYPES = {
     "output.xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
@@ -139,6 +140,12 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         if env.get("WORKER_INTERPRETATION_NAME") != "interpretation.json" or not env.get("INTERPRETATION_URL"):
             raise ValueError("incomplete interpretation configuration")
         urls["INTERPRETATION_URL"] = _url(env["INTERPRETATION_URL"])
+    row_map_enabled = bool(env.get("WORKER_ROW_MAP_NAME") or env.get("ROW_MAP_URL"))
+    if row_map_enabled:
+        if (env.get("WORKER_ROW_MAP_NAME") != "row-map.json" or not env.get("ROW_MAP_URL")
+                or interpretation_enabled):
+            raise ValueError("incomplete row map configuration")
+        urls["ROW_MAP_URL"] = _url(env["ROW_MAP_URL"])
     input_size = _expected(env, "INPUT", True); parser_size = _expected(env, "PARSER", True)
     input_hash = _expected(env, "INPUT"); parser_hash = _expected(env, "PARSER")
     transport = transport or UrllibTransport()
@@ -148,6 +155,8 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
                     "output": {"sha256": None, "size": 0, "content_type": content_type}}
     if interpretation_enabled:
         result["contract_version"] = "remote-worker.v2"
+    if row_map_enabled:
+        result["contract_version"] = "remote-worker.v3"
     try:
         parser = transport.get(urls["PARSER_URL"], max_bytes=parser_size, timeout=timeout)
         source = transport.get(urls["INPUT_URL"], max_bytes=input_size, timeout=timeout)
@@ -158,7 +167,8 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         input_name = env["WORKER_INPUT_NAME"]
         if input_name not in ("input.csv", "input.xls", "input.xlsx"):
             raise ValueError("invalid input name")
-        options = {"interpretation_name": "interpretation.json"} if interpretation_enabled else {}
+        options = ({"interpretation_name": "interpretation.json"} if interpretation_enabled
+                   else {"row_map_name": "row-map.json"} if row_map_enabled else {})
         ran = run(job=env["WORKER_JOB_ID"], parser_bytes=parser, input_bytes=source,
                   input_name=input_name, output_name=output_name,
                   output_policy="opaque", return_output=True, **options)
@@ -178,6 +188,15 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
             verification = verify_coverage(source, os.path.splitext(input_name)[1], output, sidecar)
             result["interpretation"] = {"sha256": hashlib.sha256(sidecar).hexdigest(), "size": len(sidecar),
                                         "content_type": "application/json", "verification": verification}
+        mapped = None
+        if row_map_enabled:
+            from bom_processor.row_accounting import MAX_ROW_MAP_BYTES
+            if len(ran) != 4 or not isinstance(ran[3], bytes) or not 0 < len(ran[3]) <= MAX_ROW_MAP_BYTES:
+                raise ValueError("row map artifact missing")
+            mapped = ran[3]
+            # Verified by candidate validation against the pinned source; only bound here.
+            result["row_map"] = {"sha256": hashlib.sha256(mapped).hexdigest(), "size": len(mapped),
+                                 "content_type": "application/json"}
         result["output"] = {"sha256": hashlib.sha256(output).hexdigest(), "size": len(output),
                      "content_type": content_type}
         result["parser"] = _evidence(parser, parser_hash, parser_size)
@@ -191,6 +210,12 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
                                       "Content-Type": "application/json", "Content-Length": str(len(sidecar))},
                              timeout=timeout) != 201:
                 raise RuntimeError("interpretation transfer failed")
+        if mapped is not None:
+            if transport.put(urls["ROW_MAP_URL"], mapped,
+                             headers={"x-ms-blob-type": "BlockBlob", "If-None-Match": "*",
+                                      "Content-Type": "application/json", "Content-Length": str(len(mapped))},
+                             timeout=timeout) != 201:
+                raise RuntimeError("row map transfer failed")
         result["status"] = "completed"; result["failure"] = None
         body = json.dumps(result, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
         result_headers = {"x-ms-blob-type": "BlockBlob", "If-None-Match": "*", "Content-Type": "application/json", "Content-Length": str(len(body))}

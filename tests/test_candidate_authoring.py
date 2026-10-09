@@ -30,6 +30,7 @@ import sys
 parser = argparse.ArgumentParser()
 parser.add_argument("--input", required=True)
 parser.add_argument("--output", required=True)
+parser.add_argument("--row-map", required=True)
 args = parser.parse_args()
 with open(args.input, encoding="utf-8") as source:
     rows = list(csv.reader(source))
@@ -175,7 +176,7 @@ def test_html_authoring_rejects_read_excel():
 
 def test_policy_failure_gets_one_correction_with_stable_rule_id_and_no_code_in_error():
     storage, request = request_storage()
-    bad = "import socket\n# --input --output\n"
+    bad = "import socket\n# --input --output --row-map\n"
     model = CorrectingModel(bad, GOOD)
     result = CandidateAuthoringService(request.request_id, storage, model).author()
     assert result.status == "generated_unvalidated"
@@ -186,7 +187,7 @@ def test_policy_failure_gets_one_correction_with_stable_rule_id_and_no_code_in_e
 
 def test_second_policy_failure_is_not_retried_and_exposes_only_rule_id():
     storage, request = request_storage()
-    bad = "import socket\n# --input --output\n"
+    bad = "import socket\n# --input --output --row-map\n"
     model = CorrectingModel(bad, bad)
     with pytest.raises(AuthoringError) as failure:
         CandidateAuthoringService(request.request_id, storage, model).author()

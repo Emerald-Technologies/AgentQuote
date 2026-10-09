@@ -124,13 +124,23 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
             input_bytes: bytes | None = None, limits: Limits | None = None,
     return_output: bool = False, input_name: str = "input.csv",
     output_name: str = "output.json",
-        output_policy: str = "synthetic_json", interpretation_name: str | None = None):
-    """Run an approved parser with either deterministic JSON or opaque output."""
+        output_policy: str = "synthetic_json", interpretation_name: str | None = None,
+        row_map_name: str | None = None):
+    """Run an approved parser with either deterministic JSON or opaque output.
+
+    With row_map_name (plan 8.8 step 4a) the parser also gets --row-map and must write it; the
+    bytes are returned as a fourth value and verified by candidate validation, not here.
+    """
     limits = limits or Limits()
     if interpretation_name is not None and (interpretation_name != "interpretation.json"
                                             or not return_output or output_policy != "opaque"
                                             or interpretation_name in (input_name, output_name)):
         raise ValueError("invalid interpretation configuration")
+    if row_map_name is not None and (row_map_name != "row-map.json" or interpretation_name is not None
+                                     or not return_output or output_policy != "opaque"
+                                     or row_map_name in (input_name, output_name)):
+        raise ValueError("invalid row map configuration")
+    from bom_processor.row_accounting import MAX_ROW_MAP_BYTES
     parser_bytes = parser_bytes if parser_bytes is not None else (DEFAULT_FIXTURES / "synthetic_parser.py").read_bytes()
     input_bytes = input_bytes if input_bytes is not None else (DEFAULT_FIXTURES / "synthetic_input.csv").read_bytes()
     started = time.monotonic()
@@ -151,6 +161,7 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
         root = Path(temp).resolve()
         parser = root / "parser.py"; source = root / input_name; output = root / output_name
         interpretation = root / interpretation_name if interpretation_name else None
+        row_map = root / row_map_name if row_map_name else None
         stdout = root / "stdout.log"; stderr = root / "stderr.log"
         parser.write_bytes(parser_bytes); source.write_bytes(input_bytes)
         for path in (parser, source):
@@ -177,6 +188,8 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                 command = [sys.executable, str(parser), "--input", str(source), "--output", str(output)]
                 if interpretation is not None:
                     command.extend(["--interpretation", str(interpretation)])
+                if row_map is not None:
+                    command.extend(["--row-map", str(row_map)])
                 proc = subprocess.Popen(command, **kwargs)
                 failure = None
                 while proc.poll() is None:
@@ -188,6 +201,8 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                         failure = "output_limit"; break
                     if interpretation is not None and interpretation.exists() and interpretation.stat().st_size > 1024 * 1024:
                         failure = "interpretation_limit"; break
+                    if row_map is not None and row_map.exists() and row_map.stat().st_size > MAX_ROW_MAP_BYTES:
+                        failure = "row_map_limit"; break
                     time.sleep(0.01)
                 if failure:
                     _terminate_tree(proc)
@@ -231,6 +246,12 @@ def run_job(*, job: str = "synthetic", parser_bytes: bytes | None = None,
                 base["interpretation"] = {"sha256": hashlib.sha256(sidecar).hexdigest(), "size": len(sidecar),
                                           "verification": verification}
                 return _result(job, "completed", None, exit_code=0, **base), 0, raw, sidecar
+            if row_map is not None:
+                if not _regular(row_map, root) or not 0 < row_map.stat().st_size <= MAX_ROW_MAP_BYTES:
+                    return _result(job, "failed", "invalid_row_map", **base), 5, None
+                mapped = row_map.read_bytes()
+                base["row_map"] = {"sha256": hashlib.sha256(mapped).hexdigest(), "size": len(mapped)}
+                return _result(job, "completed", None, exit_code=0, **base), 0, raw, mapped
             value = (_result(job, "completed", None, exit_code=0, **base), 0, raw)
             return value if return_output else value[:2]
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):

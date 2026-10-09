@@ -12,9 +12,11 @@ from bom_processor.candidate_validation import CandidateValidationError, Candida
 from bom_processor.candidates import persist_candidate
 from bom_processor.core import CANONICAL_COLUMNS, OUTPUT_CONTENT_TYPE
 from bom_processor.master_registry import profile_bytes
+from row_map_fixtures import attach_row_map
 
 SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.csv"
-SOURCE = b"mystery,qty\nX,2\n"
+# Holds every value workbook() writes, so row accounting (plan 8.8 step 4a) can cite it.
+SOURCE = b"mystery,name,qty\nP1,Widget,2\n"
 HTML_SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.xls"
 HTML_SOURCE = (b"<html><body><table><tr><th>item_number</th><th>item_name</th><th>quantity</th></tr>"
                b"<tr><td>A-1</td><td>Widget A</td><td>1</td></tr>"
@@ -26,6 +28,7 @@ CODE = '''import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--input", required=True)
 parser.add_argument("--output", required=True)
+parser.add_argument("--row-map", required=True)
 args = parser.parse_args()
 '''
 
@@ -74,6 +77,7 @@ class Orchestrator:
             "output": {"sha256": hashlib.sha256(self.output).hexdigest(),
                        "size": len(self.output), "content_type": OUTPUT_CONTENT_TYPE},
         }
+        result = attach_row_map(self.storage, item, self.output, result)
         self.storage.candidates[item.result_blob] = json.dumps(result).encode()
         return StartResult(item.job_id, "execution-1", datetime.now(timezone.utc))
 
@@ -150,8 +154,25 @@ def test_html_fallback_row_is_semantically_invalid_and_not_validated():
     assert not any("validated-" in path for path in storage.candidates)
 
 
+def test_html_output_that_keeps_only_half_the_rows_now_fails_row_accounting():
+    # Before plan 8.8 step 4a half the HTML rows were enough; every row must now be accounted for.
+    output = semantic_workbook([("A-1", "Widget A", 1), ("A-3", "Widget C", 3)])
+    service, storage, _, _, _ = setup_html_validation(output)
+    with pytest.raises(CandidateValidationError, match="SEMANTIC_INVALID"):
+        service.validate()
+    evidence = json.loads(next(v for k, v in storage.candidates.items() if k.endswith("/evidence.json")))
+    accounting = evidence["semantic"]["row_accounting"]
+    assert accounting["valid"] is False
+    assert {(item["row"], item["code"]) for item in accounting["failed_rows"]} == {
+        (3, "SKIPPED_ROW_LOOKS_LIKE_LINE"), (5, "SKIPPED_ROW_LOOKS_LIKE_LINE")}
+    event = json.loads(next(v for k, v in storage.candidates.items() if "validation-failed-" in k))
+    assert "HTML_TABLE_1!3:SKIPPED_ROW_LOOKS_LIKE_LINE" in event["failure_message"]
+    assert "Widget" not in event["failure_message"]  # locations and codes only
+
+
 def test_html_rows_with_source_identities_are_semantically_validated():
-    output = semantic_workbook([("A-1", "Widget A", 0.025), ("A-3", "Widget C", 3)])
+    output = semantic_workbook([("A-1", "Widget A", 1), ("A-2", "Widget B", 2),
+                                ("A-3", "Widget C", 3), ("A-4", "Widget D", 4)])
     service, storage, orchestrator, _, _ = setup_html_validation(output)
     result = service.validate()
     assert result.status == "awaiting_approval"
@@ -214,7 +235,8 @@ def test_worker_output_hash_mismatch_fails_closed():
 
 def test_grouped_validation_pass_fail_and_existing_result_replay():
     second_path = "customer/rfq-id/package-1/original-boms/doc-2.csv"
-    second = b"mystery,qty\nY,3\n"
+    # Same values as SOURCE (the double writes one output for both), different bytes.
+    second = b"mystery,name,qty\nP1,Widget,2\nend of list\n"
     storage = InMemoryStorage(sources={SOURCE_PATH: SOURCE, second_path: second})
     profile = profile_bytes(SOURCE, ".csv")
     request = persist_candidate(storage, "Customer1", "customer-key", profile, ({
@@ -246,7 +268,7 @@ def test_grouped_validation_pass_fail_and_existing_result_replay():
 
 def test_grouped_validation_fails_aggregate_when_one_fixture_fails():
     second_path = "customer/rfq-id/package-1/original-boms/doc-2.csv"
-    second = b"mystery,qty\nY,3\n"
+    second = b"mystery,name,qty\nP1,Widget,2\nend of list\n"
     storage = InMemoryStorage(sources={SOURCE_PATH: SOURCE, second_path: second})
     request = persist_candidate(storage, "Customer1", "customer-key", profile_bytes(SOURCE, ".csv"), ({
         "document_id": "doc1", "blob_path": SOURCE_PATH, "size_bytes": len(SOURCE),
@@ -274,7 +296,8 @@ def test_grouped_validation_fails_aggregate_when_one_fixture_fails():
 
 def failed_worker(item, *, message="parser failed | ValueError: no supported source rows found",
                   failure="transfer_failed"):
-    return {"contract_version": "remote-worker.v1", "job": item.job_id, "status": "failed",
+    return {"contract_version": "remote-worker.v3" if item.row_map_name else "remote-worker.v1",
+            "job": item.job_id, "status": "failed",
             "input": {"verified": True, "sha256": item.input_sha256, "size": item.input_size},
             "parser": {"verified": True, "sha256": item.parser_sha256, "size": item.parser_size},
             "output": {"sha256": None, "size": 0}, "failure": failure,

@@ -13,7 +13,7 @@ from bom_processor.candidate_review import CandidateReviewService
 from bom_processor.foundry_author import FoundryModelAuthor
 from test_source_assembly_association import roles, setup
 
-CODE = 'import argparse\np = argparse.ArgumentParser()\np.add_argument("--input")\np.add_argument("--output")\n'
+CODE = 'import argparse\np = argparse.ArgumentParser()\np.add_argument("--input")\np.add_argument("--output")\np.add_argument("--row-map")\n'
 
 
 def authored(parser_code=CODE):

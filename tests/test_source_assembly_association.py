@@ -74,7 +74,8 @@ def setup(conflict=False):
         rows = []
         for number, description, category, qty in [("DRAW-1", "Drawing", "Document", None),
                                                    ("PROC-2", "Procedure", "Document", None),
-                                                   ("R1", "Resistor", "Part", quantity)]:
+                                                   # item_name from the source row (plan 8.8 step 4a cites it).
+                                                   ("R1", "R1", "Part", quantity)]:
             row = dict.fromkeys(CANONICAL_COLUMNS)
             row.update(line_number=len(rows)+1, item_number=number, item_name=description,
                        item_category=category, quantity=qty)
@@ -102,7 +103,9 @@ def setup(conflict=False):
         def start(self, item):
             output = outputs[item.input_sha256]
             store.candidates[item.output_blob] = output
-            store.candidates[item.result_blob] = _json_bytes({"contract_version": "remote-worker.v1",
+            from row_map_fixtures import worker_result_bytes
+            store.candidates[item.result_blob] = worker_result_bytes(store, item, output, {
+                "contract_version": "remote-worker.v1",
                 "job": item.job_id, "status": "completed",
                 "input": {"verified": True, "sha256": item.input_sha256, "size": item.input_size},
                 "parser": {"verified": True, "sha256": item.parser_sha256, "size": item.parser_size},

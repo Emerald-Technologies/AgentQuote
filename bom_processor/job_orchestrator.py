@@ -48,12 +48,20 @@ class WorkItem:
     output_name: str = "output.json"
     result_name: str = "result.json"
     interpretation_name: str | None = None
+    # Plan 8.8 step 4a: opt-in parser row map, transported by the worker and verified by validation.
+    row_map_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.interpretation_name not in (None, "interpretation.json"):
             raise ValueError("invalid interpretation_name")
         if self.interpretation_name and self.interpretation_name in (self.input_name, self.output_name, self.result_name):
             raise ValueError("interpretation destination collision")
+        if self.row_map_name not in (None, "row-map.json"):
+            raise ValueError("invalid row_map_name")
+        if self.row_map_name and self.interpretation_name:
+            raise ValueError("row map and interpretation are exclusive")
+        if self.row_map_name and self.row_map_name in (self.input_name, self.output_name, self.result_name):
+            raise ValueError("row map destination collision")
         for name, value in (("job_id", self.job_id), ("source_container", self.source_container),
                             ("parser_container", self.parser_container), ("output_container", self.output_container)):
             if not isinstance(value, str) or not _ID.fullmatch(value):
@@ -87,6 +95,10 @@ class WorkItem:
     def interpretation_blob(self) -> str | None:
         return f"{self.output_prefix.rstrip('/')}/{self.interpretation_name}" if self.interpretation_name else None
 
+    @property
+    def row_map_blob(self) -> str | None:
+        return f"{self.output_prefix.rstrip('/')}/{self.row_map_name}" if self.row_map_name else None
+
 
 @dataclass(frozen=True)
 class SasUrls:
@@ -96,6 +108,7 @@ class SasUrls:
     result_url: str
     expires_on: datetime
     interpretation_url: str | None = None
+    row_map_url: str | None = None
 
     def __repr__(self) -> str:
         return f"SasUrls(expires_on={self.expires_on!r})"
@@ -141,6 +154,7 @@ class AzureSasFactory:
             make(item.output_container, item.result_blob, write=True),
             expiry,
             make(item.output_container, item.interpretation_blob, write=True) if item.interpretation_blob else None,
+            make(item.output_container, item.row_map_blob, write=True) if item.row_map_blob else None,
         )
 
 
@@ -166,6 +180,11 @@ class AzureJobStarter:
                 raise ValueError("interpretation URL missing")
             env.extend([{"name": "WORKER_INTERPRETATION_NAME", "value": item.interpretation_name},
                         {"name": "INTERPRETATION_URL", "value": urls.interpretation_url}])
+        if item.row_map_name:
+            if not urls.row_map_url:
+                raise ValueError("row map URL missing")
+            env.extend([{"name": "WORKER_ROW_MAP_NAME", "value": item.row_map_name},
+                        {"name": "ROW_MAP_URL", "value": urls.row_map_url}])
         container: dict[str, Any] = dict(self.template or {})
         container["name"] = self.container_name
         container["env"] = env

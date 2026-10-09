@@ -16,10 +16,12 @@ from bom_processor.candidates import persist_candidate
 from bom_processor.core import BlobConflictError, CANONICAL_COLUMNS, OUTPUT_CONTENT_TYPE
 from bom_processor.core import AzureBlobStorage, ProcessingError
 from bom_processor.master_registry import profile_bytes
+from row_map_fixtures import attach_row_map
 
 SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.csv"
-SOURCE = b"mystery,qty\nX,2\n"
-CODE = b'''import argparse\nparser = argparse.ArgumentParser()\nparser.add_argument("--input", required=True)\nparser.add_argument("--output", required=True)\nargs = parser.parse_args()\n'''
+# Holds every value workbook() writes, so row accounting (plan 8.8 step 4a) can cite it.
+SOURCE = b"mystery,name,qty\nX,Widget,2\n"
+CODE = b'''import argparse\nparser = argparse.ArgumentParser()\nparser.add_argument("--input", required=True)\nparser.add_argument("--output", required=True)\nparser.add_argument("--row-map", required=True)\nargs = parser.parse_args()\n'''
 NOW = datetime(2026, 9, 21, 3, 0, tzinfo=timezone.utc)
 
 
@@ -53,6 +55,7 @@ class Worker:
             "output": {"sha256": hashlib.sha256(output).hexdigest(), "size": len(output),
                        "content_type": OUTPUT_CONTENT_TYPE},
         }
+        result = attach_row_map(self.storage, item, output, result)
         self.storage.candidates[item.result_blob] = json.dumps(result).encode()
         return StartResult(item.job_id, "worker-execution", NOW)
 

@@ -24,34 +24,47 @@ from test_source_assembly_association import roles, setup
 
 
 PARSER = '''import argparse
+import json
 from openpyxl import load_workbook, Workbook
 p = argparse.ArgumentParser()
 p.add_argument("--input", required=True)
 p.add_argument("--output", required=True)
+p.add_argument("--row-map", required=True)
 args = p.parse_args()
-source = load_workbook(args.input, read_only=True, data_only=False)
+source = load_workbook(args.input, data_only=False)
 columns = COLUMNS
 records = []
+skipped = []
+def skip(sheet, number, reason, rationale):
+    skipped.append({"sheet": sheet.title, "rows": [[number, number]], "reason": reason, "rationale": rationale})
 for sheet in source:
     headers = None
     current = None
-    for cells in sheet.iter_rows(values_only=True):
+    for number, cells in enumerate(sheet.iter_rows(min_row=1, max_row=sheet.max_row, values_only=True), 1):
         values = list(cells)
         if "Part" in values and "Quantity" in values:
             headers = {str(value): i for i, value in enumerate(values) if value is not None}
+            skip(sheet, number, "header", "Column headings.")
             continue
-        if headers is None or not any(value is not None for value in values):
+        if not any(value is not None for value in values):
+            continue
+        if headers is None:
+            skip(sheet, number, "title", "Assembly declarations above the header.")
             continue
         def get(key):
             index = headers.get(key)
             return values[index] if index is not None and index < len(values) else None
+        def at(key):
+            return [number, headers[key] + 1]
         item, quantity, maker, mpn = get("Part"), get("Quantity"), get("Maker"), get("MPN")
         if item in ("Drawing", "Procedure"):
             record = dict.fromkeys(columns)
             record.update(item_number=str(quantity), item_name=str(item), item_category="Document")
+            record["_map"] = {"sheet": sheet.title, "rows": [number],
+                              "fields": {"item_number": at("Quantity"), "item_name": at("Part")}}
             records.append(record)
         elif item == "Notes":
-            continue
+            skip(sheet, number, "note", "Free-text note row.")
         elif item is None and quantity is None and maker is not None and mpn is not None:
             if current is None:
                 raise ValueError("alternate without parent")
@@ -60,10 +73,17 @@ for sheet in source:
                 raise ValueError("too many alternatives")
             current["manufacturer_"+str(slot)] = str(maker)
             current["manufacturer_item_number_"+str(slot)] = str(mpn)
+            current["_map"]["rows"].append(number)
+            current["_map"]["fields"]["manufacturer_"+str(slot)] = at("Maker")
+            current["_map"]["fields"]["manufacturer_item_number_"+str(slot)] = at("MPN")
         elif item is not None and quantity is not None:
             record = dict.fromkeys(columns)
             record.update(item_number=str(item), item_name=str(item), item_category="Part", quantity=quantity,
                           manufacturer_1=maker, manufacturer_item_number_1=mpn)
+            fields = {"item_number": at("Part"), "item_name": at("Part"), "quantity": at("Quantity")}
+            if maker is not None and mpn is not None:
+                fields.update(manufacturer_1=at("Maker"), manufacturer_item_number_1=at("MPN"))
+            record["_map"] = {"sheet": sheet.title, "rows": [number], "fields": fields}
             records.append(record)
             current = record
         else:
@@ -72,10 +92,15 @@ source.close()
 output = Workbook()
 sheet = output.active
 sheet.append(columns)
+lines = []
 for i, record in enumerate(records, 1):
     record["line_number"] = i
+    mapped = record.pop("_map")
+    lines.append({"output_row": i + 1, "sheet": mapped["sheet"], "rows": mapped["rows"], "fields": mapped["fields"]})
     sheet.append([record[column] for column in columns])
 output.save(args.output)
+with open(args.row_map, "w", encoding="utf-8") as handle:
+    json.dump({"version": "bom-row-map.v1", "lines": lines, "skipped": skipped, "ignored_columns": []}, handle)
 output.close()
 check = load_workbook(args.output, read_only=True)
 if tuple(next(check.active.values)) != tuple(columns) or check.active.max_row != len(records)+1:
@@ -106,19 +131,24 @@ def execute_package(conflict=False):
 
     class LocalWorker:
         def start(self, item):
-            result, code, output = run_job(job=item.job_id,
+            ran = run_job(job=item.job_id,
                 parser_bytes=store.candidates[item.parser_blob], input_bytes=store.sources[item.source_blob],
                 input_name=item.input_name, output_name=item.output_name, output_policy="opaque",
-                return_output=True, limits=Limits(timeout_seconds=15))
+                return_output=True, limits=Limits(timeout_seconds=15), row_map_name=item.row_map_name)
+            result, code, output = ran[:3]
             assert code == 0, (result["failure"], result.get("stderr_tail"))
             assert result["status"] == "completed" and output is not None
             executions.append(result)
-            # Simulate storage transport only; output comes from the real child process.
+            # Simulate storage transport only; output and row map come from the real child process.
             store.candidates[item.output_blob] = output
             remote = {**result, "contract_version": "remote-worker.v1",
                       "input": {**result["input"], "verified": True},
                       "parser": {**result["parser"], "verified": True},
                       "output": {**result["output"], "content_type": OUTPUT_CONTENT_TYPE}}
+            if item.row_map_name:
+                store.candidates[item.row_map_blob] = ran[3]
+                remote.update(contract_version="remote-worker.v3",
+                              row_map={**result["row_map"], "content_type": "application/json"})
             store.candidates[item.result_blob] = _json_bytes(remote)
             return StartResult(item.job_id, "offline-child-process", datetime.now(timezone.utc))
 
