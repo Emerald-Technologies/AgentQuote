@@ -423,12 +423,23 @@ class ParentPackageService:
         if (state["status"] != "completed" or state["result_sha256"] != ref["result_sha256"]
                 or sorted(expected, key=lambda item: item["document_ids"]) != recorded):
             raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
+        choices = {}
+        for item in state["result"]["choices"]:
+            if item["assembly"] in choices:
+                raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
+            choices[item["assembly"]] = item
         selections = {}
         for entry in state["result"]["primary_selections"]:
             if entry["excluded_document_ids"] and len(entry["primary_document_ids"]) == 1:
+                if entry["assembly"] not in choices:
+                    raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
                 selections[entry["primary_document_ids"][0]] = {
-                    "assembly": entry["assembly"], "excluded_document_ids": entry["excluded_document_ids"],
-                    "package_choice": dict(ref)}
+                    "selection": {"assembly": entry["assembly"],
+                                  "excluded_document_ids": entry["excluded_document_ids"],
+                                  "package_choice": dict(ref)},
+                    "choice": choices[entry["assembly"]],
+                    "documents": {file_id: item["document_id"] for item in state["result"]["documents"]
+                                  for file_id in item["survey_file_ids"]}}
         return selections
 
     def _reconcile_review_groups(self, groups: list[dict[str, Any]],
@@ -491,7 +502,9 @@ class ParentPackageService:
             if selection is not None and reconciliation.relation == "equivalent":
                 # One primary chosen by the package choice and agreed by the cross-check (plan 8.2-8).
                 evidence["reconciliation"] = "primary_selected"
-                evidence["primary_selection"] = selection
+                evidence["primary_selection"] = selection["selection"]
+                evidence["post_parse"] = self._post_parse(selection["choice"], selection["documents"],
+                                                          reconciliation.rows)
             candidate_ids = {member.get("candidate_id") for member in members
                              if member.get("candidate_id") is not None}
             merged.append({"group_id": group_id, "kind": "assembly",
@@ -501,6 +514,26 @@ class ParentPackageService:
                            "mapping_keys": sorted({key for member in members for key in member.get("mapping_keys", [])}),
                            "disposition_keys": disposition_keys})
         return sorted(passthrough + merged, key=lambda item: (item.get("document_ids", []), item.get("kind", "")))
+
+    @staticmethod
+    def _post_parse(entry: dict[str, Any], documents: dict[str, str], rows: Any) -> dict[str, Any]:
+        """Parsed primary vs the stored identity-column digests of every file set aside (plan 8.3).
+
+        Counts only. needs_review is a warning: a person must approve (system acceptance refuses)
+        and may bring a set-aside file back into processing.
+        """
+        from .bom_candidate_choice import ChoiceError, post_parse_check
+        try:
+            result = post_parse_check(entry["choice"], None, rows, digests=entry["set_aside_digests"])
+        except (ChoiceError, KeyError, TypeError) as exc:
+            raise PackageResolutionError("PACKAGE_CHOICE_BINDING") from exc
+        return {"version": result["version"], "agreement": result["agreement"],
+                "review_reasons": result["review_reasons"],
+                "checks": [{**({"document_id": documents[item["file_id"]]} if item["file_id"] in documents else {}),
+                            **{key: item[key] for key in ("disposition", "parsed_field", "relation", "outcome",
+                                                         "parsed_values", "column_values",
+                                                         "column_values_not_in_primary")}}
+                           for item in result["checks"]]}
 
     @staticmethod
     def _result_provenance(evidence: dict[str, Any]) -> dict[str, Any]:

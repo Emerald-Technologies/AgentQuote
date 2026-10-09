@@ -288,18 +288,31 @@ def test_candidate_request_identity_is_unchanged_without_a_package_choice():
     assert bound.request_id != expected and bound.to_dict()["package_choice"]["request_id"] == "c" * 64
 
 
-def _choice_for(store_, request, excluded_doc, primary_doc, assembly="Board"):
-    """Write a completed package choice directly (the decision logic is tested above)."""
+def _choice_for(store_, request, excluded_doc, primary_doc, assembly="Board", set_aside_values=("R1",)):
+    """Write a completed package choice directly (the decision logic is tested above).
+
+    set_aside_values are the identity-column values of the set-aside file, stored as digests.
+    """
+    from bom_processor.bom_candidate_choice import value_digest
     from bom_processor.bom_package_choice import RESULT_VERSION, _hash, _json_bytes
+    from bom_processor.semantic import _norm
     record = choice_request(request)
     rid = record["request_id"]
-    documents = [{"document_id": d.document_id, "sha256": d.sha256, "survey_file_ids": [f"F{i}"],
+    file_ids = {d.document_id: f"F{i}" for i, d in enumerate(request.documents, 1)}
+    documents = [{"document_id": d.document_id, "sha256": d.sha256, "survey_file_ids": [file_ids[d.document_id]],
                   "decision": "excluded" if d.document_id == excluded_doc else "process",
                   "reason": "redundant" if d.document_id == excluded_doc else "primary",
                   "disposition": "redundant" if d.document_id == excluded_doc else "primary",
                   "roles": ["bom"], "assemblies": [assembly]}
-                 for i, d in enumerate(request.documents, 1)]
-    result = {"version": RESULT_VERSION, "request_id": rid, "model_calls": 2, "survey": {}, "choices": [],
+                 for d in request.documents]
+    columns = {"sheet": "BOM", "identity_column": 2, "quantity_column": None, "first_row": 2, "last_row": None}
+    choice = {"primary": file_ids[primary_doc], "automatic_selection_allowed": True,
+              "files": [{"file_id": file_ids[primary_doc], "disposition": "primary", "columns": columns},
+                        {"file_id": file_ids[excluded_doc], "disposition": "redundant", "columns": columns}]}
+    choices = [{"assembly": assembly, "view_sha256": "e" * 64, "choice": choice,
+                "set_aside_digests": {file_ids[excluded_doc]: sorted(value_digest(_norm(value))
+                                                                    for value in set_aside_values)}}]
+    result = {"version": RESULT_VERSION, "request_id": rid, "model_calls": 2, "survey": {}, "choices": choices,
               "documents": documents, "findings": [],
               "primary_selections": [{"assembly": assembly, "primary_document_ids": [primary_doc],
                                       "excluded_document_ids": [excluded_doc]}]}
@@ -310,7 +323,7 @@ def _choice_for(store_, request, excluded_doc, primary_doc, assembly="Board"):
     return PackageChoiceService(store_).status(rid)
 
 
-def chosen_package():
+def chosen_package(set_aside_values=("R1",)):
     """Two equivalent BOMs; the choice keeps doc-1 and sets aside doc-2."""
     from test_package_resolution import package_workbook, request_and_store
     output = package_workbook(assembly=("Board", "A"))
@@ -335,7 +348,7 @@ def chosen_package():
     evidence["fixtures"] = evidence["fixtures"][:1]
     evidence["fixture_count"] = 1
     store_.candidates[evidence_path] = json.dumps(evidence).encode()
-    choice = _choice_for(store_, request, "doc-2", "doc-1")
+    choice = _choice_for(store_, request, "doc-2", "doc-1", set_aside_values=set_aside_values)
     from bom_processor.package_system_acceptance import SystemPackageService
     service = SystemPackageService(store_)
     plan = service.plan(request, approved_assignments=[], package_choice=choice,
@@ -352,6 +365,10 @@ def test_primary_selected_group_qualifies_for_system_acceptance_and_resolves_onl
     ready = by_kind["assembly"]
     assert ready["evidence"]["reconciliation"] == "primary_selected"
     assert ready["evidence"]["primary_selection"]["excluded_document_ids"] == ["doc-2"]
+    post_parse = ready["evidence"]["post_parse"]
+    assert post_parse["agreement"] == "agreed" and post_parse["review_reasons"] == []
+    assert [(item["document_id"], item["parsed_field"], item["column_values_not_in_primary"])
+            for item in post_parse["checks"]] == [("doc-2", "item_number", 0)]
     accepted = service.accept_system(plan_id=plan["plan_id"], review_manifest_sha256=review["manifest_sha256"],
                                      assembly_identities=[{"name": "Board", "revision": "A"}],
                                      caller_application="synthetic-quickquote")
@@ -360,6 +377,24 @@ def test_primary_selected_group_qualifies_for_system_acceptance_and_resolves_onl
         (["doc-1"], "primary_selected")]
     # Replay of the published manifest validates with the excluded document left out.
     assert service.manifest(plan["plan_id"], accepted["approval_id"]) == resolved
+
+
+def test_post_parse_contradiction_is_recorded_and_system_acceptance_refuses_it():
+    from bom_processor.package_resolution import PackageResolutionError
+    # The set-aside file holds R2, which the parsed primary lacks: "redundant" is contradicted.
+    _, service, plan, _ = chosen_package(set_aside_values=("R1", "R2"))
+    review = service.review(plan["plan_id"])
+    ready = next(group for group in review["groups"] if group["kind"] == "assembly")
+    post_parse = ready["evidence"]["post_parse"]
+    assert post_parse["agreement"] == "needs_review"
+    assert post_parse["checks"][0]["column_values_not_in_primary"] == 1
+    assert post_parse["review_reasons"] and all(reason.startswith("post_parse_") for reason in post_parse["review_reasons"])
+    # A person may still approve; the system may not.
+    assert review["approval_ready"]
+    with pytest.raises(PackageResolutionError, match="SYSTEM_REVIEW_REQUIRES_EXCEPTION"):
+        service.accept_system(plan_id=plan["plan_id"], review_manifest_sha256=review["manifest_sha256"],
+                              assembly_identities=[{"name": "Board", "revision": "A"}],
+                              caller_application="synthetic-quickquote")
 
 
 def test_plan_refuses_a_choice_whose_result_was_changed_after_planning():

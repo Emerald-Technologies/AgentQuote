@@ -118,6 +118,9 @@ class SystemPackageService(ParentPackageService):
             if (group.get("status") != "ready" or group.get("mapping_keys")
                     or group.get("disposition_keys")
                     or evidence.get("reconciliation") not in {"equivalent", "merged", "primary_selected"}
+                    # A post-parse contradiction of a set-aside decision needs a person (plan 8.3).
+                    or (evidence.get("reconciliation") == "primary_selected"
+                        and (evidence.get("post_parse") or {}).get("agreement") != "agreed")
                     or not isinstance(evidence.get("assembly_identity"), dict)
                     or not evidence.get("fixtures")):
                 if _guard is not None:
