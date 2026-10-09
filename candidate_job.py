@@ -70,12 +70,17 @@ def main() -> int:
                 raise ValueError("invalid author budget environment")
             budget_owner = begin_execution(storage, budget_values[0], int(budget_values[1]), request_id, budget_values[2])
         feedback = os.environ.get("AUTHOR_FEEDBACK", "") or None
+        # Plan 8.8 step 4b: ids of a row-accounting failure; the service reloads and verifies both.
+        refine_ids = (os.environ.get("AUTHOR_REFINE_CANDIDATE", ""), os.environ.get("AUTHOR_REFINE_VALIDATION", ""))
+        if any(refine_ids) and not all(refine_ids):
+            raise ValueError("invalid author refinement environment")
+        extra = {"refine": refine_ids} if all(refine_ids) else {}
         # Only pass the feedback keyword when present so older injected doubles
         # that do not accept it continue to work unchanged.
         result = (CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback,
-              source_associations=True).author() if association_policy == "true" else
-              CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback).author()
-                  if feedback else CandidateAuthoringService(request_id, storage, create_foundry_author()).author())
+              source_associations=True, **extra).author() if association_policy == "true" else
+              CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback, **extra).author()
+                  if feedback or extra else CandidateAuthoringService(request_id, storage, create_foundry_author()).author())
         if attempt_context:
             _write_attempt_marker(storage, request_id, attempt_context, "completed",
                                   {"candidate_id": result.candidate_id})

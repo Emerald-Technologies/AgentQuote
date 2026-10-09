@@ -238,6 +238,10 @@ class CandidateStatusService:
                         outcome = self.automation.start_author_refinement(request_id, candidate_id, failure_event)
                         if isinstance(outcome, str) and outcome.startswith("budget_"):
                             result["automation_error"] = outcome
+                        elif outcome == "row_accounting_review_required":
+                            # Plan 8.8 step 4b: 2 rounds spent; a person decides (locations only).
+                            result["automation_error"] = outcome
+                            result["row_accounting"] = failure_event["row_accounting"]
                     elif failure_event is not None:
                         result["automation_error"] = "validation_failure_requires_review"
                 except Exception:

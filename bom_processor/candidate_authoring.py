@@ -118,8 +118,12 @@ class AuthoringPrompt:
     prompt_version: str = AUTHORING_VERSION
 
     def __repr__(self) -> str:
-        return (f"AuthoringPrompt(canonical_columns={self.canonical_columns!r}, rules={self.rules!r}, "
-                f"structural_profile={self.structural_profile!r}, source_analysis={self.source_analysis!r}, "
+        # Prior parser code and row excerpts reach only the model call, never logs or reprs.
+        shown = {key: value for key, value in self.structural_profile.items() if key != "previous_parser_code"}
+        rules = tuple("<row accounting refinement>" if rule.startswith("ROW ACCOUNTING REFINEMENT") else rule
+                      for rule in self.rules)
+        return (f"AuthoringPrompt(canonical_columns={self.canonical_columns!r}, rules={rules!r}, "
+                f"structural_profile={shown!r}, source_analysis={self.source_analysis!r}, "
                 f"prompt_version={self.prompt_version!r})")
 
 
@@ -189,7 +193,8 @@ def _validate_code(code: str, source_subtype: str = "") -> bytes:
 
 class CandidateAuthoringService:
     def __init__(self, request_id: str, storage: Any, model: ModelAuthor,
-                 feedback: str | None = None, *, source_associations: bool = False):
+                 feedback: str | None = None, *, source_associations: bool = False,
+                 refine: tuple[str, str] | None = None):
         if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
             raise AuthoringError("INVALID_REQUEST_ID")
         self.request_id, self.storage, self.model = request_id, storage, model
@@ -198,6 +203,48 @@ class CandidateAuthoringService:
         self.source_associations = source_associations
         # Bounded refinement feedback from a prior validation failure, if any.
         self.feedback = feedback if isinstance(feedback, str) and feedback.strip() else None
+        # Plan 8.8 step 4b: (prior candidate id, validation id) of a row-accounting failure.
+        if refine is not None and not (isinstance(refine, tuple) and len(refine) == 2
+                                       and all(isinstance(v, str) and _ID.fullmatch(v) for v in refine)):
+            raise AuthoringError("INVALID_REFINEMENT")
+        self.refine = refine
+
+    def _row_refinement(self, fixtures: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Prior code plus the pinned row-accounting failure; refuses anything unbound."""
+        if self.refine is None:
+            return None
+        from .candidate_validation import MAX_ROW_ACCOUNTING_ROUNDS
+        from .row_refinement import failed_row_excerpt, refinement_instructions
+        candidate_id, validation_id = self.refine
+        base = f"candidates/{self.request_id}/{candidate_id}"
+        try:
+            manifest = json.loads(self.storage.download_candidate(f"{base}/candidate-manifest.json", 1_000_000))
+            code = self.storage.download_candidate(f"{base}/parse.py", MAX_CODE_BYTES)
+            event = json.loads(self.storage.download_candidate(
+                f"candidates/events/{self.request_id}/{candidate_id}/validation-failed-{validation_id}.json", 1_000_000))
+        except Exception:
+            raise AuthoringError("REFINEMENT_UNAVAILABLE") from None
+        failure = event.get("row_accounting") if isinstance(event, dict) else None
+        if (not isinstance(manifest, dict) or manifest.get("candidate_id") != candidate_id
+                or manifest.get("code_sha256") != hashlib.sha256(code).hexdigest()
+                or event.get("candidate_id") != candidate_id or event.get("validation_id") != validation_id
+                or not isinstance(failure, dict)):
+            raise AuthoringError("REFINEMENT_INTEGRITY")
+        source = next((item for item in fixtures if item["sha256"].lower() == failure.get("source_sha256")), None)
+        if source is None:
+            raise AuthoringError("REFINEMENT_INTEGRITY")
+        data = self.storage.download_source(source["blob_path"], MAX_SOURCE_BYTES)
+        if len(data) != source["size_bytes"] or hashlib.sha256(data).hexdigest() != source["sha256"].lower():
+            raise AuthoringError("SOURCE_INTEGRITY")
+        extension = "." + source["blob_path"].rsplit(".", 1)[-1].lower()
+        excerpt = failed_row_excerpt(data, extension, failure)
+        from .row_refinement import row_accounting_rounds
+        def paths(prefix: str) -> list[str]:
+            return self.storage.list_registry_paths(prefix, 100)
+        version = ASSOCIATION_AUTHORING_VERSION if self.source_associations else AUTHORING_VERSION
+        round_number = row_accounting_rounds(self.storage, self.request_id, candidate_id, version, paths) + 1
+        return {"previous_parser_code": code.decode("utf-8"),
+                "instructions": refinement_instructions(excerpt, round_number, MAX_ROW_ACCOUNTING_ROUNDS)}
     def author(self) -> AuthoringResult:
         path = f"candidates/requests/{self.request_id}.json"
         try:
@@ -220,7 +267,10 @@ class CandidateAuthoringService:
         rules = CANONICAL_OUTPUT_RULES
         if request["profile"].get("source_subtype") == "html_table_xls":
             rules += HTML_XLS_RULES
-        if self.feedback:
+        row_refinement = self._row_refinement(fixtures)
+        if row_refinement is not None:
+            rules = rules + (row_refinement["instructions"],)
+        elif self.feedback:
             # Refinement context: tell the model what the previous attempt got wrong.
             rules = rules + (f"IMPORTANT REFINEMENT CONTEXT: {self.feedback}. "
                              "Regenerate the parser to avoid this failure while still "
@@ -229,6 +279,8 @@ class CandidateAuthoringService:
         profile["fixture_count"] = len(fixtures)
         profile["fixtures"] = [{"sha256": item.get("sha256"), "size_bytes": item.get("size_bytes"),
                     "source_aliases": item.get("source_aliases", [])[:32]} for item in fixtures]
+        if row_refinement is not None:
+            profile["previous_parser_code"] = row_refinement["previous_parser_code"]
         prompt = AuthoringPrompt(tuple(CANONICAL_COLUMNS), rules, profile, analysis)
         source_subtype = request["profile"].get("source_subtype", "")
         associations = None

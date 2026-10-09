@@ -211,8 +211,12 @@ class FoundryModelAuthor:
                 raise ValueError("AUTHORING_SOURCE_CONTEXT_LIMIT")
             contexts.append({"source_sha256": item["sha256"], "inventory": json.loads(inventory)})
         from .document_role import BOM_READING_GUIDANCE, ROLE_DEFINITIONS, VERSION as ROLE_VERSION
-        user_text = json.dumps({"columns": prompt.canonical_columns, "rules": prompt.rules,
-                               "sources": contexts}, ensure_ascii=False)
+        request: dict[str, Any] = {"columns": prompt.canonical_columns, "rules": prompt.rules, "sources": contexts}
+        previous = getattr(prompt, "structural_profile", {}).get("previous_parser_code")
+        if isinstance(previous, str):
+            # Plan 8.8 step 4b: correct the prior parser against the listed failed rows.
+            request["previous_parser_code"] = previous
+        user_text = json.dumps(request, ensure_ascii=False)
         if len(user_text) > 120_000:
             raise ValueError("AUTHORING_SOURCE_CONTEXT_LIMIT")
         instructions = (
@@ -278,6 +282,9 @@ class FoundryModelAuthor:
                          f"Canonical output rules:\n{rules}\n"
                          f"Source format: {prompt.source_analysis.extension}\n"
                          f"Workbook {'complete cell inventory' if complete else 'preview'}:\n{source_context}")
+            previous = getattr(prompt, "structural_profile", {}).get("previous_parser_code")
+            if isinstance(previous, str) and prior_code is None:
+                user_text += f"\nprevious_parser_code (correct it against the failed rows above):\n{previous}"
             if prior_code is not None:
                 user_text += (
                     "\nA previous candidate failed static policy rule "

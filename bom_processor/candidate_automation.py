@@ -312,6 +312,9 @@ class CandidateAutomationService:
         """
         if self.author_starter is None:
             return None
+        hold = self._row_accounting_hold(request_id, candidate_id, failure_event)
+        if hold is not None:
+            return hold
         if self._budget_required(request_id):
             from .author_budget import Budget
             state = Budget(self.storage, request_id, clock=self.budget_clock).inspect()
@@ -359,6 +362,7 @@ class CandidateAutomationService:
         values = {"REQUEST_ID": request_id, **self.author_environment}
         if feedback:
             values["AUTHOR_FEEDBACK"] = feedback
+        values.update(self._row_refinement_values(candidate_id, failure_event))
 
         result = self._run_attempt(
             prefix=refinement_root, values=values,
@@ -371,6 +375,30 @@ class CandidateAutomationService:
             # remains in flight and must not fan out concurrent refinements.
             author_attempt_kind="author-refinement")
         return result
+
+    @staticmethod
+    def _row_refinement_values(candidate_id: str | None, failure_event: dict[str, Any] | None) -> dict[str, str]:
+        """Plan 8.8 step 4b: a row-accounting failure is fixed from the prior parser, not from scratch.
+
+        Only identifiers travel in the job environment; the author job reloads the hash-pinned
+        failure event and prior code from storage.
+        """
+        if (not isinstance(failure_event, dict) or not isinstance(failure_event.get("row_accounting"), dict)
+                or not isinstance(candidate_id, str) or not isinstance(failure_event.get("validation_id"), str)):
+            return {}
+        return {"AUTHOR_REFINE_CANDIDATE": candidate_id,
+                "AUTHOR_REFINE_VALIDATION": failure_event["validation_id"]}
+
+    def _row_accounting_hold(self, request_id: str, candidate_id: str,
+                             failure_event: dict[str, Any] | None) -> str | None:
+        """After 2 failed row-accounting refinement rounds the file goes to a person (Nick 2026-10-09)."""
+        if not isinstance(failure_event, dict) or not isinstance(failure_event.get("row_accounting"), dict):
+            return None
+        from .candidate_validation import MAX_ROW_ACCOUNTING_ROUNDS
+        from .row_refinement import HOLD_REASON, row_accounting_rounds
+        version = self._request_policy(request_id).authoring_version
+        rounds = row_accounting_rounds(self.storage, request_id, candidate_id, version, self._paths)
+        return HOLD_REASON if rounds >= MAX_ROW_ACCOUNTING_ROUNDS else None
 
     def _request_policy(self, request_id: str):
         """Resolve from trusted membership, never mutate shared dispatcher state."""
@@ -444,6 +472,7 @@ class CandidateAutomationService:
         if failure_event:
             values["AUTHOR_FEEDBACK"] = (f"Previous parser failed with {failure_event.get('failure') or failure_event.get('error_code')}: "
                                         f"{failure_event.get('failure_message') or ''}")[:1000]
+            values.update(self._row_refinement_values(candidate_id, failure_event))
         try:
             budget.mark_dispatch(reservation)
         except Exception:
