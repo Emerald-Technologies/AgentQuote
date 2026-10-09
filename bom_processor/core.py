@@ -410,6 +410,9 @@ class ProcessingRequest:
     force_candidate: bool = False
     # None: field absent (requests from before 2026-10-08 keep their fingerprint).
     package_files: tuple[PackageFile, ...] | None = None
+    # None: field absent. Request document ids a person brought back after the package choice set them
+    # aside (plan 8.8 step 2, reopen); needs package_files; sorted, unique.
+    package_choice_reopen: tuple[str, ...] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ProcessingRequest":
@@ -418,7 +421,7 @@ class ProcessingRequest:
         try:
             unknown = set(value) - {"job_id", "customer_key", "parser_key", "rfq_uuid",
                                     "package_version", "documents", "force_candidate",
-                                    "package_files"}
+                                    "package_files", "package_choice_reopen"}
             if unknown or value.get("force_candidate", False) not in {False, True}:
                 raise ProcessingError("invalid request")
             files = value.get("package_files")
@@ -426,6 +429,10 @@ class ProcessingRequest:
                     not isinstance(item, dict) or set(item) != {
                         "document_id", "file_name", "blob_path", "size_bytes", "sha256"} for item in files)):
                 raise ProcessingError("invalid package files")
+            reopen = value.get("package_choice_reopen")
+            if "package_choice_reopen" in value and (not isinstance(reopen, list)
+                                                     or any(not isinstance(item, str) for item in reopen)):
+                raise ProcessingError("invalid package choice reopen")
             request = cls(
                 value.get("job_id", ""), value.get("customer_key", ""),
                 value.get("parser_key", ""), value.get("rfq_uuid", ""),
@@ -433,6 +440,7 @@ class ProcessingRequest:
                 tuple(SourceDocument(**document) for document in value["documents"]),
                 value.get("force_candidate", False),
                 None if files is None else tuple(PackageFile(**item) for item in files),
+                None if reopen is None else tuple(reopen),
             )
         except (TypeError, KeyError) as exc:
             raise ProcessingError("invalid request") from exc
@@ -473,6 +481,12 @@ class ProcessingRequest:
                 raise ProcessingError("invalid source metadata")
         if self.package_files is not None:
             self._validate_package_files()
+        if self.package_choice_reopen is not None:
+            reopen = self.package_choice_reopen
+            if (self.package_files is None or not isinstance(reopen, tuple) or not 1 <= len(reopen) <= 100
+                    or list(reopen) != sorted(set(reopen))
+                    or any(item not in document_ids for item in reopen)):
+                raise ProcessingError("invalid package choice reopen")
 
     def _validate_package_files(self) -> None:
         files = self.package_files or ()
@@ -517,6 +531,8 @@ class ProcessingRequest:
                  "blob_path": item.blob_path, "size_bytes": item.size_bytes, "sha256": item.sha256}
                 for item in self.package_files
             ]
+        if self.package_choice_reopen is not None:
+            payload["package_choice_reopen"] = list(self.package_choice_reopen)
         return _sha256(_json_bytes(payload))
 
 

@@ -305,15 +305,14 @@ class CandidateAuthoringService:
         ref = request.get("package_choice")
         if ref is None:
             return False
-        from .bom_package_choice import PackageChoiceError, PackageChoiceService
+        from .bom_package_choice import PackageChoiceError, bound_state
         try:
-            state = PackageChoiceService(self.storage).status(ref.get("request_id", ""))
+            # Re-applies any reopen recorded in the binding (plan 8.8 step 2).
+            state = bound_state(self.storage, ref)
         except PackageChoiceError:
             raise AuthoringError("PACKAGE_CHOICE_BINDING") from None
-        processed = {item["sha256"] for item in state.get("result", {}).get("documents", [])
-                     if item.get("decision") == "process"}
-        if (state["status"] != "completed" or state["result_sha256"] != ref.get("result_sha256")
-                or any(item["sha256"].lower() not in processed for item in request["source_evidence"])):
+        processed = {item["sha256"] for item in state["result"]["documents"] if item.get("decision") == "process"}
+        if any(item["sha256"].lower() not in processed for item in request["source_evidence"]):
             raise AuthoringError("PACKAGE_CHOICE_BINDING")
         return True
 

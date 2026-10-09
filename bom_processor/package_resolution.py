@@ -84,11 +84,12 @@ class ParentPackageService:
         covered: list[str] = []
         choice_ref = None
         if package_choice is not None:
-            from .bom_package_choice import excluded_assignments
-            if package_choice.get("status") != "completed" or request.package_files is None:
+            from .bom_package_choice import choice_reference, excluded_assignments
+            if (package_choice.get("status") != "completed" or request.package_files is None
+                    or package_choice.get("reopened_document_ids") != (
+                        None if request.package_choice_reopen is None else list(request.package_choice_reopen))):
                 raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
-            choice_ref = {"request_id": package_choice["request_id"],
-                          "result_sha256": package_choice["result_sha256"]}
+            choice_ref = choice_reference(package_choice)
             for item in excluded_assignments(package_choice):
                 document_ids = self._documents(item, sources)
                 assignments.append({key: value for key, value in item.items() if key != "package_choice"}
@@ -412,16 +413,15 @@ class ParentPackageService:
         ref = plan.get("package_choice")
         if ref is None:
             return {}
-        from .bom_package_choice import PackageChoiceError, PackageChoiceService, excluded_assignments
+        from .bom_package_choice import PackageChoiceError, bound_state, excluded_assignments
         try:
-            state = PackageChoiceService(self.storage).status(ref["request_id"])
+            state = bound_state(self.storage, ref)
         except PackageChoiceError as exc:
             raise PackageResolutionError("PACKAGE_CHOICE_BINDING") from exc
         expected = [{key: value for key, value in item.items() if key != "package_choice"}
-                    for item in excluded_assignments(state)] if state["status"] == "completed" else None
+                    for item in excluded_assignments(state)]
         recorded = [item for item in plan["assignments"] if item["kind"] == "excluded"]
-        if (state["status"] != "completed" or state["result_sha256"] != ref["result_sha256"]
-                or sorted(expected, key=lambda item: item["document_ids"]) != recorded):
+        if sorted(expected, key=lambda item: item["document_ids"]) != recorded:
             raise PackageResolutionError("PACKAGE_CHOICE_BINDING")
         choices = {}
         for item in state["result"]["choices"]:
@@ -436,7 +436,8 @@ class ParentPackageService:
                 selections[entry["primary_document_ids"][0]] = {
                     "selection": {"assembly": entry["assembly"],
                                   "excluded_document_ids": entry["excluded_document_ids"],
-                                  "package_choice": dict(ref)},
+                                  "package_choice": {"request_id": ref["request_id"],
+                                                     "result_sha256": ref["result_sha256"]}},
                     "choice": choices[entry["assembly"]],
                     "documents": {file_id: item["document_id"] for item in state["result"]["documents"]
                                   for file_id in item["survey_file_ids"]}}

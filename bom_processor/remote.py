@@ -64,14 +64,18 @@ class RemoteBomProcessor:
             return None
         if self.package_choice is None:
             raise ProcessingError("package choice unavailable")
-        from .bom_package_choice import PackageChoiceError, PackageChoicePendingError
+        from .bom_package_choice import PackageChoiceError, PackageChoicePendingError, apply_reopen
         try:
             state = self.package_choice.ensure(request)
         except PackageChoiceError as exc:
             raise ProcessingError("package choice invalid") from exc
         if state["status"] != "completed":
             raise PackageChoicePendingError(state["request_id"], state["status"], state.get("code"))
-        return state
+        try:
+            # Documents a person brought back are processed again; no new model call.
+            return apply_reopen(state, request.package_choice_reopen)
+        except PackageChoiceError as exc:
+            raise ProcessingError("package choice reopen invalid") from exc
 
     def _budget_enabled(self, request: ProcessingRequest) -> bool:
         return self.author_budget_enabled or request.rfq_uuid.lower() in self.author_budget_quote_ids
@@ -301,8 +305,10 @@ class RemoteBomProcessor:
 
     def _choice_ref(self) -> dict[str, str] | None:
         choice = getattr(self, "_choice", None)
-        return None if choice is None else {"request_id": choice["request_id"],
-                                            "result_sha256": choice["result_sha256"]}
+        if choice is None:
+            return None
+        from .bom_package_choice import choice_reference
+        return choice_reference(choice)
 
     def _require_candidate(self, request: ProcessingRequest,
                            verified_sources: dict[str, bytes], cause: Exception,

@@ -287,10 +287,63 @@ class PackageChoiceService:
         return self.status(request_id)
 
 
+def apply_reopen(state: dict[str, Any], reopen: tuple[str, ...] | list[str] | None) -> dict[str, Any]:
+    """Completed choice with the documents a person brought back processed again (plan 8.8 step 2).
+
+    No model call; the stored result is not changed. Only a set-aside BOM can be brought back;
+    files the survey called non-BOMs stay set aside. A reopened document joins its assembly's
+    primary documents, so that assembly is reconciled (and any conflict reviewed) as before.
+    """
+    if reopen is None:
+        return state
+    if state.get("status") != "completed":
+        raise PackageChoiceError("PACKAGE_CHOICE_REOPEN_INVALID")
+    reopen = sorted(set(reopen))
+    result = state["result"]
+    documents = {item["document_id"]: item for item in result["documents"]}
+    if not reopen or any(document_id not in documents or documents[document_id]["decision"] != "excluded"
+                         or "bom" not in documents[document_id]["roles"] for document_id in reopen):
+        raise PackageChoiceError("PACKAGE_CHOICE_REOPEN_INVALID")
+    changed = [dict(item, decision="process", reason="reopened") if item["document_id"] in reopen else item
+               for item in result["documents"]]
+    selections = [dict(entry,
+                       primary_document_ids=sorted(set(entry["primary_document_ids"])
+                                                   | (set(entry["excluded_document_ids"]) & set(reopen))),
+                       excluded_document_ids=sorted(set(entry["excluded_document_ids"]) - set(reopen)))
+                  for entry in result["primary_selections"]]
+    return {**state, "result": {**result, "documents": changed, "primary_selections": selections},
+            "reopened_document_ids": reopen}
+
+
+def choice_reference(state: dict[str, Any]) -> dict[str, Any]:
+    """Binding recorded by plans and candidate requests; reopened ids only when present."""
+    reference: dict[str, Any] = {"request_id": state["request_id"], "result_sha256": state["result_sha256"]}
+    if state.get("reopened_document_ids") is not None:
+        reference["reopened_document_ids"] = list(state["reopened_document_ids"])
+    return reference
+
+
+def bound_state(storage: Any, reference: Any) -> dict[str, Any]:
+    """Re-read a recorded binding and re-apply its reopen; refuses anything that no longer matches."""
+    if (not isinstance(reference, dict) or not set(reference) <= {"request_id", "result_sha256", "reopened_document_ids"}
+            or not {"request_id", "result_sha256"} <= set(reference)):
+        raise PackageChoiceError("PACKAGE_CHOICE_BINDING")
+    state = PackageChoiceService(storage).status(str(reference["request_id"]))
+    if state["status"] != "completed" or state["result_sha256"] != reference["result_sha256"]:
+        raise PackageChoiceError("PACKAGE_CHOICE_BINDING")
+    reopen = reference.get("reopened_document_ids")
+    if reopen is not None and (not isinstance(reopen, list) or reopen != sorted(set(reopen))):
+        raise PackageChoiceError("PACKAGE_CHOICE_BINDING")
+    state = apply_reopen(state, reopen)
+    if choice_reference(state) != reference:
+        raise PackageChoiceError("PACKAGE_CHOICE_BINDING")
+    return state
+
+
 def excluded_assignments(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Package-plan assignments for the documents a completed choice set aside."""
     result = state["result"]
-    reference = {"request_id": state["request_id"], "result_sha256": state["result_sha256"]}
+    reference = choice_reference(state)
     return [{"kind": "excluded", "document_ids": [item["document_id"]], "package_choice": reference,
              "reason": item["reason"], "roles": item["roles"], "assemblies": item["assemblies"]}
             for item in result["documents"] if item["decision"] == "excluded"]

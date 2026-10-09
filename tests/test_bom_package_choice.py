@@ -237,6 +237,84 @@ def test_remote_returns_pending_until_the_choice_completes_then_plans_with_exclu
     assert groups[("doc-mod",)] == "pending" and not review["approval_ready"]
 
 
+def reopen_request(reopen, docs=DOCS):
+    value = json.loads(json.dumps({"job_id": "job-1", "customer_key": "cust", "parser_key": "Parser1",
+                                   "rfq_uuid": RFQ, "package_version": "1"}))
+    base = make_request(docs)
+    value["documents"] = [{"document_id": d.document_id, "blob_path": d.blob_path, "size_bytes": d.size_bytes,
+                           "sha256": d.sha256} for d in base.documents]
+    value["package_files"] = [{"document_id": f.document_id, "file_name": f.file_name, "blob_path": f.blob_path,
+                               "size_bytes": f.size_bytes, "sha256": f.sha256} for f in base.package_files]
+    value["package_choice_reopen"] = reopen
+    return ProcessingRequest.from_dict(value)
+
+
+def test_reopen_request_field_is_validated_and_changes_the_fingerprint_only_when_present():
+    assert make_request().package_choice_reopen is None
+    reopened = reopen_request(["doc-plain"])
+    assert reopened.fingerprint() != make_request().fingerprint()
+    # The choice request is the same: reopening never runs the survey or choice again.
+    assert choice_request(reopened)["request_id"] == choice_request(make_request())["request_id"]
+    for bad in (["doc-x"], [], ["doc-plain", "doc-mod"], ["doc-plain", "doc-plain"], "doc-plain"):
+        with pytest.raises(ProcessingError):
+            reopen_request(bad)
+    with pytest.raises(ProcessingError):
+        ProcessingRequest.from_dict({**make_request(with_files=False).__dict__, "documents": [],
+                                     "package_choice_reopen": ["doc-plain"]})
+
+
+def test_reopen_brings_a_set_aside_bom_back_without_a_model_call_and_refuses_non_boms():
+    from bom_processor.bom_package_choice import apply_reopen, bound_state, choice_reference
+    storage, service, _, state = completed_service()
+    reopened = apply_reopen(state, ["doc-plain"])
+    assert decisions(reopened)["doc-plain"] == ("process", "reopened")
+    assert decisions(reopened)["doc-mpi"] == ("excluded", "work_instruction")
+    assert reopened["result"]["primary_selections"] == [
+        {"assembly": "ASSY-100", "primary_document_ids": ["doc-mod", "doc-plain"], "excluded_document_ids": []}]
+    # The stored result is unchanged and the binding re-applies the same reopen.
+    assert service.status(state["request_id"]) == state
+    reference = choice_reference(reopened)
+    assert reference["reopened_document_ids"] == ["doc-plain"]
+    assert bound_state(storage, reference) == reopened
+    assert set(choice_reference(state)) == {"request_id", "result_sha256"}
+    with pytest.raises(PackageChoiceError, match="PACKAGE_CHOICE_REOPEN_INVALID"):
+        apply_reopen(state, ["doc-mpi"])  # the survey called it a work instruction
+    with pytest.raises(PackageChoiceError, match="PACKAGE_CHOICE_REOPEN_INVALID"):
+        apply_reopen(state, ["doc-mod"])  # already processed
+    with pytest.raises(PackageChoiceError, match="PACKAGE_CHOICE_REOPEN_INVALID"):
+        bound_state(storage, {**reference, "reopened_document_ids": ["doc-mpi"]})
+    with pytest.raises(PackageChoiceError, match="PACKAGE_CHOICE_BINDING"):
+        bound_state(storage, {**reference, "reopened_document_ids": ["doc-plain", "doc-plain"]})
+    with pytest.raises(PackageChoiceError, match="PACKAGE_CHOICE_BINDING"):
+        bound_state(storage, {**reference, "extra": 1})
+
+
+def test_remote_with_reopen_processes_the_reopened_bom_under_a_new_plan():
+    storage = store()
+    service = PackageChoiceService(storage, Starter())
+    processor = remote(storage, service)
+    with pytest.raises(PackageChoicePendingError) as pending:
+        processor.process(make_request())
+    service.run(pending.value.request_id, Agent())
+    with pytest.raises(AggregateCandidateRequiredError) as first:
+        processor.process(make_request())
+    with pytest.raises(AggregateCandidateRequiredError) as second:
+        processor.process(reopen_request(["doc-plain"]))
+    authored = sorted(doc for item in second.value.candidates for doc in item.document_ids)
+    assert authored == ["doc-mod", "doc-other", "doc-plain"]
+    assert second.value.plan_id != first.value.plan_id
+    # New candidate request ids: the reopened binding is part of their identity.
+    assert not {item.request_id for item in first.value.candidates} & {item.request_id for item in second.value.candidates}
+    plan = json.loads(storage.registry[f"packages/{second.value.plan_id}/package-plan.v1.json"])
+    assert plan["package_choice"]["reopened_document_ids"] == ["doc-plain"]
+    assert [item["document_ids"] for item in plan["assignments"] if item["kind"] == "excluded"] == [["doc-mpi"]]
+    review = ParentPackageService(storage).review(second.value.plan_id)
+    assert {tuple(group["document_ids"]): group["status"] for group in review["groups"]}[("doc-mpi",)] == "excluded"
+    # A reopen of a non-BOM fails closed.
+    with pytest.raises(ProcessingError, match="package choice reopen invalid"):
+        processor.process(reopen_request(["doc-mpi"]))
+
+
 def test_remote_without_package_files_never_touches_the_choice_service():
     storage = store()
 
