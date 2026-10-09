@@ -67,6 +67,19 @@ def _validate(proposal: Any, keys: set[str]) -> None:
             raise PrimarySelectionError("PRIMARY_SELECTION_FINDING_INVALID")
 
 
+def disposition_outcome(disposition: str, relation: str) -> str:
+    """Whether one alignment relation (primary vs other file) agrees with the agent's label."""
+    if relation == "conflict":
+        return "conflict"
+    if disposition == "redundant":
+        return "agrees" if relation in ("identical", "superset") else "disagrees"
+    if relation == "subset":
+        # The other file contains the primary: the data suggests the opposite choice.
+        return "disagrees"
+    # inferior/obsolete/not_bom/irrelevant: judgments the counts cannot confirm.
+    return "not_confirmable"
+
+
 def cross_check(proposal: Any, boms: Mapping[str, list[Mapping[str, Any]]]) -> dict[str, Any]:
     """Record the agent's dispositions and whether the parsed BOMs agree with them.
 
@@ -81,17 +94,8 @@ def cross_check(proposal: Any, boms: Mapping[str, list[Mapping[str, Any]]]) -> d
     checks, reasons = [], []
     for key in sorted(keys - {primary}):
         alignment = align_boms(boms[primary], boms[key])
-        relation, disposition = alignment["relation"], dispositions[key]
-        if relation == "conflict":
-            outcome = "conflict"
-        elif disposition == "redundant":
-            outcome = "agrees" if relation in ("identical", "superset") else "disagrees"
-        elif relation == "subset":
-            # The other file contains the primary: the data suggests the opposite choice.
-            outcome = "disagrees"
-        else:
-            # inferior/obsolete/not_bom/irrelevant: judgments the counts cannot confirm.
-            outcome = "not_confirmable"
+        disposition = dispositions[key]
+        outcome = disposition_outcome(disposition, alignment["relation"])
         checks.append({"fixture_sha256": key, "disposition": disposition, "outcome": outcome,
                        "alignment": alignment})
         if outcome != "agrees":

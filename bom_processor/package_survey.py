@@ -212,7 +212,23 @@ def _ooxml_guard(data: bytes) -> bool:
         raise _Unreadable("WORKBOOK_INVALID") from exc
 
 
-def _ooxml_top(data: bytes) -> tuple[list[SheetTop], bool]:
+class _Cells(dict):
+    """Cell map with a ceiling: a whole-sheet read stops loudly instead of growing without bound."""
+
+    def __init__(self, budget: list[int] | None):
+        super().__init__()
+        self.budget = budget
+
+    def __setitem__(self, key: tuple[int, int], value: Any) -> None:
+        if self.budget is not None:
+            self.budget[0] -= 1
+            if self.budget[0] < 0:
+                raise _Unreadable("WORKBOOK_CELL_LIMIT")
+        super().__setitem__(key, value)
+
+
+def _ooxml_top(data: bytes, max_row: int | None = TOP_ROWS,
+               budget: list[int] | None = None) -> tuple[list[SheetTop], bool]:
     from openpyxl import load_workbook
     macros = _ooxml_guard(data)
     try:
@@ -224,8 +240,8 @@ def _ooxml_top(data: bytes) -> tuple[list[SheetTop], bool]:
     try:
         sheets = []
         for sheet in book.worksheets:
-            cells: dict[tuple[int, int], Any] = {}
-            for row, values in enumerate(sheet.iter_rows(min_row=1, max_row=TOP_ROWS,
+            cells: dict[tuple[int, int], Any] = _Cells(budget)
+            for row, values in enumerate(sheet.iter_rows(min_row=1, max_row=max_row,
                                                          max_col=MAX_COLUMNS, values_only=True), 1):
                 for column, value in enumerate(values, 1):
                     value = _value(value)
@@ -233,13 +249,16 @@ def _ooxml_top(data: bytes) -> tuple[list[SheetTop], bool]:
                         cells[(row, column)] = value
             sheets.append(SheetTop(sheet.title, sheet.max_row, sheet.max_column, cells))
         return sheets, macros
+    except _Unreadable:
+        raise
     except Exception as exc:
         raise _Unreadable("WORKBOOK_UNREADABLE") from exc
     finally:
         book.close()
 
 
-def _xls_top(data: bytes) -> list[SheetTop]:
+def _xls_top(data: bytes, max_row: int | None = TOP_ROWS,
+             budget: list[int] | None = None) -> list[SheetTop]:
     import xlrd
     try:
         book = xlrd.open_workbook(file_contents=data, on_demand=True, formatting_info=False)
@@ -249,8 +268,8 @@ def _xls_top(data: bytes) -> list[SheetTop]:
         sheets = []
         for index in range(book.nsheets):
             sheet = book.sheet_by_index(index)
-            cells = {}
-            for row in range(min(TOP_ROWS, sheet.nrows)):
+            cells = _Cells(budget)
+            for row in range(sheet.nrows if max_row is None else min(max_row, sheet.nrows)):
                 for column in range(min(MAX_COLUMNS, sheet.ncols)):
                     kind = sheet.cell_type(row, column)
                     if kind in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK, xlrd.XL_CELL_ERROR):
@@ -262,17 +281,20 @@ def _xls_top(data: bytes) -> list[SheetTop]:
             sheets.append(SheetTop(sheet.name, sheet.nrows, sheet.ncols, cells))
             book.unload_sheet(index)
         return sheets
+    except _Unreadable:
+        raise
     except Exception as exc:
         raise _Unreadable("WORKBOOK_UNREADABLE") from exc
     finally:
         book.release_resources()
 
 
-def _rows_top(name: str, rows: Any, row_count: int | None) -> list[SheetTop]:
-    cells = {}
+def _rows_top(name: str, rows: Any, row_count: int | None, max_row: int | None = TOP_ROWS,
+              budget: list[int] | None = None) -> list[SheetTop]:
+    cells = _Cells(budget)
     columns = 0
     for row, values in enumerate(rows, 1):
-        if row > TOP_ROWS:
+        if max_row is not None and row > max_row:
             break
         columns = max(columns, len(values))
         for column, value in enumerate(values[:MAX_COLUMNS], 1):
@@ -282,33 +304,41 @@ def _rows_top(name: str, rows: Any, row_count: int | None) -> list[SheetTop]:
     return [SheetTop(name, row_count, columns or None, cells)]
 
 
-def read_top_rows(kind: str, data: bytes) -> tuple[list[SheetTop], bool]:
-    """Top rows of every sheet, plus whether a macro part is present. Raises _Unreadable."""
+def read_top_rows(kind: str, data: bytes, *, max_row: int | None = TOP_ROWS,
+                  cell_limit: int | None = None) -> tuple[list[SheetTop], bool]:
+    """Top rows of every sheet, plus whether a macro part is present. Raises _Unreadable.
+
+    max_row=None reads every row (stage 2 candidate view); cell_limit then bounds the
+    total stored cells and a larger workbook is unreadable with WORKBOOK_CELL_LIMIT.
+    """
+    budget = None if cell_limit is None else [cell_limit]
     if kind == "spreadsheet_ooxml":
-        return _ooxml_top(data)
+        return _ooxml_top(data, max_row, budget)
     if kind == "spreadsheet_xls":
-        return _xls_top(data), False
+        return _xls_top(data, max_row, budget), False
     if kind == "spreadsheet_html_xls":
         from .master_registry import RegistryError, html_table_raw_rows
         try:
             rows = html_table_raw_rows(data)
         except RegistryError as exc:
             raise _Unreadable("HTML_TABLE_INVALID") from exc
-        return _rows_top("HTML_TABLE_1", rows, len(rows)), False
+        return _rows_top("HTML_TABLE_1", rows, len(rows), max_row, budget), False
     if kind == "spreadsheet_csv":
-        prefix = data[:CSV_PREFIX_BYTES]
+        whole = max_row is None
+        prefix = data if whole else data[:CSV_PREFIX_BYTES]
         try:
             text = prefix.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             # Only a character cut by the prefix boundary itself is tolerated.
-            if len(data) <= CSV_PREFIX_BYTES or exc.start < len(prefix) - 3:
+            if whole or len(data) <= CSV_PREFIX_BYTES or exc.start < len(prefix) - 3:
                 raise _Unreadable("CSV_ENCODING") from exc
             text = prefix[:exc.start].decode("utf-8-sig")
         try:
-            rows = [row for _, row in zip(range(TOP_ROWS), csv.reader(io.StringIO(text)))]
+            reader = csv.reader(io.StringIO(text))
+            rows = list(reader) if whole else [row for _, row in zip(range(max_row), reader)]
         except csv.Error as exc:
             raise _Unreadable("CSV_INVALID") from exc
-        return _rows_top("csv", rows, None), False
+        return _rows_top("csv", rows, len(rows) if whole else None, max_row, budget), False
     raise _Unreadable("NOT_A_SPREADSHEET")
 
 
