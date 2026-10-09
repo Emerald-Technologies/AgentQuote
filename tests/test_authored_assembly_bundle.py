@@ -75,15 +75,28 @@ def test_authored_association_bytes_cannot_be_replaced():
         service.validate()
 
 
-def test_bundle_context_limit_is_checked_before_agent_creation():
+def test_a_source_too_large_to_send_in_full_is_sent_as_a_bounded_skim_view():
+    # Plan 8.8 step 4c: before, this stopped with AUTHORING_SOURCE_CONTEXT_LIMIT.
     from test_source_assembly_association import workbook
-    calls = []
+    seen = []
+
+    class Agent:
+        def __init__(self, **kwargs):
+            seen.append({"instructions": kwargs["instructions"]})
+
+        async def run(self, text, *, options):
+            seen.append({"text": text})
+            return SimpleNamespace(output_text="{}")
+
     source = workbook([["short words "*20] for _ in range(1000)])
     prompt = SimpleNamespace(canonical_columns=(), rules=())
-    with pytest.raises(ValueError, match="AUTHORING_SOURCE_CONTEXT_LIMIT"):
-        FoundryModelAuthor(agent_factory=lambda **kwargs: calls.append(kwargs)).generate_bundle(
-            prompt, [{"bytes": source, "sha256": "a"*64, "extension": "xlsx"}])
-    assert calls == []
+    FoundryModelAuthor(agent_factory=Agent).generate_bundle(
+        prompt, [{"bytes": source, "sha256": "a"*64, "extension": "xlsx"}])
+    request = json.loads(seen[1]["text"])
+    view = request["sources"][0]["inventory"]
+    assert view["coverage"] == "skim" and view["sheets"][0]["row_count"] == 1000
+    assert len(seen[1]["text"]) <= 120_000
+    assert "coverage 'skim'" in seen[0]["instructions"]
 
 
 def test_grouped_v6_replay_rechecks_source_hash():
