@@ -39,7 +39,10 @@ def derive_row_map(source, extension, output):
         for field, value in zip(header, values):
             if field in ("line_number", "item_category") or value is None or _text(value) == "":
                 continue
-            match = next(((s, r, c) for (s, r), cells in sorted(by_row.items())
+            # Prefer the rows this line already cites (a value such as "A" repeats elsewhere), then
+            # any row not yet used by another line.
+            candidates = sorted(by_row.items(), key=lambda item: (item[0][1] not in cited, item[0]))
+            match = next(((s, r, c) for (s, r), cells in candidates
                           if (sheet is None or s == sheet) and (s, r) not in used
                           for c, v in sorted(cells.items()) if _same(v, value, field == "quantity")), None)
             if match is None:

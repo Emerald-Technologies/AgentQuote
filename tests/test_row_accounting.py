@@ -143,7 +143,9 @@ def test_a_pair_split_across_rows_fails_even_when_values_match():
                "ignored_columns": []}
     assert run(source, out, row_map)["valid"] is True
     fields["manufacturer_item_number_2"] = [2, 5]
-    assert run(source, out, row_map)["failed_rows"] == [{"sheet": "BOM", "row": 2, "code": "PAIR_ROWS_DIFFER"}]
+    # The split is reported on the cited row; row 3's own MPN is then not carried (step 4d check).
+    assert run(source, out, row_map)["failed_rows"] == [{"sheet": "BOM", "row": 2, "code": "PAIR_ROWS_DIFFER"},
+                                                         {"sheet": "BOM", "row": 3, "code": "PAIR_NOT_CARRIED"}]
 
 
 def test_an_unmapped_column_with_data_in_bom_lines_fails():

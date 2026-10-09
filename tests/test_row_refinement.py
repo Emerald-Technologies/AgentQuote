@@ -166,5 +166,6 @@ def test_status_surfaces_the_hold_with_row_locations_only():
     assert 'outcome == "row_accounting_review_required"' in source
     assert 'result["row_accounting"] = failure_event["row_accounting"]' in source
     # The failure record holds counts, locations and codes, never cell values.
-    assert set(FAILURE) == {"source_sha256", "error", "failed_row_count", "failed_rows", "unmapped_columns"}
+    assert set(FAILURE) <= {"source_sha256", "error", "failed_row_count", "failed_rows", "unmapped_columns",
+                            "pattern_findings"}
     assert HOLD_REASON == "row_accounting_review_required"

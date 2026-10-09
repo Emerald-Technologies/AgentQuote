@@ -9,8 +9,12 @@ locations only, never customer values. Code checks, on every row of the real fil
   of it, or a stated derivation for unit_of_measure / bom_notes only;
 - every row in a line contributes at least one cited value; both halves of a pair cite one row;
 - a skipped row holding a part number and a positive quantity in mapped columns is a failure;
-- every source column with data in BOM lines feeds a field or is declared ignored.
-Run: python -m pytest tests/test_row_accounting.py
+- every source column with data in BOM lines feeds a field or is declared ignored;
+- the manufacturer/MPN pattern holds on every line row (plan 8.12, step 4d): a column is never a
+  manufacturer in one pair and an MPN in another, a manufacturer column always pairs with the same
+  MPN column, a populated pair cell in a mapped pair column is carried, a combined cell splits into
+  equal name and MPN counts and every part is carried, and no ignored column holds known makers.
+Run: python -m pytest tests/test_row_accounting.py tests/test_manufacturer_layouts.py
 """
 from __future__ import annotations
 
@@ -176,6 +180,13 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
     used_columns: set[tuple[str, int]] = set()
     identity_columns: set[tuple[str, int]] = set()
     quantity_columns: set[tuple[str, int]] = set()
+    # Manufacturer/MPN pattern facts (plan 8.12, step 4d).
+    column_roles: dict[tuple[str, int], set[str]] = {}
+    pair_columns: dict[tuple[str, int], set[int]] = {}
+    cited_cells: set[tuple[str, int, int]] = set()
+    pair_cells: set[tuple[str, int, int]] = set()
+    part_links: Counter[tuple[str, int, int]] = Counter()
+    pair_rows: list[tuple[str, int, int, int, bool]] = []
     allowed_fields = set(columns) - _FIXED
     for line in lines:
         _keys(line, {"output_row", "sheet", "rows", "fields"}, "ROW_MAP_LINE_INVALID")
@@ -221,10 +232,17 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 continue
             contributed.add(row)
             used_columns.add((sheet, column))
+            cited_cells.add((sheet, row, column))
             if field == "item_number" or field.startswith("manufacturer_item_number_"):
                 identity_columns.add((sheet, column))
             if field == "quantity":
                 quantity_columns.add((sheet, column))
+            if field.startswith("manufacturer_"):
+                role = "mpn" if field.startswith("manufacturer_item_number_") else "manufacturer"
+                column_roles.setdefault((sheet, column), set()).add(role)
+                pair_cells.add((sheet, row, column))
+                if len(link) == 3:
+                    part_links[(sheet, row, column)] += 1
         for row in rows:
             if (sheet, row) in source_rows and row not in contributed:
                 fail((sheet, row), "ROW_CONTRIBUTES_NOTHING")
@@ -233,7 +251,42 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
             mpn = fields.get(f"manufacturer_item_number_{index}")
             if isinstance(manufacturer, list) and isinstance(mpn, list) and manufacturer[0] != mpn[0]:
                 fail((sheet, mpn[0]), "PAIR_ROWS_DIFFER")
+            elif isinstance(manufacturer, list) and isinstance(mpn, list):
+                pair_columns.setdefault((sheet, manufacturer[1]), set()).add(mpn[1])
+                pair_rows.append((sheet, manufacturer[0], manufacturer[1], mpn[1],
+                                  len(manufacturer) == 3 and len(mpn) == 3))
     _require(mapped_output == output_rows, "ROW_MAP_OUTPUT_COVERAGE_INVALID")
+
+    # Manufacturer/MPN pattern on every line row (plan 8.12): a broken pattern is a finding.
+    pattern: dict[tuple[str, int], str] = {}
+    for key, roles in column_roles.items():
+        if roles == {"manufacturer", "mpn"}:
+            pattern.setdefault(key, "MANUFACTURER_MPN_SWAPPED")
+    for key, mpns in pair_columns.items():
+        if len(mpns) > 1:
+            pattern.setdefault(key, "PAIR_COLUMNS_INCONSISTENT")
+    consistent = {(sheet, mfr, next(iter(mpns))) for (sheet, mfr), mpns in pair_columns.items() if len(mpns) == 1}
+    for sheet, mfr, mpn in consistent:
+        for (row_sheet, row), cols in source_rows.items():
+            if row_sheet != sheet or (sheet, row) not in owner:
+                continue
+            halves = [column for column in (mfr, mpn) if column in cols
+                      and (sheet, row, column) not in cited_cells]
+            if not halves:
+                continue
+            if len(halves) == 2 or (sheet, row, mfr if halves[0] == mpn else mpn) in pair_cells:
+                fail((sheet, row), "PAIR_NOT_CARRIED")
+            else:
+                fail((sheet, row), "PAIR_HALF_MISSING")
+    for sheet, row, mfr, mpn, combined in pair_rows:
+        if not combined:
+            continue
+        names = [part for part in _PARTS.split(_text(original.cells[(sheet, row, mfr)])) if part]
+        codes = [part for part in _PARTS.split(_text(original.cells[(sheet, row, mpn)])) if part]
+        if len(names) != len(codes):
+            fail((sheet, row), "COMBINED_PAIR_COUNT_MISMATCH")
+        elif part_links[(sheet, row, mfr)] != len(names) or part_links[(sheet, row, mpn)] != len(codes):
+            fail((sheet, row), "COMBINED_PART_NOT_CARRIED")
 
     skipped = proposal["skipped"]
     _require(isinstance(skipped, list) and len(skipped) <= 10_000, "ROW_MAP_SKIP_INVALID")
@@ -287,11 +340,20 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                     if (sheet, row) in owner for column in cols}
     unmapped = sorted(line_columns - used_columns - ignored_columns)
     contradicted = sorted(ignored_columns & used_columns)
+    # An ignored column holding manufacturer names seen in a mapped manufacturer column is a
+    # manufacturer column the parser left out (repeated-pair layouts often reuse header text).
+    makers = {_text(value).casefold() for (sheet, row, column), value in original.cells.items()
+              if (sheet, row) in owner and "manufacturer" in column_roles.get((sheet, column), set()) and _text(value)}
+    for sheet, column in sorted(ignored_columns):
+        values = {_text(original.cells[(sheet, row, column)]).casefold()
+                  for (row_sheet, row) in owner if row_sheet == sheet and (sheet, row, column) in original.cells}
+        if values & makers:
+            pattern.setdefault((sheet, column), "PAIR_COLUMN_IGNORED")
 
     recorded = sorted(failed.items())
     return {
         "version": RESULT_VERSION,
-        "valid": not failed and not unmapped and not contradicted,
+        "valid": not failed and not unmapped and not contradicted and not pattern,
         "source_sha256": original.sha256,
         "output_sha256": parsed.sha256,
         "row_map_sha256": sha256(row_map).hexdigest(),
@@ -307,4 +369,6 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                              for sheet, column in unmapped[:MAX_RECORDED_COLUMNS]],
         "ignored_but_used_columns": [{"sheet": sheet, "column": column}
                                      for sheet, column in contradicted[:MAX_RECORDED_COLUMNS]],
+        "pattern_findings": [{"sheet": sheet, "column": column, "code": code}
+                             for (sheet, column), code in sorted(pattern.items())[:MAX_RECORDED_COLUMNS]],
     }

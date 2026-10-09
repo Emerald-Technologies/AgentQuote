@@ -135,7 +135,8 @@ def _row_failure(semantic: dict[str, Any], source_evidence: dict[str, Any]) -> d
     return {"source_sha256": source_evidence["sha256"].lower(), "error": accounting.get("error"),
             "failed_row_count": accounting.get("failed_row_count", 0),
             "failed_rows": list(accounting.get("failed_rows", []))[:MAX_REFINEMENT_ROWS],
-            "unmapped_columns": list(accounting.get("unmapped_columns", []))[:20]}
+            "unmapped_columns": list(accounting.get("unmapped_columns", []))[:20],
+            "pattern_findings": list(accounting.get("pattern_findings", []))[:20]}
 
 
 def _row_feedback(accounting: dict[str, Any]) -> str:
@@ -144,7 +145,11 @@ def _row_feedback(accounting: dict[str, Any]) -> str:
         return f"row_map_invalid:{accounting['error']}; write --row-map as the bom-row-map.v1 rule describes"
     rows = "; ".join(f"{item['sheet']}!{item['row']}:{item['code']}" for item in accounting.get("failed_rows", [])[:20])
     columns = ", ".join(f"{item['sheet']}!col{item['column']}" for item in accounting.get("unmapped_columns", [])[:10])
+    pattern = ", ".join(f"{item['sheet']}!col{item['column']}:{item['code']}"
+                        for item in accounting.get("pattern_findings", [])[:10])
     parts = [f"row_accounting_failed rows={accounting.get('failed_row_count', 0)}"]
+    if pattern:
+        parts.append(f"manufacturer/MPN pattern: {pattern}")
     if rows:
         parts.append(f"failed rows: {rows}")
     if columns:

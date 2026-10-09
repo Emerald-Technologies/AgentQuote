@@ -45,6 +45,7 @@ def failed_row_excerpt(source: bytes, extension: str, failure: dict[str, Any]) -
         rows.append(entry); size += cost
     return {"version": "row-refinement-excerpt.v1", "failed_row_count": failure.get("failed_row_count", 0),
             "rows": rows, "unmapped_columns": failure.get("unmapped_columns", []),
+            "pattern_findings": failure.get("pattern_findings", []),
             "truncated": truncated or len(wanted) > MAX_EXCERPT_ROWS}
 
 
@@ -57,7 +58,12 @@ def refinement_instructions(excerpt: dict[str, Any], round_number: int, rounds: 
             "ROW_CONTRIBUTES_NOTHING (listed in a line but no value cited from it), FIELD_NOT_LINKED, "
             "FIELD_VALUE_MISMATCH (cited cell does not hold the output value), FIELD_OUTSIDE_LINE, "
             "PAIR_ROWS_DIFFER, SKIPPED_ROW_LOOKS_LIKE_LINE (skipped row has a part number and quantity), "
-            "FIELD_DERIVATION_NOT_ALLOWED. unmapped_columns are source columns with data in BOM lines that "
+            "FIELD_DERIVATION_NOT_ALLOWED, PAIR_NOT_CARRIED (a manufacturer/MPN pair in this row is not in the "
+            "output), PAIR_HALF_MISSING, COMBINED_PAIR_COUNT_MISMATCH (a combined cell splits into different "
+            "name and MPN counts), COMBINED_PART_NOT_CARRIED. pattern_findings are columns: "
+            "MANUFACTURER_MPN_SWAPPED (one column used as both), PAIR_COLUMNS_INCONSISTENT (a manufacturer "
+            "column paired with different MPN columns), PAIR_COLUMN_IGNORED (an ignored column holds maker "
+            "names). unmapped_columns are source columns with data in BOM lines that "
             "feed no field and are not in ignored_columns. Correct previous_parser_code so every row is "
             "accounted for, keep rows that already passed unchanged, and return the complete replacement. "
             "Never drop or invent a row to pass the check. Failed rows: "
