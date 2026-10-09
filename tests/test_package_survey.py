@@ -1,0 +1,323 @@
+"""Stage 1 package survey (plan 8.3): view, checks and run loop. Offline, synthetic data only."""
+import copy
+import io
+import json
+import zipfile
+
+import pytest
+from openpyxl import Workbook
+
+from bom_processor.document_role import ROLE_DEFINITIONS
+from bom_processor.package_survey import (FILE_CELL_LIMIT, SURVEY_INSTRUCTIONS, SurveyError,
+                                          build_view, expand_package, plan_batches)
+from bom_processor.package_survey_check import verify_batch
+from bom_processor.package_survey_run import survey_package
+
+
+def xlsx(sheets, *, macros=False):
+    book = Workbook()
+    book.remove(book.active)
+    for title, rows in sheets.items():
+        sheet = book.create_sheet(title)
+        for row in rows:
+            sheet.append(row)
+    stream = io.BytesIO(); book.save(stream); book.close()
+    if not macros:
+        return stream.getvalue()
+    # A macro part is added the way Excel stores it; the survey must not open it.
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(stream.getvalue())) as source, zipfile.ZipFile(out, "w") as target:
+        for item in source.infolist():
+            target.writestr(item, source.read(item))
+        target.writestr("xl/vbaProject.bin", b"\x00synthetic-not-a-real-macro")
+    return out.getvalue()
+
+
+def archive(members):
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, data in members.items():
+            target.writestr(name, data)
+    return stream.getvalue()
+
+
+BOM_ROWS = [["Assembly", "ASSY-100", "Rev", "B"], [],
+            ["Item", "Part Number", "Manufacturer", "MPN", "Qty", "Ref Des"],
+            [1, "P-1", "Maker", "M-1", 2, "C1,C2"], [2, "P-2", "Maker", "M-2", 1, "R1"]]
+MPI_ROWS = [["Manufacturing Process Instruction"], ["Assembly:ASSY-100", "Rev: B"],
+            ["Step", "Operation"], [10, "Apply paste"], [20, "Place parts"],
+            ["Parts used"], ["P-1", 2], ["P-2", 1]]
+
+
+def a030_like():
+    """Two assemblies, two candidate BOMs for A, an MPI each, PDFs and Gerber data."""
+    assembly_a = archive({
+        "ASSY-100 BOM.xlsx": xlsx({"BOM": BOM_ROWS}),
+        "ASSY-100 MOD BOM.xlsx": xlsx({"BOM": BOM_ROWS + [[3, "P-3", "Maker", "M-3", 4, "U1"]]}),
+        "ASSY-100 MPI.xlsm": xlsx({"MPI": MPI_ROWS, "Pictures": [["see layout"]]}, macros=True),
+        "ASSY-100 drawing.pdf": b"%PDF-1.4 synthetic",
+    })
+    assembly_b = archive({
+        "ASSY-200 BOM.xlsx": xlsx({"BOM": [["Assembly", "ASSY-200"]] + BOM_ROWS[2:]}),
+        "ASSY-200 MPI.xlsx": xlsx({"MPI": [["Process instruction"], ["Assembly:ASSY-200"], ["Step"], [10]]}),
+    })
+    gerbers = archive({"fab/top.gbr": b"G04 synthetic*\n%FSLAX24Y24*%\n", "fab/drill.drl": b"M48\n"})
+    return [("package.zip", archive({"A.zip": assembly_a, "B.zip": assembly_b, "PCB.zip": gerbers}))]
+
+
+def by_name(view):
+    return {item.chain[-1].rsplit("/", 1)[-1]: file_id for file_id, item in view.files.items()}
+
+
+def cell(sheet, row, column, value):
+    return {"source": "cell", "value": value, "cell": {"sheet": sheet, "row": row, "column": column}}
+
+
+def path(value):
+    return {"source": "path", "value": value}
+
+
+def record(file_id, role, *, assembly=None, evidence=(), shared=False, findings=()):
+    return {"file_id": file_id, "role": role, "assembly": assembly, "possibly_shared": shared,
+            "rationale": "Synthetic stub rationale.", "evidence": list(evidence), "findings": list(findings)}
+
+
+def a030_answers(view):
+    ids = by_name(view)
+    a = {"name": [cell("BOM", 1, 2, "ASSY-100"), path("ASSY-100")], "revision": [cell("BOM", 1, 4, "B")]}
+    mpi_a = {"name": [cell("MPI", 2, 1, "ASSY-100")], "revision": [cell("MPI", 2, 2, "B")]}
+    b = {"name": [cell("BOM", 1, 2, "ASSY-200")], "revision": []}
+    answers = {
+        ids["ASSY-100 BOM.xlsx"]: record(ids["ASSY-100 BOM.xlsx"], "bom", assembly=a,
+                                         evidence=[cell("BOM", 3, 2, "Part Number"), cell("BOM", 3, 6, "Ref Des")]),
+        ids["ASSY-100 MOD BOM.xlsx"]: record(ids["ASSY-100 MOD BOM.xlsx"], "bom", assembly=a,
+                                             evidence=[cell("BOM", 3, 4, "MPN")]),
+        ids["ASSY-100 MPI.xlsm"]: record(ids["ASSY-100 MPI.xlsm"], "work_instruction", assembly=mpi_a,
+                                         evidence=[cell("MPI", 1, 1, "Manufacturing Process Instruction"),
+                                                   cell("MPI", 3, 2, "Operation")]),
+        ids["ASSY-100 drawing.pdf"]: record(ids["ASSY-100 drawing.pdf"], "other",
+                                            assembly={"name": [path("ASSY-100")], "revision": []}),
+        ids["ASSY-200 BOM.xlsx"]: record(ids["ASSY-200 BOM.xlsx"], "bom", assembly=b,
+                                         evidence=[cell("BOM", 2, 2, "Part Number")]),
+        ids["ASSY-200 MPI.xlsx"]: record(ids["ASSY-200 MPI.xlsx"], "work_instruction",
+                                         assembly={"name": [cell("MPI", 2, 1, "ASSY-200")], "revision": []},
+                                         evidence=[cell("MPI", 1, 1, "Process instruction")]),
+        ids["top.gbr"]: record(ids["top.gbr"], "other", shared=True),
+        ids["drill.drl"]: record(ids["drill.drl"], "other", shared=True),
+    }
+    return answers
+
+
+class StubAgent:
+    """Answers each batch from a fixed per-file table; records what it was sent."""
+
+    def __init__(self, answers, mutate=None):
+        self.answers, self.mutate, self.sent = answers, mutate, []
+
+    def __call__(self, instructions, user_text):
+        self.sent.append((instructions, user_text))
+        batch, _ = json.JSONDecoder().raw_decode(user_text)
+        reply = {"version": "package-survey-reply.v1",
+                 "files": [copy.deepcopy(self.answers[file_id]) for file_id in batch["classify"]],
+                 "findings": []}
+        return self.mutate(reply, len(self.sent)) if self.mutate else reply
+
+
+def run(roots=None, answers=None, **kwargs):
+    roots = roots or a030_like()
+    view = build_view(expand_package(roots))
+    agent = StubAgent(answers or a030_answers(view), kwargs.pop("mutate", None))
+    return view, agent, survey_package(roots, agent, **kwargs)
+
+
+def test_every_file_is_recorded_including_non_spreadsheets_and_nested_archives():
+    view = build_view(expand_package(a030_like()))
+    kinds = {item.chain[-1].rsplit("/", 1)[-1]: view.entries[file_id]["kind"] for file_id, item in view.files.items()}
+    assert kinds == {"ASSY-100 BOM.xlsx": "spreadsheet_ooxml", "ASSY-100 MOD BOM.xlsx": "spreadsheet_ooxml",
+                     "ASSY-100 MPI.xlsm": "spreadsheet_ooxml", "ASSY-100 drawing.pdf": "pdf",
+                     "ASSY-200 BOM.xlsx": "spreadsheet_ooxml", "ASSY-200 MPI.xlsx": "spreadsheet_ooxml",
+                     "top.gbr": "gerber_text", "drill.drl": "excellon_text"}
+    paths = sorted(item.path for item in view.files.values())
+    assert "package.zip/PCB.zip/fab/top.gbr" in paths
+
+
+def test_a030_shaped_package_gives_roles_and_assemblies_from_plan_8_7():
+    view, agent, survey = run()
+    assert survey["model_calls"] == 1 and len(survey["files"]) == 8
+    groups = {group["name"]: group for group in survey["assemblies"]}
+    ids = by_name(view)
+    assert sorted(groups["ASSY-100"]["files"]["bom"]) == sorted([ids["ASSY-100 BOM.xlsx"], ids["ASSY-100 MOD BOM.xlsx"]])
+    assert groups["ASSY-100"]["files"]["work_instruction"] == [ids["ASSY-100 MPI.xlsm"]]
+    assert groups["ASSY-200"]["files"] == {"bom": [ids["ASSY-200 BOM.xlsx"]],
+                                           "work_instruction": [ids["ASSY-200 MPI.xlsx"]], "other": []}
+    assert sorted(survey["unassigned"]) == sorted([ids["top.gbr"], ids["drill.drl"]])
+    assert not survey["has_blocking_findings"]
+    instructions, text = agent.sent[0]
+    assert instructions == SURVEY_INSTRUCTIONS and ROLE_DEFINITIONS in instructions
+    assert "Apply paste" in text and "macros_present_not_opened" in text
+
+
+def test_macro_workbook_is_read_without_opening_the_macro_part():
+    view, _, survey = run()
+    mpi = next(item for item in survey["files"] if item["path"].endswith("MPI.xlsm"))
+    assert view.entries[mpi["file_id"]]["macros_present_not_opened"] is True
+    assert "SURVEY_MACROS_NOT_OPENED" in {finding["code"] for finding in mpi["findings"]}
+
+
+def test_work_instruction_with_parts_table_keeps_the_agent_role():
+    view, _, survey = run()
+    mpi = next(item for item in survey["files"] if item["path"].endswith("MPI.xlsm"))
+    assert mpi["role"] == "work_instruction"
+    assert mpi["assembly"] == {"name": "ASSY-100", "revision": "B"}
+    # The cited 'ASSY-100' is a whole token inside 'Assembly:ASSY-100'.
+    assert mpi["assembly_evidence"]["name"][0]["cell"] == {"sheet": "MPI", "row": 2, "column": 1}
+
+
+def test_file_with_no_assembly_gets_a_warning_not_a_block():
+    _, _, survey = run()
+    gerber = next(item for item in survey["files"] if item["path"].endswith("top.gbr"))
+    finding = next(item for item in gerber["findings"] if item["code"] == "SURVEY_ASSEMBLY_NOT_IDENTIFIED")
+    assert finding["severity"] == "warning" and not survey["has_blocking_findings"]
+
+
+def test_name_that_disagrees_with_contents_is_a_finding():
+    roots = [("package.zip", archive({"ASSY-999 BOM.xlsx": xlsx({"BOM": BOM_ROWS})}))]
+    view = build_view(expand_package(roots))
+    file_id = view.ids[0]
+    answers = {file_id: record(file_id, "bom", evidence=[cell("BOM", 3, 2, "Part Number")],
+                               assembly={"name": [cell("BOM", 1, 2, "ASSY-100"), path("ASSY-999")], "revision": []})}
+    _, _, survey = run(roots, answers)
+    item = survey["files"][0]
+    assert item["assembly"]["name"] == "ASSY-100"
+    assert "NAME_CONTENT_DISAGREE" in {finding["code"] for finding in item["findings"]}
+
+
+@pytest.mark.parametrize("change, code", [
+    (lambda r: r["evidence"].__setitem__(0, cell("BOM", 3, 2, "Invented")), "SURVEY_EVIDENCE_VALUE_CHANGED"),
+    (lambda r: r["evidence"].__setitem__(0, cell("BOM", 99, 2, "Part Number")), "SURVEY_EVIDENCE_CELL_NOT_SHOWN"),
+    (lambda r: r["evidence"].__setitem__(0, path("ASSY-555")), "SURVEY_EVIDENCE_NOT_IN_PATH"),
+    # A whole word inside the cell may be cited ('Part' of 'Part Number'); a partial word may not.
+    (lambda r: r["evidence"].__setitem__(0, cell("BOM", 3, 2, "Numb")), "SURVEY_EVIDENCE_VALUE_CHANGED"),
+    (lambda r: r.update(evidence=[]), "SURVEY_ROLE_EVIDENCE_REQUIRED"),
+    (lambda r: r.update(role="drawing"), "SURVEY_RECORD_INVALID"),
+    (lambda r: r.update(assembly={"name": [], "revision": []}), "SURVEY_ASSEMBLY_INVALID"),
+    (lambda r: r["findings"].append({"code": "X", "severity": "fatal", "rationale": "r"}), "SURVEY_FINDING_INVALID"),
+])
+def test_cited_evidence_is_checked_against_the_shown_cells_and_path(change, code):
+    view = build_view(expand_package(a030_like()))
+    answers = a030_answers(view)
+    batch = plan_batches(view)[0]
+    target = answers[by_name(view)["ASSY-100 BOM.xlsx"]]
+    change(target)
+    reply = {"version": "package-survey-reply.v1", "files": [answers[i] for i in batch.file_ids], "findings": []}
+    with pytest.raises(SurveyError, match=code):
+        verify_batch(view, batch, reply)
+
+
+def test_every_file_needs_exactly_one_record():
+    view = build_view(expand_package(a030_like()))
+    answers = a030_answers(view)
+    batch = plan_batches(view)[0]
+    files = [answers[i] for i in batch.file_ids]
+    for broken in (files[1:], files + [files[0]]):
+        with pytest.raises(SurveyError, match="SURVEY_COVERAGE_INVALID"):
+            verify_batch(view, batch, {"version": "package-survey-reply.v1", "files": broken, "findings": []})
+
+
+def test_a_rejected_reply_is_retried_once_with_the_code_only():
+    def mutate(reply, attempt):
+        if attempt == 1:
+            reply["files"] = reply["files"][1:]
+        return reply
+    _, agent, survey = run(mutate=mutate)
+    assert survey["model_calls"] == 2
+    assert '"previous_reply_rejected":"SURVEY_COVERAGE_INVALID"' in agent.sent[1][1]
+
+
+def test_two_rejected_replies_stop_the_survey_with_the_code():
+    def mutate(reply, _):
+        reply["version"] = "wrong"
+        return reply
+    with pytest.raises(SurveyError, match="SURVEY_REPLY_INVALID"):
+        run(mutate=mutate)
+
+
+def test_call_ceiling_stops_further_calls():
+    def mutate(reply, _):
+        reply["files"] = []
+        return reply
+    with pytest.raises(SurveyError, match="SURVEY_CALL_LIMIT"):
+        run(mutate=mutate, max_calls=1)
+
+
+def test_large_package_is_split_into_batches_with_every_file_once():
+    rows = [["Header", "Value"]] + [[f"row {index}", "x" * 150] for index in range(1, 20)]
+    members = {f"folder{index // 10}/sheet{index}.xlsx": xlsx({"S": rows}) for index in range(30)}
+    members.update({f"docs/file{index}.pdf": b"%PDF-1.4" for index in range(50)})
+    view = build_view(expand_package([("big.zip", archive(members))]))
+    batches = plan_batches(view)
+    assert len(batches) > 1
+    seen = [file_id for batch in batches for file_id in batch.file_ids]
+    assert sorted(seen) == sorted(view.ids) and len(seen) == len(set(seen))
+    assert all(len(batch.user_text) <= 60_000 and len(batch.file_ids) <= 40 for batch in batches)
+
+
+def test_view_bounds_cells_and_redacts_links_and_long_tokens():
+    wide = [[f"v{row}-{column}" for column in range(1, 60)] for row in range(1, 21)]
+    long_value = "word " * 99 + "end"
+    secret = "see https://example.invalid/x and " + "Z" * 40
+    roots = [("p.zip", archive({"wide.xlsx": xlsx({"S": wide}), "long.xlsx": xlsx({"S": [[long_value, secret]]})}))]
+    view = build_view(expand_package(roots))
+    ids = by_name(view)
+    wide_entry = view.entries[ids["wide.xlsx"]]
+    assert wide_entry["view_limited"] is True
+    assert sum(len(cells) for _, cells in wide_entry["sheets"][0]["top"]) <= FILE_CELL_LIMIT
+    shown = view.entries[ids["long.xlsx"]]["sheets"][0]["top"][0][1]
+    assert shown[0][1].endswith("\u2026") and len(shown[0][1]) == 201
+    assert "example.invalid" not in shown[1][1] and "Z" * 40 not in shown[1][1]
+    # Citations are checked against the original value, not the shortened display.
+    file_id = ids["long.xlsx"]
+    batch = next(b for b in plan_batches(view) if file_id in b.file_ids)
+    answers = {i: record(i, "other") for i in batch.file_ids}
+    answers[file_id] = record(file_id, "other", evidence=[cell("S", 1, 1, long_value[:256])])
+    with pytest.raises(SurveyError, match="SURVEY_EVIDENCE_VALUE_CHANGED"):
+        verify_batch(view, batch, {"version": "package-survey-reply.v1",
+                                   "files": [answers[i] for i in batch.file_ids], "findings": []})
+
+
+def test_unreadable_archive_and_workbook_are_recorded_not_dropped():
+    roots = [("p.zip", archive({"broken.zip": b"PK\x03\x04 not a zip", "bad.xlsx": b"PK\x03\x04 nope",
+                                "notes.txt": b"plain text"}))]
+    view = build_view(expand_package(roots))
+    entries = {item.chain[-1]: view.entries[file_id] for file_id, item in view.files.items()}
+    assert entries["broken.zip"]["kind"] == "archive_unreadable" and entries["broken.zip"]["unreadable"]
+    assert entries["bad.xlsx"]["unreadable"] == "WORKBOOK_INVALID"
+    assert entries["notes.txt"]["kind"] == "text"
+
+
+def test_identical_files_are_linked_and_a_different_verdict_is_reported():
+    data = xlsx({"BOM": BOM_ROWS})
+    roots = [("p.zip", archive({"one/BOM.xlsx": data, "two/BOM.xlsx": data}))]
+    view = build_view(expand_package(roots))
+    first, second = view.ids
+    assert view.entries[first]["same_bytes_as"] == [second]
+    answers = {first: record(first, "bom", evidence=[cell("BOM", 3, 2, "Part Number")]),
+               second: record(second, "other")}
+    _, _, survey = run(roots, answers)
+    assert "SAME_BYTES_DIFFERENT_ROLE" in {finding["code"] for finding in survey["findings"]}
+
+
+def test_csv_and_html_xls_top_rows_are_shown():
+    html = b"<html><body><table><tr><td>Part</td><td>Qty</td></tr><tr><td>P-1</td><td>2</td></tr></table></body></html>"
+    roots = [("p.zip", archive({"a.csv": b"Part,Qty\nP-1,2\n", "b.xls": html}))]
+    view = build_view(expand_package(roots))
+    entries = {item.chain[-1]: view.entries[file_id] for file_id, item in view.files.items()}
+    assert entries["a.csv"]["sheets"][0]["top"][0] == [1, [[1, "Part"], [2, "Qty"]]]
+    assert entries["b.xls"]["kind"] == "spreadsheet_html_xls"
+    assert entries["b.xls"]["sheets"][0]["top"][1] == [2, [[1, "P-1"], [2, "2"]]]
+
+
+def test_roots_are_validated():
+    for roots in ([], [("a/b.zip", b"")], [("x.zip", "text")], [("a.zip", b""), ("A.ZIP", b"")]):
+        with pytest.raises(SurveyError):
+            expand_package(roots)

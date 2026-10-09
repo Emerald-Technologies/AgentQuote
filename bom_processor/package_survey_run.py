@@ -1,0 +1,85 @@
+"""Run stage 1 (package survey): one model call per batch, every reply checked.
+
+Inputs: package root files as (name, bytes) and a caller that sends one batch to
+the agent. Output: the survey record (package_survey_check.assemble). A reply
+that fails a check is retried once with the stable failure code; a second
+failure stops the survey with that code. Not yet wired into the package flow
+(plan 8.8 step 2). Run python -m pytest tests/test_package_survey.py.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any, Callable
+
+from .package_survey import (SURVEY_INSTRUCTIONS, SurveyBatch, SurveyError, build_view,
+                             expand_package, plan_batches)
+from .package_survey_check import verify_batch, assemble
+
+SURVEY_MAX_TOKENS = 8192
+SURVEY_RESPONSE_FORMAT = {"type": "json_object"}
+ATTEMPTS_PER_BATCH = 2
+MAX_REPLY_BYTES = 1_000_000
+
+Caller = Callable[[str, str], Any]
+
+
+def survey_package(roots: list[tuple[str, bytes]], call: Caller, *, max_calls: int | None = None) -> dict[str, Any]:
+    """call(instructions, user_text) returns the parsed JSON reply for one batch."""
+    view = build_view(expand_package(roots))
+    batches = plan_batches(view)
+    ceiling = max_calls if max_calls is not None else len(batches) * ATTEMPTS_PER_BATCH
+    calls = 0
+    records: list[dict] = []
+    package_findings: list[dict] = []
+    for batch in batches:
+        failure = None
+        for _ in range(ATTEMPTS_PER_BATCH):
+            if calls >= ceiling:
+                raise SurveyError("SURVEY_CALL_LIMIT")
+            calls += 1
+            text = batch.user_text if failure is None else _retry_text(batch, failure)
+            try:
+                found, findings = verify_batch(view, batch, call(SURVEY_INSTRUCTIONS, text))
+            except SurveyError as exc:
+                failure = str(exc)
+                continue
+            records.extend(found)
+            package_findings.extend(findings)
+            break
+        else:
+            raise SurveyError(failure or "SURVEY_REPLY_INVALID")
+    return assemble(view, records, package_findings, model_calls=calls)
+
+
+def _retry_text(batch: SurveyBatch, failure: str) -> str:
+    # Only the stable check code is returned to the agent, never source values.
+    return batch.user_text + json.dumps(
+        {"previous_reply_rejected": failure,
+         "instruction": "Return a complete corrected reply for every id in classify."},
+        separators=(",", ":"))
+
+
+def foundry_caller(client: Any = None, agent_factory: Any = None) -> Caller:
+    """Same agent and JSON mode as the parser author (foundry_author)."""
+    from .foundry_author import _response_text
+    from .interpretation_coverage import _pairs_hook
+
+    def call(instructions: str, user_text: str) -> Any:
+        async def invoke() -> Any:
+            factory = agent_factory
+            if factory is None:
+                from agent_framework import Agent
+                factory = Agent
+            response = await factory(client=client, instructions=instructions, tools=[]).run(
+                user_text, options={"max_tokens": SURVEY_MAX_TOKENS,
+                                    "response_format": dict(SURVEY_RESPONSE_FORMAT)})
+            text = _response_text(response)
+            if len(text.encode("utf-8")) > MAX_REPLY_BYTES:
+                raise SurveyError("SURVEY_REPLY_LIMIT")
+            try:
+                return json.loads(text, object_pairs_hook=_pairs_hook)
+            except ValueError:
+                raise SurveyError("SURVEY_REPLY_NOT_JSON") from None
+        return asyncio.run(invoke())
+    return call
