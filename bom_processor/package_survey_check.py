@@ -40,16 +40,26 @@ def _findings(value: Any) -> list[dict[str, Any]]:
 
 def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
     """One cited item, checked against the original value (never the shortened display)."""
-    if not isinstance(item, dict) or item.get("source") not in ("cell", "path"):
-        raise SurveyError("SURVEY_EVIDENCE_INVALID")
+    if not isinstance(item, dict):
+        raise SurveyError("SURVEY_EVIDENCE_RECORD_INVALID")
+    if item.get("source") not in ("cell", "path"):
+        raise SurveyError("SURVEY_EVIDENCE_SOURCE_INVALID")
+    expected = {"source", "value"} if item["source"] == "path" else {"source", "value", "cell"}
+    if set(item) != expected:
+        raise SurveyError("SURVEY_EVIDENCE_FIELDS_INVALID")
+    value = item["value"]
+    if not isinstance(value, str):
+        raise SurveyError("SURVEY_EVIDENCE_VALUE_TYPE_INVALID")
+    if not value:
+        raise SurveyError("SURVEY_EVIDENCE_VALUE_EMPTY")
+    if len(value) > 256:
+        raise SurveyError("SURVEY_EVIDENCE_VALUE_LIMIT")
+    if value != value.strip():
+        raise SurveyError("SURVEY_EVIDENCE_VALUE_WHITESPACE")
     if item["source"] == "path":
-        if set(item) != {"source", "value"} or not _text(item["value"], 256):
-            raise SurveyError("SURVEY_EVIDENCE_INVALID")
-        if not _within_cell(item["value"], view.files[file_id].path):
+        if not _within_cell(value, view.files[file_id].path):
             raise SurveyError("SURVEY_EVIDENCE_NOT_IN_PATH")
-        return {"source": "path", "value": item["value"]}
-    if set(item) != {"source", "value", "cell"} or not _text(item["value"], 256):
-        raise SurveyError("SURVEY_EVIDENCE_INVALID")
+        return {"source": "path", "value": value}
     cell = item["cell"]
     if (not isinstance(cell, dict) or set(cell) != {"sheet", "row", "column"}
             or not isinstance(cell["sheet"], str)

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import candidate_job
 
 
@@ -87,14 +89,15 @@ def test_job_reports_safe_authoring_error_code(monkeypatch, capsys):
     assert marker["rule_id"] == "banned_import"
 
 
-def test_job_reports_safe_model_diagnostics(monkeypatch, capsys):
+@pytest.mark.parametrize("rule_id", [None, "DOCUMENT_ROLE_EVIDENCE_INVALID"])
+def test_job_reports_safe_model_diagnostics(monkeypatch, capsys, rule_id):
     import sys
     from types import ModuleType
     from bom_processor.candidate_authoring import AuthoringError
     class Service:
         def __init__(self, *args): pass
         def author(self):
-            raise AuthoringError("MODEL_FAILED", diagnostics={"failure_stage": "response", "failure_category": "json_invalid", "raw_message": "secret"})
+            raise AuthoringError("MODEL_FAILED", rule_id=rule_id, diagnostics={"failure_stage": "response", "failure_category": "json_invalid", "raw_message": "secret"})
     monkeypatch.setenv("REQUEST_ID", "request-1")
     monkeypatch.setenv("BOM_STORAGE_ACCOUNT_URL", "https://example.blob.core.usgovcloudapi.net")
     azure = ModuleType("azure"); identity = ModuleType("azure.identity")
@@ -108,6 +111,7 @@ def test_job_reports_safe_model_diagnostics(monkeypatch, capsys):
     assert output["failure_stage"] == "response"
     assert output["failure_category"] == "json_invalid"
     assert output["error_code"] == "MODEL_FAILED"
+    assert output.get("rule_id") == rule_id
     assert "secret" not in json.dumps(output)
 
 

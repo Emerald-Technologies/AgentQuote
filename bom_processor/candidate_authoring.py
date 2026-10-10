@@ -337,7 +337,7 @@ class CandidateAuthoringService:
         except AuthoringError:
             raise
         except AuthorFailure as failure:
-            raise AuthoringError("MODEL_FAILED", diagnostics=failure.diagnostics) from None
+            raise AuthoringError("MODEL_FAILED", rule_id=failure.rule_id, diagnostics=failure.diagnostics) from None
         except Exception:
             raise AuthoringError("MODEL_FAILED") from None
         code_hash = hashlib.sha256(code).hexdigest()

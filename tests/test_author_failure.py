@@ -1,4 +1,5 @@
 """Offline failure-stage accuracy and content-leak regressions."""
+import copy
 import json
 from types import SimpleNamespace
 
@@ -131,6 +132,52 @@ def test_safe_diagnostics_survive_service_boundary(monkeypatch):
     assert failed.value.diagnostics == {"failure_stage": "response", "failure_category": "json_invalid",
                                         "failure_json_reason": "other"}
     assert store.candidates == before
+
+
+@pytest.mark.parametrize("mutate,rule", [
+    (lambda p: p.update(source_sha256="0" * 64), "DOCUMENT_ROLE_BINDING_INVALID"),
+    (lambda p: p["evidence"][0].update(value=17), "DOCUMENT_ROLE_EVIDENCE_INVALID"),
+    (lambda p: p["evidence"][0]["cell"].update(row="1"), "DOCUMENT_ROLE_LOCATOR_INVALID"),
+    (lambda p: p["evidence"][0].update(value=SECRET), "DOCUMENT_ROLE_SOURCE_VALUE_CHANGED"),
+    (lambda p: p["findings"].append({"code": "X", "severity": SECRET, "rationale": "r"}),
+     "DOCUMENT_ROLE_FINDING_INVALID"),
+])
+def test_document_role_rule_survives_real_validator_and_service(mutate, rule):
+    from test_source_assembly_association import roles, setup
+    store, sources, associations, _ = setup()
+    path = "candidates/requests/xlsx-demo.json"
+    request = json.loads(store.registry[path]); request["version"] = "candidate-request.v2"
+    store.registry[path] = json.dumps(request).encode()
+    proposals = copy.deepcopy(roles(store, sources))
+    mutate(proposals[sources[0]["sha256"]])
+    before = dict(store.candidates)
+    calls = []
+    class Model:
+        def generate_bundle(self, *_):
+            calls.append(True)
+            return {"parser_code": "unused", "document_roles": proposals,
+                    "assembly_associations": associations}
+    with pytest.raises(AuthoringError) as failed:
+        CandidateAuthoringService("xlsx-demo", store, Model(), source_associations=True).author()
+    assert failed.value.code == "MODEL_FAILED" and failed.value.rule_id == rule
+    assert failed.value.diagnostics == {"failure_stage": "document_role", "failure_category": "value_error"}
+    assert SECRET not in repr(failed.value.__dict__) and SECRET not in str(failed.value)
+    assert store.candidates == before and calls == [True]
+
+
+@pytest.mark.parametrize("kind,args,stage", [
+    (ValueError, ("DOCUMENT_ROLE_EVIDENCE_INVALID",), "document_role"),
+    ("document_role", (SECRET,), "document_role"),
+    ("document_role", (["DOCUMENT_ROLE_EVIDENCE_INVALID"],), "document_role"),
+    ("document_role", ("DOCUMENT_ROLE_EVIDENCE_INVALID", SECRET), "document_role"),
+    ("document_role", ("DOCUMENT_ROLE_EVIDENCE_INVALID",), "response"),
+])
+def test_rule_id_refuses_untrusted_text_types_and_wrong_boundaries(kind, args, stage):
+    from bom_processor.document_role import DocumentRoleError
+    exception = (DocumentRoleError if kind == "document_role" else kind)(*args)
+    failed = AuthorFailure(stage, exception)
+    assert failed.rule_id is None
+    assert SECRET not in str(failed) and SECRET not in repr(failed.diagnostics)
 
 
 def test_association_failure_has_safe_stage_and_preserves_artifacts(monkeypatch):

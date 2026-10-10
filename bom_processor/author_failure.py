@@ -42,6 +42,14 @@ def diagnostic_fields(stage, category, http_status=None, json_reason=None):
     return fields
 
 
+# Only known validator codes can reach job logs; never use arbitrary exception text.
+_DOCUMENT_ROLE_RULES = frozenset({
+    "DOCUMENT_ROLE_BINDING_INVALID", "DOCUMENT_ROLE_EVIDENCE_INVALID",
+    "DOCUMENT_ROLE_LOCATOR_INVALID", "DOCUMENT_ROLE_SOURCE_VALUE_CHANGED",
+    "DOCUMENT_ROLE_FINDING_INVALID",
+})
+
+
 class AuthorFailure(ValueError):
     def __init__(self, stage, exception):
         name = type(exception).__name__
@@ -59,6 +67,13 @@ class AuthorFailure(ValueError):
             category = "value_error"
         else:
             category = "unexpected"
+        self.rule_id = None
+        if stage == "document_role":
+            from .document_role import DocumentRoleError
+            if isinstance(exception, DocumentRoleError) and len(exception.args) == 1:
+                code = exception.args[0]
+                if isinstance(code, str) and code in _DOCUMENT_ROLE_RULES:
+                    self.rule_id = code
         self.diagnostics = diagnostic_fields(stage, category, getattr(exception, "status_code", None),
                                              json_reason(exception) if category == "json_invalid" else None)
         # Preserve this existing stable pre-call limit sentinel, not arbitrary text.

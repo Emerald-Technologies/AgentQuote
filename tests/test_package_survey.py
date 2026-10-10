@@ -130,6 +130,35 @@ def run(roots=None, answers=None, **kwargs):
     return view, agent, survey_package(roots, agent, **kwargs)
 
 
+@pytest.mark.parametrize("evidence,code", [
+    ("private-response-value", "SURVEY_EVIDENCE_RECORD_INVALID"),
+    ({"source": "private-response-value", "value": "x"}, "SURVEY_EVIDENCE_SOURCE_INVALID"),
+    ({"source": "path", "value": "x", "extra": "private-response-value"}, "SURVEY_EVIDENCE_FIELDS_INVALID"),
+    ({"source": "cell", "value": "x"}, "SURVEY_EVIDENCE_FIELDS_INVALID"),
+    ({"source": "cell", "value": 17, "cell": {}}, "SURVEY_EVIDENCE_VALUE_TYPE_INVALID"),
+    ({"source": "path", "value": None}, "SURVEY_EVIDENCE_VALUE_TYPE_INVALID"),
+    ({"source": "path", "value": ""}, "SURVEY_EVIDENCE_VALUE_EMPTY"),
+    ({"source": "path", "value": "private-response-value" * 20}, "SURVEY_EVIDENCE_VALUE_LIMIT"),
+    ({"source": "path", "value": " private-response-value"}, "SURVEY_EVIDENCE_VALUE_WHITESPACE"),
+])
+def test_evidence_rejection_names_rule_without_leaking_reply_or_adding_retries(evidence, code):
+    roots = [("bom.xlsx", xlsx({"BOM": BOM_ROWS}))]
+    calls = []
+    def agent(_instructions, user_text):
+        calls.append(user_text)
+        batch, _ = json.JSONDecoder().raw_decode(user_text)
+        return {"version": "package-survey-reply.v1", "files": [
+            record(batch["classify"][0], "bom", evidence=[copy.deepcopy(evidence)])], "findings": []}
+    result = survey_package(roots, agent)
+    assert len(calls) == result["model_calls"] == 2
+    assert code in calls[1] and "private-response-value" not in calls[1]
+    assert result["has_blocking_findings"]
+    finding = next(f for f in result["findings"] if f["code"] == "SURVEY_BATCH_FAILED")
+    assert finding["failure_code"] == code and finding["raised_by"] == "code"
+    assert all(f["classification_status"] == "unclassified" for f in result["files"])
+    assert "private-response-value" not in json.dumps(result)
+
+
 def test_every_file_is_recorded_including_non_spreadsheets_and_nested_archives():
     view = build_view(expand_package(a030_like()))
     kinds = {item.chain[-1].rsplit("/", 1)[-1]: view.entries[file_id]["kind"] for file_id, item in view.files.items()}
