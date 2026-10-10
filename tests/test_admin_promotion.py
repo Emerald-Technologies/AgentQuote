@@ -116,8 +116,10 @@ def test_approved_signature_is_derived_from_candidate_profile_for_same_source():
     request = json.loads(storage.registry[f"candidates/requests/{common['request_id']}.json"])
     signature = json.loads(storage.registry[
         "approved/Customer1/mystery-csv/1/signature.json"])
+    # The validated parser read the code-found heading row, so the heading rule is approved.
     assert signature["signature_hash"] == VariantSignature.from_profile(
-        request["profile"]).signature_hash
+        request["profile"], heading=True).signature_hash
+    assert signature["required_heading"] == {"Sheet1": ["mystery", "name", "qty"]}
     selected = BlobRegistryReader(storage.download_registry).select(
         "Customer1", "customer-key", SOURCE, ".csv")
     assert selected.variant.signature_hash == signature["signature_hash"]

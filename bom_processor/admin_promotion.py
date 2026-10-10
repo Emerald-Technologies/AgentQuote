@@ -154,7 +154,7 @@ class AdminDecisionService:
                 raise RegistryError("OUTPUT_BINDING")
             try: _validate_xlsx_bytes(output_bytes, self.max_rows)
             except Exception as exc: raise RegistryError("OUTPUT_SCHEMA_INVALID") from exc
-        signature = self._signature(request)
+        signature = self._signature(request, evidence)
         if decision == "approve":
             if variant_id is None or version is None or not all(c.isalnum() or c in "._-" for c in variant_id + version): raise RegistryError("INVALID_VARIANT")
         reason, ticket = reason.strip(), ticket.strip()
@@ -199,8 +199,14 @@ class AdminDecisionService:
                 "variant_id": variant.variant_id, "version": variant.version}}
 
     @staticmethod
-    def _signature(request: dict[str, Any]) -> VariantSignature:
-        return VariantSignature.from_profile(request.get("profile", {}))
+    def _signature(request: dict[str, Any], evidence: dict[str, Any] | None = None) -> VariantSignature:
+        """Heading rule when validation showed the parser read the code-found heading row on every
+        file (layout_heading, Nick 2026-10-09); otherwise the previous first-row rule."""
+        from .layout_heading import layout_key, validated_heading
+        profile = request.get("profile", {})
+        if evidence is not None and layout_key(profile.get("layout")) is not None and validated_heading(evidence):
+            return VariantSignature.from_profile(profile, heading=True)
+        return VariantSignature.from_profile(profile)
 
     def _publish(self, parser_key: str, variant: ApprovedVariant, signature: VariantSignature, record: dict[str, Any]) -> int:
         path = f"registry/{parser_key}/master.json"

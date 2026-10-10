@@ -234,7 +234,10 @@ def test_remote_returns_pending_until_the_choice_completes_then_plans_with_exclu
     review = ParentPackageService(storage).review(required.value.plan_id)
     groups = {tuple(group["document_ids"]): group["status"] for group in review["groups"]}
     assert groups[("doc-mpi",)] == "excluded" and groups[("doc-plain",)] == "excluded"
-    assert groups[("doc-mod",)] == "pending" and not review["approval_ready"]
+    # ASSY-100 and ASSY-200 differ only in the title row above the same heading row: one layout,
+    # so one parser request covers both (layout by heading row, Nick 2026-10-09).
+    assert len(required.value.candidates) == 1
+    assert groups[("doc-mod", "doc-other")] == "pending" and not review["approval_ready"]
 
 
 def reopen_request(reopen, docs=DOCS):

@@ -85,16 +85,29 @@ class StructuralProfile:
     sheet_names: tuple[str, ...]
     header_candidates: Mapping[str, tuple[tuple[str, ...], ...]]
     source_subtype: str = ""
+    # Code-found column-heading row per sheet (layout_heading.build_layout); None for old callers.
+    layout: Mapping[str, Any] | None = None
     profile_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         subtype = self.source_subtype or _subtype_for_extension(self.extension)
         object.__setattr__(self, "source_subtype", subtype)
+        from .layout_heading import layout_key
+        key = layout_key(self.layout)
+        if key is not None:
+            # Layout by heading row (Nick 2026-10-09): title rows and part rows above or below the
+            # headings no longer split one format into one layout per BOM.
+            object.__setattr__(self, "profile_hash", _hash({
+                "extension": self.extension, "source_subtype": subtype,
+                "sheet_names": list(self.sheet_names), "layout": key}))
+            return
+        # No heading found on any sheet: the previous fingerprint, so such a BOM stays its own layout.
         # Candidate identity is structural: content-specific size and digest
         # remain evidence, but must not prevent equivalent sources deduping.
         structural = self.to_dict(False)
         structural.pop("size_bytes", None)
         structural.pop("sha256", None)
+        structural.pop("layout", None)
         object.__setattr__(self, "profile_hash", _hash(structural))
 
     def to_dict(self, include_hash: bool = True) -> dict[str, Any]:
@@ -102,16 +115,21 @@ class StructuralProfile:
                  "sheet_names": list(self.sheet_names), "header_candidates": {name: [list(row) for row in rows] for name, rows in sorted(self.header_candidates.items())}}
         if self.source_subtype != _subtype_for_extension(self.extension):
             value["source_subtype"] = self.source_subtype
+        if self.layout is not None:
+            value["layout"] = {"version": self.layout["version"], "sheets": {
+                name: (None if entry is None else {"row": entry["row"], "headings": list(entry["headings"])})
+                for name, entry in sorted(self.layout["sheets"].items())}}
         if include_hash: value["profile_hash"] = self.profile_hash
         return value
 
 
 def _csv_profile(data: bytes):
+    from .layout_heading import READ_ROWS
     rows = []
     for row in csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace"))):
         rows.append(tuple(normalize_header(cell) for cell in row[:MAX_HEADER_CELLS]))
-        if len(rows) == MAX_HEADER_ROWS: break
-    return ("Sheet1",), {"Sheet1": tuple(rows)}
+        if len(rows) == READ_ROWS: break
+    return ("Sheet1",), {"Sheet1": tuple(rows[:MAX_HEADER_ROWS])}, {"Sheet1": tuple(enumerate(rows, 1))}
 
 
 def _subtype_for_extension(extension: str) -> str:
@@ -266,7 +284,9 @@ def _html_profile(data: bytes):
         if (parser.stack or parser.current_row is not None or parser.current_cell is not None
                 or parser.tables != 1 or not parser.rows or not any(parser.rows)):
             raise ValueError("incomplete")
-        return ("HTMLTable",), {"HTMLTable": tuple(parser.rows[:MAX_HEADER_ROWS])}
+        from .layout_heading import READ_ROWS
+        return (("HTMLTable",), {"HTMLTable": tuple(parser.rows[:MAX_HEADER_ROWS])},
+                {"HTMLTable": tuple(enumerate(parser.rows[:READ_ROWS], 1))})
     except (UnicodeDecodeError, ValueError) as exc:
         raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "invalid_html_xls"}) from exc
 
@@ -364,7 +384,8 @@ def _xlsx_profile(data: bytes):
                 root = ElementTree.fromstring(_bounded_zip_read(archive, "xl/sharedStrings.xml"))
                 for item in root.findall("m:si", namespace)[:4096]:
                     shared.append("".join(text.text or "" for text in item.findall(".//m:t", namespace))[:1024])
-            sheet_names, headers = [], {}
+            from .layout_heading import READ_ROWS
+            sheet_names, headers, numbered = [], {}, {}
             relation_attribute = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
             for sheet in workbook.findall("m:sheets/m:sheet", namespace)[:32]:
                 name = sheet.attrib.get("name", "Sheet")[:128]
@@ -372,8 +393,11 @@ def _xlsx_profile(data: bytes):
                 # Sheets are only ever read from xl/ (unchanged rule); other internal parts are never read.
                 if not target or not target.startswith("xl/") or target not in names: continue
                 root = ElementTree.fromstring(_bounded_zip_read(archive, target))
-                rows = []
-                for row in root.findall(".//m:sheetData/m:row", namespace)[:MAX_HEADER_ROWS]:
+                rows, read = [], []
+                for position, row in enumerate(root.findall(".//m:sheetData/m:row", namespace), 1):
+                    # Real row numbers (r), so the heading row is the row a spreadsheet shows.
+                    number = int(row.attrib["r"]) if row.attrib.get("r", "").isdigit() else position
+                    if number > READ_ROWS and position > MAX_HEADER_ROWS: break
                     values = [""] * MAX_HEADER_CELLS
                     for cell in row.findall("m:c", namespace):
                         index = _column_index(cell.attrib.get("r", ""))
@@ -385,9 +409,10 @@ def _xlsx_profile(data: bytes):
                         elif kind == "inlineStr": value = "".join(text.text or "" for text in cell.findall(".//m:t", namespace))
                         values[index] = normalize_header(value)
                     while values and not values[-1]: values.pop()
-                    rows.append(tuple(values))
-                sheet_names.append(name); headers[name] = tuple(rows)
-            return tuple(sheet_names) or ("Sheet1",), headers or {"Sheet1": ()}
+                    if position <= MAX_HEADER_ROWS: rows.append(tuple(values))
+                    if number <= READ_ROWS: read.append((number, tuple(values)))
+                sheet_names.append(name); headers[name] = tuple(rows); numbered[name] = tuple(read)
+            return tuple(sheet_names) or ("Sheet1",), headers or {"Sheet1": ()}, numbered
     except RegistryError: raise
     except (zipfile.BadZipFile, ElementTree.ParseError, ValueError) as exc:
         raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "invalid_xlsx"}) from exc
@@ -395,31 +420,36 @@ def _xlsx_profile(data: bytes):
 
 def profile_bytes(data: bytes, extension: str) -> StructuralProfile:
     if not isinstance(data, bytes) or len(data) > MAX_PROFILE_BYTES: raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "profile_size_limit"})
+    from .layout_heading import READ_ROWS, build_layout
     normalized = extension.lower() if extension.startswith(".") else "." + extension.lower()
-    if normalized == ".csv": sheets, headers = _csv_profile(data)
-    elif normalized == ".xlsx": sheets, headers = _xlsx_profile(data)
+    if normalized == ".csv": sheets, headers, numbered = _csv_profile(data)
+    elif normalized == ".xlsx": sheets, headers, numbered = _xlsx_profile(data)
     elif normalized == ".xls":
         if data[:4] == b"\xd0\xcf\x11\xe0":
             subtype = "ole_xls"
         elif data.lstrip(b" \t\r\n").startswith((b"<", b"\xef\xbb\xbf<", b"\xff\xfe<", b"\xfe\xff<")):
-            sheets, headers = _html_profile(data)
-            return StructuralProfile(normalized, len(data), _hash(data), sheets, headers, "html_table_xls")
+            sheets, headers, numbered = _html_profile(data)
+            return StructuralProfile(normalized, len(data), _hash(data), sheets, headers, "html_table_xls",
+                                     build_layout(numbered))
         else:
             subtype = "ole_xls"
         try:
             import xlrd
             book = xlrd.open_workbook(file_contents=data, on_demand=True)
-            sheets, headers = [], {}
+            sheets, headers, numbered = [], {}, {}
             for sheet in book.sheets()[:MAX_XLS_SHEETS]:
                 sheets.append(sheet.name[:128]); rows = []
-                for row in range(min(sheet.nrows, MAX_XLS_ROWS)):
+                for row in range(min(sheet.nrows, READ_ROWS)):
                     rows.append(tuple(normalize_header(sheet.cell_value(row, col)) for col in range(min(sheet.ncols, MAX_HEADER_CELLS))))
-                headers[sheet.name[:128]] = tuple(rows)
-            return StructuralProfile(normalized, len(data), _hash(data), tuple(sheets) or ("Sheet1",), headers or {"Sheet1": ()}, subtype)
+                headers[sheet.name[:128]] = tuple(rows[:MAX_XLS_ROWS])
+                numbered[sheet.name[:128]] = tuple(enumerate(rows, 1))
+            return StructuralProfile(normalized, len(data), _hash(data), tuple(sheets) or ("Sheet1",), headers or {"Sheet1": ()}, subtype,
+                                     build_layout(numbered) if sheets else None)
         except RegistryError: raise
         except Exception as exc: raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "invalid_xls"}) from exc
     else: raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "unsupported_extension"})
-    return StructuralProfile(normalized, len(data), _hash(data), sheets, headers)
+    return StructuralProfile(normalized, len(data), _hash(data), sheets, headers, "",
+                             build_layout({name: numbered.get(name, ()) for name in sheets}) if numbered else None)
 
 
 @dataclass(frozen=True)
@@ -429,6 +459,9 @@ class VariantSignature:
     required_headers: Mapping[str, frozenset[str]] = field(default_factory=dict)
     minimum_header_overlap: float = 1.0
     source_subtype: str = ""
+    # Heading rule (layout_heading, Nick 2026-10-09): per sheet, the exact code-found heading row,
+    # wherever it sits. Set only when validation showed the parser read that row; None = old rule.
+    required_heading: Mapping[str, tuple[str, ...]] | None = None
     rule_hash: str = field(init=False)
     signature_hash: str = field(init=False)
 
@@ -436,6 +469,12 @@ class VariantSignature:
         extensions = frozenset(value.lower() if value.startswith(".") else "." + value.lower() for value in self.extensions)
         headers = {name: frozenset(normalize_header(value) for value in values) for name, values in self.required_headers.items()}
         if not extensions or not 0 < self.minimum_header_overlap <= 1: raise RegistryError("INVALID_SIGNATURE")
+        if self.required_heading is not None:
+            if (not isinstance(self.required_heading, Mapping) or not self.required_heading or headers
+                    or any(not isinstance(row, (list, tuple)) or not any(row) for row in self.required_heading.values())):
+                raise RegistryError("INVALID_SIGNATURE")
+            object.__setattr__(self, "required_heading", {name: tuple(str(cell) for cell in row)
+                                                          for name, row in sorted(self.required_heading.items())})
         object.__setattr__(self, "extensions", extensions); object.__setattr__(self, "required_headers", headers)
         subtype = self.source_subtype or ("ole_xls" if ".xls" in extensions else _subtype_for_extension(next(iter(extensions))))
         object.__setattr__(self, "source_subtype", subtype)
@@ -447,17 +486,34 @@ class VariantSignature:
         default_subtype = "ole_xls" if ".xls" in self.extensions else _subtype_for_extension(next(iter(self.extensions)))
         if self.source_subtype != default_subtype:
             value["source_subtype"] = self.source_subtype
+        if self.required_heading is not None:
+            # Present only for heading rules, so every earlier rule keeps its hashes.
+            value["required_heading"] = {name: list(row) for name, row in sorted(self.required_heading.items())}
         if include_hash: value.update(rule_hash=self.rule_hash, signature_hash=self.signature_hash)
         return value
 
     @classmethod
-    def from_profile(cls, profile: Mapping[str, Any]) -> "VariantSignature":
+    def from_profile(cls, profile: Mapping[str, Any], *, heading: bool = False) -> "VariantSignature":
         """Build the approval rule from the persisted candidate profile.
 
         Candidate requests persist JSON lists, while runtime profiles use
         tuples.  Normalize both representations in one place so the rule
         signed during approval is the same rule used by registry selection.
+        heading=True (the parser was shown to read the code-found heading row) gives the heading
+        rule; it needs a profile layout with a heading, else INVALID_SIGNATURE.
         """
+        if heading:
+            from .layout_heading import layout_key
+            key = layout_key(profile.get("layout"))
+            if key is None:
+                raise RegistryError("INVALID_SIGNATURE")
+            extension = profile.get("extension", ".xlsx")
+            sheet_names = profile.get("sheet_names", [])
+            if not isinstance(sheet_names, (list, tuple)):
+                raise RegistryError("INVALID_SIGNATURE")
+            subtype = profile.get("source_subtype") or ("ole_xls" if extension.lower() in (".xls", "xls") else _subtype_for_extension(extension if str(extension).startswith(".") else "." + str(extension)))
+            return cls(frozenset([extension]), frozenset(sheet_names), {}, 1.0, subtype,
+                       {name: tuple(row) for name, row in key["headings"].items() if row})
         headers = profile.get("header_candidates", {})
         if not isinstance(headers, Mapping):
             raise RegistryError("INVALID_SIGNATURE")
@@ -480,12 +536,20 @@ class VariantSignature:
     def from_dict(cls, value):
         extensions = frozenset(value["extensions"])
         subtype = value.get("source_subtype") or ("ole_xls" if ".xls" in extensions else _subtype_for_extension(next(iter(extensions))))
-        signature = cls(extensions, frozenset(value.get("required_sheet_names", [])), {name: frozenset(headers) for name, headers in value.get("required_headers", {}).items()}, float(value.get("minimum_header_overlap", 1.0)), subtype)
+        heading = value.get("required_heading")
+        signature = cls(extensions, frozenset(value.get("required_sheet_names", [])), {name: frozenset(headers) for name, headers in value.get("required_headers", {}).items()}, float(value.get("minimum_header_overlap", 1.0)), subtype,
+                        None if heading is None else {name: tuple(row) for name, row in heading.items()})
         if value.get("signature_hash") != signature.signature_hash or value.get("rule_hash") != signature.rule_hash: raise RegistryError("REGISTRY_CORRUPT")
         return signature
 
     def matches(self, profile):
         if profile.extension not in self.extensions or profile.source_subtype != self.source_subtype or not self.required_sheet_names.issubset(profile.sheet_names): return False
+        if self.required_heading is not None:
+            # The new file's own code-found heading row must be exactly the approved one, on every
+            # sheet the rule names; row position, titles and part rows do not matter.
+            sheets = (profile.layout or {}).get("sheets", {})
+            return all(sheets.get(name) and tuple(sheets[name]["headings"]) == row
+                       for name, row in self.required_heading.items())
         for name, required in self.required_headers.items():
             rows = profile.header_candidates.get(name, ())
             if not rows or max((len(required & set(row)) / len(required) if required else 1) for row in rows) < self.minimum_header_overlap: return False

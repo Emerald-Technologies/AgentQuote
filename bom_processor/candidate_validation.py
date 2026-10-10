@@ -757,6 +757,16 @@ class CandidateValidationService:
             accounting = {"version": "bom-row-accounting.v1", "valid": False, "error": str(exc)}
         except Exception:
             accounting = {"version": "bom-row-accounting.v1", "valid": False, "error": "ROW_MAP_UNVERIFIABLE"}
+        if accounting.get("valid") is True:
+            # Option C part B (Nick 2026-10-09): did the parser read the code-found heading row?
+            # Decides only which approval rule is used; never makes validation fail.
+            from .layout_heading import heading_agreement
+            try:
+                accounting["layout_heading"] = heading_agreement(
+                    source, PurePosixPath(source_evidence["blob_path"]).suffix.lower(), bound["bytes"])
+            except Exception:
+                accounting["layout_heading"] = {"version": "bom-layout.v1", "agreed": False,
+                                                "reason": "CHECK_FAILED"}
         accounting["row_map"] = {key: bound[key] for key in ("blob_path", "sha256", "size")}
         result = {**semantic, "row_accounting": accounting}
         if semantic.get("valid") is True and accounting["valid"] is not True:
