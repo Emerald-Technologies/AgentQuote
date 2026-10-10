@@ -172,6 +172,40 @@ def _policy_valid(policy: Any, group_id: str) -> None:
              and type(policy.get("stall_seconds")) is int
              and policy["stall_seconds"] == STALL_SECONDS)
     _require(policy.get("sources") == _sources(policy.get("sources")))
+    if "package_choice" in policy:
+        _require(policy["package_choice"] == _choice_identity(policy["package_choice"]))
+
+
+def _choice_identity(reference: Any) -> dict[str, str]:
+    _require(isinstance(reference, dict))
+    result = {key: reference.get(key) for key in ("request_id", "result_sha256")}
+    for value in result.values():
+        _digest(value)
+    return result
+
+
+def _check_sources(storage: Any, policy: dict[str, Any], evidence: list[dict[str, Any]],
+                   plan: dict[str, Any]) -> None:
+    """Added files must be reviewed reopens of this group's pinned package choice.
+
+    The first policy and all claims stay immutable. The new membership binds its
+    own persisted plan; later readers recheck that plan and the choice result.
+    """
+    extra = [item for item in evidence if item not in policy["sources"]]
+    if not extra:
+        return
+    from .bom_package_choice import bound_state, PackageChoiceService
+    _require(policy.get("package_choice") == _choice_identity(plan.get("package_choice")))
+    state = bound_state(storage, plan["package_choice"])
+    request = PackageChoiceService(storage).request(state["request_id"])
+    identity = policy["identity"]
+    _require(all(request.get(key) == identity[key]
+                 for key in ("customer_key", "rfq_uuid", "package_version")))
+    originals = _sources(request["documents"])
+    reopened = set(state.get("reopened_document_ids", []))
+    pinned = {item["document_id"]: item for item in policy["sources"]}
+    _require(all(item["document_id"] not in pinned
+                 and item["document_id"] in reopened and item in originals for item in extra))
 
 
 def _membership(storage: Any, request_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
@@ -187,8 +221,18 @@ def _membership(storage: Any, request_id: str) -> tuple[dict[str, Any], dict[str
              and member.get("policy_hash") == _hash(policy))
     _digest(member.get("plan_id"))
     evidence = _sources(member.get("sources"))
-    _require(evidence == member["sources"]
-             and all(item in policy["sources"] for item in evidence))
+    _require(evidence == member["sources"])
+    if any(item not in policy["sources"] for item in evidence):
+        from .package_resolution import ParentPackageService
+        plan = ParentPackageService(storage)._plan(member["plan_id"])
+        _require(_identity(plan, policy["identity"]["profile_hash"]) == policy["identity"])
+        _require(all(item in _sources(plan["sources"]) for item in evidence))
+        assignments = [item for item in plan["assignments"]
+                       if item.get("kind") == "candidate_request" and item.get("request_id") == request_id]
+        _require(len(assignments) == 1
+                 and set(assignments[0]["document_ids"]) == {item["document_id"] for item in evidence}
+                 and assignments[0]["profile_hash"] == policy["identity"]["profile_hash"])
+        _check_sources(storage, policy, evidence, plan)
     return member, policy
 
 
@@ -198,7 +242,7 @@ def enroll(storage: Any, plan: dict[str, Any], request_id: str, *,
     """Publish trusted opt-in membership, never backfill existing author history.
 
     First enrollment pins all same-profile source evidence in the supplied plan.
-    Later split/shuffled plans share that group, but cannot add source evidence.
+    Later plans share the group; only verified same-choice reopens can add files.
     Enrollment itself consumes no slots; clock/token are reserved API seams.
     Re-enrolling identical membership is idempotent even after authoring starts.
     """
@@ -249,8 +293,10 @@ def enroll(storage: Any, plan: dict[str, Any], request_id: str, *,
         if policy is None:
             policy = {"version": VERSION, "group_id": group_id, "identity": identity,
                       "limit": LIMIT, "stall_seconds": STALL_SECONDS, "sources": group_sources}
+            if plan.get("package_choice") is not None:
+                policy["package_choice"] = _choice_identity(plan["package_choice"])
         _policy_valid(policy, group_id)
-        _require(all(item in policy["sources"] for item in group_sources))
+        _check_sources(storage, policy, group_sources, plan)
         member = {"version": VERSION, "request_id": request_id, "group_id": group_id,
                   "policy_hash": _hash(policy), "plan_id": plan_id, "sources": target_sources}
         existing = _membership(storage, request_id)

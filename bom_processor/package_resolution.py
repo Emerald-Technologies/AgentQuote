@@ -152,6 +152,10 @@ class ParentPackageService:
         groups: list[dict[str, Any]] = []
         complete = True
         primaries = self._primary_selections(plan)
+        choice_result = None
+        if plan.get("package_choice") is not None:
+            from .bom_package_choice import bound_state
+            choice_result = bound_state(self.storage, plan["package_choice"])["result"]
         for assignment in plan["assignments"]:
             if assignment["kind"] == "excluded":
                 # Set aside by the package choice; recorded, never parsed (plan 8.2-2, 8.2-9).
@@ -183,6 +187,15 @@ class ParentPackageService:
             projected: dict[str, Any] = {"kind": assignment["kind"],
                 "document_ids": assignment["document_ids"], "request_id": assignment["request_id"],
                 "child_status": child.get("status"), "candidate_id": child.get("candidate_id")}
+            if child.get("automation_error") is not None:
+                projected["automation_error"] = child["automation_error"]
+                if choice_result is not None:
+                    documents = [item for item in choice_result["documents"]
+                                 if item["document_id"] in assignment["document_ids"]]
+                    file_ids = {file_id for item in documents for file_id in item["survey_file_ids"]}
+                    projected["source_file_paths"] = sorted({item["path"] for item in choice_result["survey"]["files"]
+                                                              if item["file_id"] in file_ids})
+                    projected["source_assemblies"] = sorted({name for item in documents for name in item["assemblies"]})
             if child.get("review_error") == "review_semantic_binding":
                 raise PackageResolutionError("PACKAGE_SEMANTIC_BINDING")
             if child.get("status") not in {"awaiting_approval", "approved"} or not isinstance(child.get("review"), dict):
@@ -206,6 +219,12 @@ class ParentPackageService:
                 "status": "awaiting_approval" if complete else "pending",
                 "source_count": len(plan["sources"]), "groups": groups,
                 "assembly_mappings": mappings, "conflict_dispositions": dispositions}
+        if choice_result is not None:
+            failures = [item for item in choice_result["findings"]
+                        if item["code"] in {"SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "CHOICE_ASSEMBLY_FAILED"}
+                        and item.get("raised_by") == "code"]
+            if failures:
+                body["package_choice_findings"] = failures
         return {**body, "manifest_sha256": _hash(body)}
 
     def approve(self, *, plan_id: str, review_manifest_sha256: str,

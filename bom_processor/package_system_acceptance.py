@@ -101,7 +101,8 @@ class SystemPackageService(ParentPackageService):
         # Independently rebuild full review without mappings/conflict choices.
         self._verify_plan_sources(plan_id)
         review = self.review(plan_id)
-        if (not review["approval_ready"] or not review["complete"]
+        if (review.get("package_choice_findings")
+                or not review["approval_ready"] or not review["complete"]
                 or review["manifest_sha256"] != review_manifest_sha256
                 or review["assembly_mappings"] or review["conflict_dispositions"]):
             if _guard is not None:

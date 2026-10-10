@@ -234,20 +234,23 @@ def test_a_rejected_reply_is_retried_once_with_the_code_only():
     assert '"previous_reply_rejected":"SURVEY_COVERAGE_INVALID"' in agent.sent[1][1]
 
 
-def test_two_rejected_replies_stop_the_survey_with_the_code():
+def test_two_rejected_replies_leave_unclassified_files_with_the_code():
     def mutate(reply, _):
         reply["version"] = "wrong"
         return reply
-    with pytest.raises(SurveyError, match="SURVEY_REPLY_INVALID"):
-        run(mutate=mutate)
+    _, agent, survey = run(mutate=mutate)
+    assert survey["model_calls"] == 2 and survey["has_blocking_findings"]
+    assert all(item["classification_status"] == "unclassified" for item in survey["files"])
+    assert survey["findings"][0]["failure_code"] == "SURVEY_REPLY_INVALID"
 
 
 def test_call_ceiling_stops_further_calls():
     def mutate(reply, _):
         reply["files"] = []
         return reply
-    with pytest.raises(SurveyError, match="SURVEY_CALL_LIMIT"):
-        run(mutate=mutate, max_calls=1)
+    _, agent, survey = run(mutate=mutate, max_calls=1)
+    assert survey["model_calls"] == 1 and len(agent.sent) == 1
+    assert survey["has_blocking_findings"] and survey["findings"][0]["code"] == "SURVEY_CALL_LIMIT"
 
 
 def test_large_package_is_split_into_batches_with_every_file_once():

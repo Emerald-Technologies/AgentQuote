@@ -75,7 +75,7 @@ def _stable_code(exc: BaseException) -> str:
 
 def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller) -> dict[str, Any]:
     """Survey, choose and decide per request document. Pure apart from model calls."""
-    from .bom_candidate_choice import run_choice, set_aside_digests
+    from .bom_candidate_choice import ATTEMPTS, ChoiceError, run_choice, set_aside_digests
     from .bom_candidate_view import build_candidate_view
     from .package_survey import build_view, expand_package
     from .package_survey_run import survey_view
@@ -84,12 +84,26 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     survey = survey_view(view, call)
     calls = survey["model_calls"]
     choices = []
-    for group in survey["assemblies"]:
+    failed_files = set()
+    failures = [item for item in survey["findings"]
+                if item["code"] in {"SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT"} and item["raised_by"] == "code"]
+    # Failed survey batches make all choice results unusable; avoid paid calls.
+    for group in ([] if failures else survey["assemblies"]):
         boms = group["files"]["bom"]
         if len(boms) < 2:
             continue
         candidate_view = build_candidate_view(view, group["name"], boms)
-        choice, used = run_choice(candidate_view, call)
+        try:
+            choice, used = run_choice(candidate_view, call)
+        except ChoiceError as exc:
+            calls += ATTEMPTS
+            failed_files.update(boms)
+            failures.append({"code": "CHOICE_ASSEMBLY_FAILED", "severity": "warning", "raised_by": "code",
+                             "rationale": "No primary BOM was chosen after two attempts; all BOMs of this assembly are retained for review.",
+                             "file_ids": list(boms), "assembly": group["name"]})
+            choices.append({"assembly": group["name"], "view_sha256": candidate_view.sha256,
+                            "choice": None, "set_aside_digests": {}, "failure_code": _stable_code(exc)})
+            continue
         calls += used
         choices.append({"assembly": group["name"], "view_sha256": candidate_view.sha256,
                         "choice": choice, "set_aside_digests": set_aside_digests(choice, candidate_view)})
@@ -99,6 +113,8 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
         by_hash.setdefault(item.sha256, []).append(file_id)
     labels: dict[str, tuple[dict[str, Any], str]] = {}
     for entry in choices:
+        if entry["choice"] is None:
+            continue
         for item in entry["choice"]["files"]:
             labels[item["file_id"]] = (entry, item["disposition"])
     documents, findings = [], []
@@ -113,6 +129,8 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                              "document_id": document["document_id"], "raised_by": "code"})
         elif survey["has_blocking_findings"]:
             reason = "survey_blocking"
+        elif failed_files.intersection(file_ids):
+            reason = "choice_failed"
         elif "bom" not in roles:
             decision, reason = "excluded", roles[0] if len(roles) == 1 else "not_bom"
         else:
@@ -140,7 +158,7 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
         raise PackageChoiceError("PACKAGE_NO_BOM")
     primaries = []
     for entry in choices:
-        if not entry["choice"]["automatic_selection_allowed"]:
+        if entry["choice"] is None or not entry["choice"]["automatic_selection_allowed"]:
             continue
         ids = {file_id for item in entry["choice"]["files"] for file_id in [item["file_id"]]}
         members = [item for item in documents if set(item["survey_file_ids"]) & ids]
@@ -149,6 +167,13 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                                                          if item["decision"] == "process"),
                           "excluded_document_ids": sorted(item["document_id"] for item in members
                                                           if item["decision"] == "excluded")})
+    for failure in failures:
+        ids = set(failure["file_ids"])
+        findings.append({key: failure[key] for key in ("code", "severity", "rationale", "raised_by")} | {
+            "document_ids": sorted(item["document_id"] for item in documents if ids.intersection(item["survey_file_ids"])),
+            "assemblies": sorted({records[file_id]["assembly"]["name"] for file_id in ids
+                                  if records[file_id]["assembly"] is not None}),
+            "file_paths": [view.files[file_id].path for file_id in sorted(ids)]})
     return {"version": RESULT_VERSION, "request_id": request["request_id"], "model_calls": calls,
             "survey": survey, "choices": choices, "documents": documents,
             "primary_selections": primaries, "findings": findings}

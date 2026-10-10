@@ -3,8 +3,8 @@
 Inputs: package root files as (name, bytes) and a caller that sends one batch to
 the agent. Output: the survey record (package_survey_check.assemble). A reply
 that fails a check is retried once with the stable failure code; a second
-failure stops the survey with that code. Not yet wired into the package flow
-(plan 8.8 step 2). Run python -m pytest tests/test_package_survey.py.
+failure leaves its files unclassified with a blocking finding. Other batches
+continue; package choice retains every BOM when a batch failed (plan 8.8 step 6). Run python -m pytest tests/test_package_survey.py.
 """
 from __future__ import annotations
 
@@ -40,19 +40,32 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
         failure = None
         for _ in range(ATTEMPTS_PER_BATCH):
             if calls >= ceiling:
-                raise SurveyError("SURVEY_CALL_LIMIT")
+                failure = "SURVEY_CALL_LIMIT"
+                break
             calls += 1
             text = batch.user_text if failure is None else _retry_text(batch, failure)
             try:
                 found, findings = verify_batch(view, batch, call(SURVEY_INSTRUCTIONS, text))
-            except SurveyError as exc:
-                failure = str(exc)
+            except Exception as exc:
+                failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
                 continue
             records.extend(found)
             package_findings.extend(findings)
+            failure = None
             break
-        else:
-            raise SurveyError(failure or "SURVEY_REPLY_INVALID")
+        if failure is not None:
+            code = "SURVEY_CALL_LIMIT" if failure == "SURVEY_CALL_LIMIT" else "SURVEY_BATCH_FAILED"
+            finding = {"code": code, "severity": "blocking", "raised_by": "code",
+                       "rationale": "These files could not be classified; every BOM is retained for review.",
+                       "file_ids": list(batch.file_ids), "failure_code": failure}
+            package_findings.append(finding)
+            for file_id in batch.file_ids:
+                item, entry = view.files[file_id], view.entries[file_id]
+                records.append({"file_id": file_id, "path": item.path, "chain": list(item.chain),
+                                "sha256": item.sha256, "size_bytes": item.size_bytes, "kind": entry["kind"],
+                                "role": "other", "classification_status": "unclassified",
+                                "assembly": None, "assembly_evidence": None, "possibly_shared": False,
+                                "rationale": finding["rationale"], "evidence": [], "findings": [finding]})
     return assemble(view, records, package_findings, model_calls=calls)
 
 

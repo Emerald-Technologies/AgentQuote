@@ -78,7 +78,8 @@ class RemoteBomProcessor:
             raise ProcessingError("package choice reopen invalid") from exc
 
     def _budget_enabled(self, request: ProcessingRequest) -> bool:
-        return self.author_budget_enabled or request.rfq_uuid.lower() in self.author_budget_quote_ids
+        return (request.package_files is not None or self.author_budget_enabled
+                or request.rfq_uuid.lower() in self.author_budget_quote_ids)
 
     def process(self, request: ProcessingRequest) -> dict[str, Any]:
         request.validate()

@@ -335,6 +335,6 @@ def run_choice(view: CandidateView, call: Caller) -> tuple[dict[str, Any], int]:
             separators=(",", ":"))
         try:
             return verify_choice(view, call(CHOICE_INSTRUCTIONS, text)), attempt
-        except ChoiceError as exc:
-            failure = str(exc)
+        except Exception as exc:
+            failure = str(exc) if isinstance(exc, ChoiceError) else "CHOICE_CALL_FAILED"
     raise ChoiceError(failure or "CHOICE_REPLY_INVALID")
