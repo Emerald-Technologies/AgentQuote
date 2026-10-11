@@ -107,6 +107,18 @@ def _assembly(view: SurveyView, file_id: str, value: Any) -> dict[str, Any] | No
     return {"name": name, "revision": revision}
 
 
+def _field(name: str, check: Any) -> Any:
+    """Run one field's check; a refusal names the field so the stored result shows what was wrong."""
+    try:
+        return check()
+    except SurveyError as exc:
+        raise SurveyError(str(exc), exc.file_id, {**(exc.rejected or {}), "field": name}) from None
+
+
+def _refusal(exc: SurveyError) -> dict[str, Any]:
+    return {"failure_code": str(exc), **(exc.rejected or {})}
+
+
 def _link(view: SurveyView, file_id: str, value: Any, assembly: dict[str, Any] | None) -> dict[str, Any] | None:
     """The agent's link to a requested assembly, confirmed only when cited text names its core number.
 
@@ -121,6 +133,24 @@ def _link(view: SurveyView, file_id: str, value: Any, assembly: dict[str, Any] |
         raise SurveyError("SURVEY_REQUESTED_ASSEMBLY_INVALID")
     requested = refs[value["ref"]]
     evidence = [_evidence(view, file_id, item) for item in value["evidence"]]
+    return _confirm(requested, value["ref"], value["matched_core"], evidence, assembly)
+
+
+def _contained_link(view: SurveyView, value: Any, assembly: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A link whose own citation was refused (round 3, A036): keep the agent's ref when it is valid
+    and confirm only from the file's other verified citations; never refuse the file."""
+    refs = {item["ref"]: item for item in view.requested}
+    if not isinstance(value, dict) or value.get("ref") not in refs:
+        return None
+    core = value.get("matched_core") if _text(value.get("matched_core"), 100) else None
+    link = _confirm(refs[value["ref"]], value["ref"], core, [], assembly)
+    if link["link"] == "unconfirmed":
+        link["unconfirmed_reason"] = "citation_refused"
+    return link
+
+
+def _confirm(requested: dict[str, Any], ref: str, core: str | None, evidence: list[dict[str, Any]],
+             assembly: dict[str, Any] | None) -> dict[str, Any]:
     matched = None
     for cited in evidence + (assembly["name"] if assembly is not None else []):
         found = find_assembly(requested["part_number"], cited["value"])
@@ -130,11 +160,11 @@ def _link(view: SurveyView, file_id: str, value: Any, assembly: dict[str, Any] |
     revision = assembly["revision"][0]["value"] if assembly is not None and assembly["revision"] else None
     differs = revision_contradicts(requested["revision"], revision)
     confirmed = matched is not None and not differs
-    return {"assembly_id": requested["assembly_id"], "ref": value["ref"],
+    return {"assembly_id": requested["assembly_id"], "ref": ref,
             "link": "confirmed" if confirmed else "unconfirmed",
             "unconfirmed_reason": None if confirmed else (
                 "revision_differs" if matched is not None else "number_not_found"),
-            "matched": matched, "matched_core": value["matched_core"], "evidence": evidence}
+            "matched": matched, "matched_core": core, "evidence": evidence}
 
 
 def _code_finding(code: str, severity: str, rationale: str) -> dict[str, Any]:
@@ -154,11 +184,26 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
             or not _text(proposal["rationale"], 1000)
             or not isinstance(proposal["evidence"], list) or len(proposal["evidence"]) > MAX_EVIDENCE):
         raise SurveyError("SURVEY_RECORD_INVALID")
-    evidence = [_evidence(view, file_id, item) for item in proposal["evidence"]]
+    evidence = _field("evidence", lambda: [_evidence(view, file_id, item) for item in proposal["evidence"]])
     if proposal["role"] != "other" and not evidence:
-        raise SurveyError("SURVEY_ROLE_EVIDENCE_REQUIRED")
-    assembly = _assembly(view, file_id, proposal["assembly"])
-    link = _link(view, file_id, proposal["requested_assembly"], assembly) if view.requested else None
+        raise SurveyError("SURVEY_ROLE_EVIDENCE_REQUIRED", rejected={"field": "evidence"})
+    refused: list[dict[str, Any]] = []
+    link = None
+    if view.requested:
+        # Round 3 (A036): with requested assemblies the provisional assembly and the link decide no
+        # role, so a refused citation there drops only that part; the file keeps its classification.
+        try:
+            assembly = _assembly(view, file_id, proposal["assembly"])
+        except SurveyError as exc:
+            assembly = None
+            refused.append({"field": "assembly", **_refusal(exc)})
+        try:
+            link = _link(view, file_id, proposal["requested_assembly"], assembly)
+        except SurveyError as exc:
+            link = _contained_link(view, proposal["requested_assembly"], assembly)
+            refused.append({"field": "requested_assembly", **_refusal(exc)})
+    else:
+        assembly = _field("assembly", lambda: _assembly(view, file_id, proposal["assembly"]))
     findings = [{**item, "raised_by": "agent"} for item in _findings(proposal["findings"])]
     item = view.files[file_id]
     entry = view.entries[file_id]
@@ -184,6 +229,10 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
             ("unreadable", "SURVEY_FILE_UNREADABLE", "The file could not be opened; its role rests on its name and type.")):
         if entry.get(flag):
             findings.append(_code_finding(code, "information", text))
+    if refused:
+        findings.append(_code_finding("SURVEY_LINK_CITATION_REFUSED", "warning",
+                                      "A citation for the file's assembly or requested-assembly link was refused; "
+                                      "only that part was dropped and the file keeps its classification."))
     if link is not None and link["link"] == "unconfirmed":
         findings.append(_code_finding("SURVEY_MAPPING_UNCONFIRMED", "warning",
                                       "The file was linked to a requested assembly, but no cited text names its "
@@ -199,6 +248,7 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
               "evidence": evidence, "findings": findings}
     if view.requested:
         record["requested_assembly"] = link
+        record["refused_citations"] = refused
     return record
 
 

@@ -78,3 +78,29 @@ No AUTHORING_VERSION bump, as in round 1.
   (26), test_package_requested_review.py (9), plus author-rule assertions.
 - Full suite: `py -3.12 -m pytest tests -q -p no:cacheprovider` 1342 passed.
 - Not built or deployed.
+
+## Round 3 (branch `feature/survey-round3`, after the A036 retest)
+
+Approved by Nick from QuickQuote Docs/SURVEY_ROUND2_RETEST_A036_2026-10-11.md
+(options A-D).
+
+- **A. Link containment.** With requested assemblies, a refused citation in a
+  file's provisional assembly or requested-assembly link drops only that part.
+  - The link is confirmed from the file's other verified citations if possible,
+    else it becomes unconfirmed with reason `citation_refused`.
+  - The record keeps `refused_citations` and gets the warning
+    `SURVEY_LINK_CITATION_REFUSED`.
+  - Role evidence refusals and all v1 refusals are unchanged.
+- **B/C. Prompt.**
+  - Every citation quotes this file's own path or shown cells; a file name is
+    path text, never a cell value.
+  - The 011-0810-00 example is replaced.
+  - Board (PCB) drawings, Gerber, drill and fabrication files belong to the
+    assembly that uses the board.
+- **D. Diagnosis.**
+  - Refusals name their field.
+  - A failed call records its exception class name.
+  - A reply cut off at the output limit is reported as `SURVEY_REPLY_TRUNCATED`.
+
+Verification: focused 102 plus 31 requested-assembly tests; the full suite has
+1347 passing.

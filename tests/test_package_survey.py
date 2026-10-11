@@ -423,10 +423,11 @@ def test_one_refused_drawing_keeps_the_other_files_and_does_not_block():
     assert {group["name"] for group in survey["assemblies"]} == {"ASSY-100", "ASSY-200"}
     finding = next(f for f in survey["findings"] if f["code"] == "SURVEY_FILES_UNCLASSIFIED")
     assert finding["severity"] == "warning" and finding["file_ids"] == [pdf]
-    assert finding["attempt_failures"] == [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2
+    # Each refusal names the field it came from (round 3).
+    assert finding["attempt_failures"] == [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf, "field": "assembly"}] * 2
     # The stored result keeps what the agent wrote, so a refusal can be diagnosed.
     assert finding["rejected_citations"] == [{"file_id": pdf, "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH",
-                                              "source": "path", "value": "private-response-value"}]
+                                              "source": "path", "value": "private-response-value", "field": "assembly"}]
 
 
 def test_retry_that_corrects_the_refused_file_classifies_everything():
@@ -467,7 +468,7 @@ def test_choice_job_log_line_carries_only_codes_and_ids():
     line = _summary({"request_id": "r1", "status": "completed", "result": {"survey": survey}})
     assert line == {"request_id": "r1", "status": "completed", "survey_failures": [{
         "code": "SURVEY_FILES_UNCLASSIFIED", "severity": "warning", "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH",
-        "file_ids": [pdf], "attempts": [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2}]}
+        "file_ids": [pdf], "attempts": [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf, "field": "assembly"}] * 2}]}
     assert "private-response-value" not in json.dumps(line) and "package.zip" not in json.dumps(line)
     assert _summary({"request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}) == {
         "request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}

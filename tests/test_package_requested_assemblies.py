@@ -56,10 +56,12 @@ def path_item(value):
 class LinkingAgent:
     """Survey v2 replies linked by folder; the choice keeps the MOD BOM and sets the plain one aside."""
 
-    def __init__(self, links=None, revision=None):
-        # links: file name -> (ref, cited path text) overrides; revision: cited revision cell text.
+    def __init__(self, links=None, revision=None, link_evidence=None):
+        # links: file name -> (ref, cited path text) overrides; revision: cited revision cell text;
+        # link_evidence: file name -> raw evidence items for the link (to send refused citations).
         self.links = links or {}
         self.revision = revision
+        self.link_evidence = link_evidence or {}
         self.instructions, self.texts, self.choice_calls = [], [], 0
 
     def __call__(self, instructions, text):
@@ -97,7 +99,8 @@ class LinkingAgent:
                           "findings": [], "evidence": evidence,
                           "assembly": {"name": [path_item(folder.split(" ")[0])], "revision": revision},
                           "requested_assembly": None if link is None else
-                          {"ref": link[0], "matched_core": "core", "evidence": [path_item(link[1])]}})
+                          {"ref": link[0], "matched_core": "core",
+                           "evidence": self.link_evidence.get(name, [path_item(link[1])])}})
         return {"version": "package-survey-reply.v2", "files": files, "findings": []}
 
 
@@ -265,3 +268,74 @@ def test_a_stored_v1_request_and_result_are_still_read():
     _, service, _, done = completed_service()
     assert done["status"] == "completed" and done["result"]["version"] == "bom-package-choice.v1"
     assert service.status(done["request_id"])["result"]["version"] == "bom-package-choice.v1"
+
+
+# --- round 3: a refused link citation drops only the link (A036) -----------------------------------
+
+def test_a_file_name_cited_as_a_cell_keeps_the_bom_and_the_choice_runs():
+    # A036: the plain ENE BOM's link cited its file name as a cell value; that blocked the whole choice.
+    bad = [cell("BOM", 1, 4, "ENE BOM.xlsx")]
+    _, _, done, agent = run(LinkingAgent(link_evidence={"ENE BOM.xlsx": bad}))
+    assert done["status"] == "completed" and agent.choice_calls == 1
+    assert decisions(done)["doc-ene"] == ("excluded", "redundant")
+    ene = next(item for item in done["result"]["survey"]["files"] if item["path"].endswith("ENE BOM.xlsx"))
+    assert ene["role"] == "bom" and "classification_status" not in ene
+    # Confirmed from the file's own folder, cited in its provisional assembly name.
+    assert ene["requested_assembly"]["link"] == "confirmed" and ene["requested_assembly"]["evidence"] == []
+    assert ene["refused_citations"] == [{"field": "requested_assembly", "failure_code": "SURVEY_EVIDENCE_CELL_NOT_SHOWN",
+                                         "source": "cell", "value": "ENE BOM.xlsx",
+                                         "cell": {"sheet": "BOM", "row": 1, "column": 4}}]
+    assert any(item["code"] == "SURVEY_LINK_CITATION_REFUSED" for item in ene["findings"])
+    assert not done["result"]["survey"]["has_blocking_findings"]
+
+
+def test_board_files_citing_another_folder_stay_classified_with_an_unconfirmed_link():
+    # A036: the SNC board package's files cited the sibling assembly folder, not their own path.
+    _, _, done, _ = run(LinkingAgent(links={"SIB BOM.xlsx": ("R2", "SNC006-002022-01-TK")}))
+    sib = next(item for item in done["result"]["survey"]["files"] if item["path"].endswith("SIB BOM.xlsx"))
+    assert "classification_status" not in sib and sib["role"] == "bom"
+    assert sib["requested_assembly"]["link"] == "unconfirmed"
+    assert sib["requested_assembly"]["unconfirmed_reason"] == "citation_refused"
+    assert sib["refused_citations"][0]["failure_code"] == "SURVEY_EVIDENCE_NOT_IN_PATH"
+    assert decisions(done)["doc-sib"] == ("excluded", "not_mapped")
+    assert set(codes(done)) == {"SURVEY_MAPPING_UNCONFIRMED"}
+
+
+def test_an_unknown_ref_drops_the_link_but_keeps_the_file():
+    _, _, done, _ = run(LinkingAgent(links={"SIB BOM.xlsx": ("R9", "ENE011-0810-00")}))
+    sib = next(item for item in done["result"]["survey"]["files"] if item["path"].endswith("SIB BOM.xlsx"))
+    assert sib["requested_assembly"] is None and sib["role"] == "bom"
+    assert sib["refused_citations"] == [{"field": "requested_assembly", "failure_code": "SURVEY_REQUESTED_ASSEMBLY_INVALID"}]
+
+
+def test_round3_instructions_state_the_citation_rule_and_board_files():
+    for phrase in ("this file's own path", "never as a cell value", "bare board (PCB)", "Gerber, drill"):
+        assert phrase in SURVEY_INSTRUCTIONS_V2
+    assert "011-0810-00" not in SURVEY_INSTRUCTIONS_V2
+
+
+def test_a_failed_call_records_its_exception_type_and_a_cut_off_reply_is_named():
+    from bom_processor.package_survey import SurveyError, build_view, expand_package
+    from bom_processor.package_survey_run import foundry_caller, survey_view
+
+    class Cut:
+        finish_reason = "length"
+        text = '{"version": "package-survey-reply.v2", "files": ['
+
+    class Factory:
+        def __init__(self, **_):
+            pass
+
+        async def run(self, *_args, **_kwargs):
+            return Cut()
+
+    with pytest.raises(SurveyError, match="SURVEY_REPLY_TRUNCATED"):
+        foundry_caller(agent_factory=Factory)("instructions", "text")
+
+    def down(_instructions, _text):
+        raise TimeoutError("private transport detail")
+
+    survey = survey_view(build_view(expand_package([("package.zip", PACKAGE)]), REQUESTED), down)
+    attempts = next(item for item in survey["findings"] if item["code"] == "SURVEY_BATCH_FAILED")["attempt_failures"]
+    assert attempts == [{"failure_code": "SURVEY_CALL_FAILED", "file_id": None, "exception_type": "TimeoutError"}] * 2
+    assert "private transport detail" not in json.dumps(survey)

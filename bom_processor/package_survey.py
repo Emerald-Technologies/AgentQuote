@@ -545,13 +545,19 @@ LINK_INSTRUCTIONS = (
     "or neither may be present, and customer files usually show the customer's own number, sometimes with "
     "our prefix. Compare the core number: its groups of digits and letters-with-digits, in order, ignoring "
     "letter case, separators (space, -, _, .), our prefix and our suffix. A different number in any group "
-    "is a different item (011-0810-00 is not 010-0810-U2; -01 is not -02); never link by elimination. A "
+    "is a different item for a BOM (123-4567-01 is not 123-4567-02; 124-4567 is not 123-4567); never link by "
+    "elimination. A bare board (PCB) usually has its own number, different from the assembly number but often "
+    "sharing digits with it; the board's drawings, Gerber, drill and fabrication files belong to the assembly "
+    "that uses the board, so link them to that assembly when the folder or package structure shows it. A "
     "related number such as a bare board, or a product or customer name, supports a link but is not enough "
     "on its own. Revisions are written loosely (V10p1-B, v10p1 and V10.1 can be the same); a clearly "
     "different revision is a contradiction. requested_assembly is null or {ref, matched_core, evidence}: "
     "ref is one of the requested refs; matched_core is the core number you matched, at most 100 characters; "
-    "evidence is a list of 1 to 3 evidence items that cite the path text or shown cell carrying that "
-    "number, in the same form as evidence. "
+    "evidence is a list of 1 to 3 evidence items in the same form as evidence. Every citation, for any field, "
+    "quotes this file's own path or one of this file's shown cells, never another file's path or folder; the "
+    "file name is part of the path, so cite it with source 'path', never as a cell value. When only another "
+    "folder shows the link, still link the file and cite the closest text in its own path (for example its "
+    "archive name). "
 )
 SURVEY_INSTRUCTIONS_V2 = SURVEY_INSTRUCTIONS.replace(
     "version='package-survey-reply.v1'", "version='package-survey-reply.v2'").replace(

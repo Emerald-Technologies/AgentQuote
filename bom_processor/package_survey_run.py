@@ -57,7 +57,9 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
                 # The reply as a whole was unusable: every pending file is asked again.
                 failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
                 codes.update({file_id: failure for file_id in pending})
-                attempts.append({"failure_code": failure, "file_id": None})
+                # The exception class name is code, never customer text (round 3, A036 diagnosis).
+                attempts.append({"failure_code": failure, "file_id": None,
+                                 **({} if isinstance(exc, SurveyError) else {"exception_type": type(exc).__name__})})
                 feedback = _retry_text(failure)
                 continue
             records.extend(found)
@@ -67,7 +69,8 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
                 agent_findings_kept = True
             for file_id, error in failed.items():
                 codes[file_id] = str(error)
-                attempts.append({"failure_code": str(error), "file_id": file_id})
+                field = (error.rejected or {}).get("field")
+                attempts.append({"failure_code": str(error), "file_id": file_id, **({"field": field} if field else {})})
                 if error.rejected is not None:
                     rejected[file_id] = {"file_id": file_id, "failure_code": str(error), **error.rejected}
             pending = [file_id for file_id in batch.file_ids if file_id in failed]
@@ -139,6 +142,9 @@ def foundry_caller(client: Any = None, agent_factory: Any = None) -> Caller:
             response = await factory(client=client, instructions=instructions, tools=[]).run(
                 user_text, options={"max_tokens": SURVEY_MAX_TOKENS,
                                     "response_format": dict(SURVEY_RESPONSE_FORMAT)})
+            # A reply cut off at the output limit is reported as such, not as an unusable call (round 3).
+            if str(getattr(response, "finish_reason", "") or "").lower().endswith("length"):
+                raise SurveyError("SURVEY_REPLY_TRUNCATED")
             text = _response_text(response)
             if len(text.encode("utf-8")) > MAX_REPLY_BYTES:
                 raise SurveyError("SURVEY_REPLY_LIMIT")
