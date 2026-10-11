@@ -221,3 +221,27 @@ def test_duplicate_json_keys_and_nan_are_refused():
         verify_row_map(source, ".xlsx", out, b'{"version":"a","version":"b"}')
     with pytest.raises(RowMapError, match="ROW_MAP_JSON_INVALID"):
         verify_row_map(source, ".xlsx", out, b'{"version":NaN}')
+
+
+def test_mismatches_name_the_field_and_cited_column_without_values():
+    # A037 (round 4): a "Source category: ..." note cited as a plain cell, and a manufacturer cited as
+    # "part" of a column that does not hold it.
+    source, out, row_map = good()
+    out = output([
+        {"item_number": "R-100", "item_name": "Resistor 10k", "quantity": 4, "bom_notes": "Source category: RoHS",
+         "manufacturer_1": "Acme", "manufacturer_item_number_1": "RC0603",
+         "manufacturer_2": "Beta", "manufacturer_item_number_2": "RB0603"},
+        {"item_number": "C-200", "item_name": "Capacitor 1uF", "quantity": 2,
+         "manufacturer_1": "Gamma", "manufacturer_item_number_1": "GC0805"},
+    ])
+    row_map["lines"][1]["fields"]["manufacturer_1"] = [5, 1, "part"]
+    result = run(source, out, row_map)
+    assert result["field_mismatches"] == [
+        {"sheet": "BOM", "row": 3, "field": "bom_notes", "column": 7, "part": False},
+        {"sheet": "BOM", "row": 5, "field": "manufacturer_1", "column": 1, "part": True}]
+    assert "Source category" not in json.dumps(result) and "Gamma" not in json.dumps(result)
+    # The same note cited as derived passes.
+    row_map["lines"][0]["fields"]["bom_notes"] = {"derived": "Source category note added by the parser"}
+    row_map["lines"][1]["fields"]["manufacturer_1"] = [5, 5]
+    row_map["ignored_columns"].append({"sheet": "BOM", "column": 7, "reason": "Notes column carried as a derived note."})
+    assert run(source, out, row_map)["valid"] is True

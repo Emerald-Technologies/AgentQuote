@@ -20,8 +20,17 @@ MAX_EXCERPT_CHARS = 40_000
 HOLD_REASON = "row_accounting_review_required"
 
 
-def failed_row_excerpt(source: bytes, extension: str, failure: dict[str, Any]) -> dict[str, Any]:
-    """Cells of each failed row and the row above it, bounded by rows and characters."""
+def failed_row_excerpt(source: bytes, extension: str, failure: dict[str, Any],
+                       fields: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Cells of each failed row and the row above it, bounded by rows and characters.
+
+    fields (round 4): per FIELD_VALUE_MISMATCH row, the output field and the source column the
+    previous row map cited, shown as "cited" so the parser can see which link to correct.
+    """
+    cited: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for item in fields or []:
+        cited.setdefault((item["sheet"], item["row"]), []).append(
+            {"field": item["field"], "column": item["column"], "part": bool(item["part"])})
     inventory = source_inventory(source, extension)
     wanted: list[tuple[str, int]] = []
     for item in failure.get("failed_rows", []):
@@ -38,6 +47,8 @@ def failed_row_excerpt(source: bytes, extension: str, failure: dict[str, Any]) -
     for key in wanted[:MAX_EXCERPT_ROWS]:
         entry = {"sheet": key[0], "row": key[1], "code": codes.get(key, "context_row_above"),
                  "cells": by_row.get(key, [])}
+        if key in cited:
+            entry["cited"] = cited[key]
         cost = len(json.dumps(entry, ensure_ascii=False))
         if size + cost > MAX_EXCERPT_CHARS:
             truncated = True
@@ -56,7 +67,10 @@ def refinement_instructions(excerpt: dict[str, Any], round_number: int, rounds: 
             "context_row_above rows are supplied only so an alternate row can find its parent. Codes: "
             "ROW_UNACCOUNTED (row neither in a line nor skipped), ROW_IN_TWO_LINES, ROW_IN_LINE_AND_SKIPPED, "
             "ROW_CONTRIBUTES_NOTHING (listed in a line but no value cited from it), FIELD_NOT_LINKED, "
-            "FIELD_VALUE_MISMATCH (cited cell does not hold the output value), FIELD_OUTSIDE_LINE, "
+            "FIELD_VALUE_MISMATCH (cited cell does not hold the output value; cited lists each output field and "
+            "the source column your row map gave for it, so compare that column's value in cells with what "
+            "the parser wrote: cite the column that holds the value, or {\"derived\": reason} for a value the "
+            "parser changed or added words to), FIELD_OUTSIDE_LINE, "
             "PAIR_ROWS_DIFFER, SKIPPED_ROW_LOOKS_LIKE_LINE (skipped row has a part number and quantity), "
             "FIELD_DERIVATION_NOT_ALLOWED, PAIR_NOT_CARRIED (a manufacturer/MPN pair in this row is not in the "
             "output), PAIR_HALF_MISSING, COMBINED_PAIR_COUNT_MISMATCH (a combined cell splits into different "

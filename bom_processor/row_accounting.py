@@ -35,6 +35,7 @@ RESULT_VERSION = "bom-row-accounting.v1"
 ROW_MAP_NAME = "row-map.json"
 MAX_ROW_MAP_BYTES = 8 * 1024 * 1024
 MAX_RECORDED_ROWS = 500
+MAX_RECORDED_MISMATCHES = 200
 MAX_RECORDED_COLUMNS = 200
 MAX_SKIPPED_ROW_SPAN = 200_000
 SKIP_REASONS = frozenset({"header", "title", "blank", "total", "note", "section", "signature",
@@ -169,6 +170,9 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
             output_fields.setdefault(row, set()).add(columns[column - 1])
 
     failed: dict[tuple[str, int], str] = {}
+    # Which output field cited which source column on a mismatched row (round 4, A037): locations
+    # and field names only, so the refinement can say what to correct without customer values.
+    mismatches: list[dict[str, Any]] = []
 
     def fail(key: tuple[str, int], code: str) -> None:
         failed.setdefault(key, code)
@@ -229,6 +233,9 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                        and (_part(value, target) if len(link) == 3 else _same(value, target, field == "quantity")))
             if not matches:
                 fail((sheet, row), "FIELD_VALUE_MISMATCH")
+                if len(mismatches) < MAX_RECORDED_MISMATCHES:
+                    mismatches.append({"sheet": sheet, "row": row, "field": field, "column": column,
+                                       "part": len(link) == 3})
                 continue
             contributed.add(row)
             used_columns.add((sheet, column))
@@ -365,6 +372,7 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
         "failed_rows": [{"sheet": sheet, "row": row, "code": code}
                         for (sheet, row), code in recorded[:MAX_RECORDED_ROWS]],
         "failure_codes": dict(sorted(Counter(code for code in failed.values()).items())),
+        "field_mismatches": mismatches,
         "unmapped_columns": [{"sheet": sheet, "column": column}
                              for sheet, column in unmapped[:MAX_RECORDED_COLUMNS]],
         "ignored_but_used_columns": [{"sheet": sheet, "column": column}

@@ -444,3 +444,26 @@ def test_legacy_singleton_evidence_replays_without_new_identity():
     storage.candidates[result.evidence_path] = json.dumps(payload).encode()
     assert service.validate() == result
     assert len(orchestrator.calls) == 1
+
+def test_the_failure_event_carries_cited_fields_apart_from_the_status_contract(monkeypatch):
+    # Round 4 (A037): the refinement learns which field cited which column; the row_accounting
+    # record QuickQuote reads keeps its exact shape.
+    import bom_processor.candidate_validation as validation
+    output = semantic_workbook([("A-1", "Widget A", 1), ("A-2", "Widget B", 2),
+                                ("A-3", "Widget C", 3), ("A-4", "Widget D", 4)])
+    service, storage, _, _, _ = setup_html_validation(output)
+    mismatch = {"sheet": "HTML_TABLE_1", "row": 3, "field": "bom_notes", "column": 4, "part": False}
+
+    def failing(*_args, **_kwargs):
+        return {"version": "bom-row-accounting.v1", "valid": False, "source_sha256": "a" * 64,
+                "failed_row_count": 1, "failed_rows": [{"sheet": "HTML_TABLE_1", "row": 3, "code": "FIELD_VALUE_MISMATCH"}],
+                "field_mismatches": [mismatch], "unmapped_columns": [], "pattern_findings": []}
+
+    monkeypatch.setattr(validation, "verify_row_map", failing)
+    with pytest.raises(CandidateValidationError, match="SEMANTIC_INVALID"):
+        service.validate()
+    event = json.loads(next(v for k, v in storage.candidates.items() if "validation-failed-" in k))
+    assert event["row_accounting_fields"] == [mismatch]
+    assert set(event["row_accounting"]) == {"source_sha256", "error", "failed_row_count", "failed_rows",
+                                            "unmapped_columns", "pattern_findings"}
+    assert "HTML_TABLE_1!3 bom_notes<-col4" in event["failure_message"]

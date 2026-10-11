@@ -169,3 +169,26 @@ def test_status_surfaces_the_hold_with_row_locations_only():
     assert set(FAILURE) <= {"source_sha256", "error", "failed_row_count", "failed_rows", "unmapped_columns",
                             "pattern_findings"}
     assert HOLD_REASON == "row_accounting_review_required"
+
+
+def test_excerpt_and_instructions_show_the_cited_field_and_column():
+    failure = {**FAILURE, "failed_rows": [{"sheet": "BOM", "row": 2, "code": "FIELD_VALUE_MISMATCH"}]}
+    fields = [{"sheet": "BOM", "row": 2, "field": "manufacturer_1", "column": 1, "part": True}]
+    excerpt = failed_row_excerpt(SOURCE, ".xlsx", failure, fields)
+    row = next(item for item in excerpt["rows"] if item["row"] == 2)
+    assert row["cited"] == [{"field": "manufacturer_1", "column": 1, "part": True}]
+    text = refinement_instructions(excerpt, 1, 2)
+    assert "cited lists each output field" in text and '{"derived": reason}' in text
+    # Without field detail the excerpt is unchanged (older failure events).
+    assert "cited" not in next(item for item in failed_row_excerpt(SOURCE, ".xlsx", failure)["rows"] if item["row"] == 2)
+
+
+def test_row_feedback_names_cited_cells_and_the_rule_explains_derived_values():
+    from bom_processor.candidate_authoring import ROW_MAP_RULE
+    from bom_processor.candidate_validation import _row_feedback
+    text = _row_feedback({"failed_row_count": 1, "failed_rows": [{"sheet": "BOM", "row": 5, "code": "FIELD_VALUE_MISMATCH"}],
+                          "field_mismatches": [{"sheet": "BOM", "row": 5, "field": "bom_notes", "column": 17, "part": False}],
+                          "unmapped_columns": [], "pattern_findings": []})
+    assert "BOM!5 bom_notes<-col17" in text
+    assert "Source category: Capacitor" in ROW_MAP_RULE and "several values separated by delimiters" in ROW_MAP_RULE
+    assert "cited by no field goes in ignored_columns" in ROW_MAP_RULE

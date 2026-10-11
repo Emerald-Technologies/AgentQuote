@@ -139,11 +139,21 @@ def _row_failure(semantic: dict[str, Any], source_evidence: dict[str, Any]) -> d
             "pattern_findings": list(accounting.get("pattern_findings", []))[:20]}
 
 
+def _row_fields(semantic: dict[str, Any]) -> list[dict[str, Any]]:
+    """Cited field and column per mismatched row (round 4), kept apart from the status contract."""
+    accounting = semantic.get("row_accounting")
+    if not isinstance(accounting, dict) or accounting.get("valid") is not False:
+        return []
+    return list(accounting.get("field_mismatches", []))[:MAX_REFINEMENT_ROWS]
+
+
 def _row_feedback(accounting: dict[str, Any]) -> str:
     """Bounded locations and codes only; the author re-reads values from the source itself."""
     if "error" in accounting:
         return f"row_map_invalid:{accounting['error']}; write --row-map as the bom-row-map.v1 rule describes"
     rows = "; ".join(f"{item['sheet']}!{item['row']}:{item['code']}" for item in accounting.get("failed_rows", [])[:20])
+    cited = ", ".join(f"{item['sheet']}!{item['row']} {item['field']}<-col{item['column']}{' part' if item['part'] else ''}"
+                      for item in accounting.get("field_mismatches", [])[:10])
     columns = ", ".join(f"{item['sheet']}!col{item['column']}" for item in accounting.get("unmapped_columns", [])[:10])
     pattern = ", ".join(f"{item['sheet']}!col{item['column']}:{item['code']}"
                         for item in accounting.get("pattern_findings", [])[:10])
@@ -152,6 +162,8 @@ def _row_feedback(accounting: dict[str, Any]) -> str:
         parts.append(f"manufacturer/MPN pattern: {pattern}")
     if rows:
         parts.append(f"failed rows: {rows}")
+    if cited:
+        parts.append(f"cited cells that do not hold the written value (field<-column): {cited}")
     if columns:
         parts.append(f"unmapped columns with data in BOM lines: {columns}")
     return "; ".join(parts)
@@ -437,7 +449,8 @@ class CandidateValidationService:
                 validation_id, item, "SEMANTIC_INVALID",
                 {"error_type": "SemanticError",
                  "error_message": _semantic_feedback(semantic)},
-                row_accounting=_row_failure(semantic, source_evidence))
+                row_accounting=_row_failure(semantic, source_evidence),
+                row_accounting_fields=_row_fields(semantic))
             failure = CandidateValidationError("SEMANTIC_INVALID")
             failure.feedback_recorded = recorded
             raise failure
@@ -845,13 +858,21 @@ class CandidateValidationService:
                 if isinstance(fixture.get("row_accounting_failure"), dict)]
         if rows:
             event["row_accounting"] = rows[0]  # Refinement repairs one source at a time (sorted order).
+            # The cited field/column per mismatched row, kept apart from row_accounting (whose exact
+            # shape is part of the status contract read by QuickQuote).
+            fields = next((_row_fields(fixture["semantic"]) for fixture in evidence["fixtures"]
+                           if fixture.get("row_accounting_failure") is rows[0]
+                           and isinstance(fixture.get("semantic"), dict)), [])
+            if fields:
+                event["row_accounting_fields"] = fields
         path = f"candidates/events/{self.request_id}/{self.candidate_id}/validation-failed-{validation_id}.json"
         self.storage.upload_candidate_immutable(path, _json_bytes(event), "application/json")
 
     def _write_validation_failed_event(self, validation_id: str, item: WorkItem,
                                        error_code: str,
                                        classification: dict[str, str] | None,
-                                       row_accounting: dict[str, Any] | None = None) -> bool:
+                                       row_accounting: dict[str, Any] | None = None,
+                                       row_accounting_fields: list[dict[str, Any]] | None = None) -> bool:
         """Persist an immutable validation-failed event for the refinement loop.
 
         Best effort: a failure to write the event must not mask the original
@@ -871,6 +892,8 @@ class CandidateValidationService:
                 "failure_message": (classification or {}).get("error_message"),
                 "worker_job": item.job_id,
                 **({"row_accounting": row_accounting} if row_accounting is not None else {}),
+                **({"row_accounting_fields": row_accounting_fields}
+                   if row_accounting is not None and row_accounting_fields else {}),
             }
             path = (f"candidates/events/{self.request_id}/{self.candidate_id}/"
                     f"validation-failed-{validation_id}.json")

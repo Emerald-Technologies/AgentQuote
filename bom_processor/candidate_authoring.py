@@ -33,7 +33,11 @@ ROW_MAP_RULE = (
     "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
     "when the value is one separated part of a combined cell; use {\"derived\": reason} only for "
     "unit_of_measure or bom_notes values not copied from one cell. Every listed row must supply at least "
-    "one linked value, and both halves of a manufacturer/MPN pair come from the same source row. skipped "
+    "one linked value, and both halves of a manufacturer/MPN pair come from the same source row. A linked "
+    "cell must hold exactly the written value (ignoring outer spaces): a value with added words, such as "
+    "'Source category: Capacitor' in bom_notes, is not copied from one cell and is cited as {\"derived\": "
+    "reason}, and a source column then cited by no field goes in ignored_columns; cite each manufacturer and MPN at its own column, and use \"part\" only when that cell holds "
+    "several values separated by delimiters. skipped "
     "lists every other non-empty source row: {\"sheet\", \"rows\": [[first, last], ...], \"reason\": one of header, "
     "title, blank, total, note, section, signature, other_sheet, other, \"rationale\"}. ignored_columns lists "
     "every source column holding data in BOM lines that feeds no output field: {\"sheet\", \"column\", \"reason\"}. "
@@ -253,7 +257,8 @@ class CandidateAuthoringService:
         if len(data) != source["size_bytes"] or hashlib.sha256(data).hexdigest() != source["sha256"].lower():
             raise AuthoringError("SOURCE_INTEGRITY")
         extension = "." + source["blob_path"].rsplit(".", 1)[-1].lower()
-        excerpt = failed_row_excerpt(data, extension, failure)
+        fields = event.get("row_accounting_fields")
+        excerpt = failed_row_excerpt(data, extension, failure, fields if isinstance(fields, list) else None)
         from .row_refinement import row_accounting_rounds
         def paths(prefix: str) -> list[str]:
             return self.storage.list_registry_paths(prefix, 100)
