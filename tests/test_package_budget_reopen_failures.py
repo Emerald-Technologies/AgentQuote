@@ -143,7 +143,11 @@ def test_one_assembly_choice_failure_keeps_its_boms_and_other_choice_succeeds():
 
 
 @pytest.mark.parametrize("transport", [False, True])
-def test_failed_survey_processes_every_bom_without_choice_calls(transport):
+def test_an_incomplete_survey_stops_for_a_person_before_any_parser_runs(transport):
+    # Round 7 (Nick 2026-10-11): an unclassified spreadsheet could be any assembly's BOM; the choice
+    # stops (PACKAGE_SURVEY_INCOMPLETE) instead of parsing every BOM on an unknown basis.
+    from bom_processor.bom_package_choice import PackageChoicePendingError
+    from choice_job import _summary
     calls = []
 
     def call(instructions, text):
@@ -154,18 +158,19 @@ def test_failed_survey_processes_every_bom_without_choice_calls(transport):
         return {}
 
     storage, service, request, done = completed_service(call)
-    assert done["status"] == "completed" and done["result"]["model_calls"] == len(calls) == 2
-    assert all(decision == ("process", "survey_blocking") for decision in decisions(done).values())
-    assert done["result"]["choices"] == [] and done["result"]["primary_selections"] == []
-    assert all(item["classification_status"] == "unclassified" for item in done["result"]["survey"]["files"])
-    finding = done["result"]["findings"][0]
-    assert finding["code"] == "SURVEY_BATCH_FAILED" and finding["severity"] == "blocking"
-    assert sorted(finding["document_ids"]) == sorted(DOCS)
+    assert done["status"] == "failed" and done["code"] == "PACKAGE_SURVEY_INCOMPLETE" and len(calls) == 2
+    # The survey stays with the failure for diagnosis; the log line carries codes and ids only.
+    finding = next(item for item in done["survey"]["findings"] if item["code"] == "SURVEY_BATCH_FAILED")
+    assert finding["severity"] == "blocking"
+    assert all(item["classification_status"] == "unclassified" for item in done["survey"]["files"])
+    line = _summary(done)
+    assert line["code"] == "PACKAGE_SURVEY_INCOMPLETE" and line["survey_failures"][0]["code"] == "SURVEY_BATCH_FAILED"
     assert "private exception" not in json.dumps(done)
-    with pytest.raises(AggregateCandidateRequiredError) as required:
+    # The BOM request gets the failed state; no plan and no parser request is created.
+    with pytest.raises(PackageChoicePendingError) as stopped:
         remote(storage, service).process(request)
-    assert sorted(doc for candidate in required.value.candidates for doc in candidate.document_ids) == sorted(DOCS)
-    assert ParentPackageService(storage).review(required.value.plan_id)["package_choice_findings"] == [finding]
+    assert (stopped.value.state, stopped.value.code) == ("failed", "PACKAGE_SURVEY_INCOMPLETE")
+    assert not any(path.startswith("candidates/requests/") for path in storage.registry)
 
 
 def test_failed_survey_batch_preserves_successful_batches(monkeypatch):

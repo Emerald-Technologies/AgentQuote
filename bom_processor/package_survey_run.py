@@ -18,7 +18,6 @@ from .package_survey import (SPREADSHEET_KINDS, SurveyError, build_view, expand_
                              plan_batches, sub_batch, survey_instructions)
 from .package_survey_check import assemble, verify_batch_files
 
-SURVEY_MAX_TOKENS = 8192
 SURVEY_RESPONSE_FORMAT = {"type": "json_object"}
 ATTEMPTS_PER_BATCH = 2
 MAX_REPLY_BYTES = 1_000_000
@@ -140,9 +139,10 @@ def foundry_caller(client: Any = None, agent_factory: Any = None) -> Caller:
                 from agent_framework import Agent
                 factory = Agent
             try:
+                # No output cap (round 7, Nick 2026-10-11): on this reasoning model the cap also counted
+                # hidden reasoning and cut off hard batches' JSON (A036, A038, A039).
                 response = await factory(client=client, instructions=instructions, tools=[]).run(
-                    user_text, options={"max_tokens": SURVEY_MAX_TOKENS,
-                                        "response_format": dict(SURVEY_RESPONSE_FORMAT)})
+                    user_text, options={"response_format": dict(SURVEY_RESPONSE_FORMAT)})
             except ValueError as exc:
                 # The model library parses JSON-mode replies itself and raises ValueError on an incomplete
                 # reply (A038); named here, and the message (which may quote the reply) is never kept.

@@ -38,8 +38,7 @@ FILE_CHAR_LIMIT = 12_000
 CELL_TEXT_LIMIT = 200
 FOLDER_SUMMARY_CHAR_LIMIT = 20_000
 BATCH_CHAR_LIMIT = 60_000
-# The reply holds one record per file. Round 6 (A038): v2 records (link and evidence) made 40-record
-# replies reach SURVEY_MAX_TOKENS and arrive as incomplete JSON; 20 records keep each reply about half.
+# The reply holds one record per file; 20 records keep each reply and its reasoning moderate (round 6).
 BATCH_FILE_LIMIT = 20
 OOXML_ENTRY_LIMIT = 2_000
 OOXML_XML_ENTRY_BYTES = 32 * 1024 * 1024

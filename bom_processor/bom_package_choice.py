@@ -38,7 +38,15 @@ Caller = Callable[[str, str], Any]
 
 
 class PackageChoiceError(ValueError):
-    """Stable failure code without customer values."""
+    """Stable failure code without customer values.
+
+    survey: the survey record when the survey itself stopped the choice; kept in the private failed
+    artifact (like result.json) so the refused citations and attempt codes can be diagnosed.
+    """
+
+    def __init__(self, code: str, survey: dict[str, Any] | None = None):
+        super().__init__(code)
+        self.survey = survey
 
 
 class PackageChoicePendingError(Exception):
@@ -99,10 +107,13 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     failed_files = set()
     failures = [item for item in survey["findings"] if item["raised_by"] == "code"
                 and item["code"] in {"SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "SURVEY_FILES_UNCLASSIFIED"}]
-    # An unclassified spreadsheet makes all choice results unusable; avoid paid calls. Unclassified
+    # An unclassified spreadsheet could be any assembly's BOM: stop for a person before any parser
+    # runs (round 7, Nick 2026-10-11) instead of parsing every BOM on an unknown basis. Unclassified
     # non-spreadsheet files are a warning and do not stop the choice.
     blocked = any(item["severity"] == "blocking" for item in failures)
-    for group in ([] if blocked else survey["requested_assemblies"] if linked else survey["assemblies"]):
+    if blocked:
+        raise PackageChoiceError("PACKAGE_SURVEY_INCOMPLETE", survey)
+    for group in (survey["requested_assemblies"] if linked else survey["assemblies"]):
         boms = group["files"]["bom"]
         if len(boms) < 2:
             continue
@@ -299,7 +310,8 @@ class PackageChoiceService:
         if failed is not None:
             code = failed.get("code")
             return {"request_id": request_id, "status": "failed",
-                    "code": code if isinstance(code, str) and _CODE.fullmatch(code) else "PACKAGE_CHOICE_FAILED"}
+                    "code": code if isinstance(code, str) and _CODE.fullmatch(code) else "PACKAGE_CHOICE_FAILED",
+                    **({"survey": failed["survey"]} if isinstance(failed.get("survey"), dict) else {})}
         for artifact, state in (("worker-claim", "running"), ("start-unknown", "start_unknown"),
                                 ("started", "started"), ("start-claim", "start_unknown")):
             if self._read(request_id, artifact) is not None:
@@ -362,7 +374,9 @@ class PackageChoiceService:
             self._write(request_id, "result", result)
             self._write(request_id, "completed", {"request_id": request_id, "result_sha256": _hash(result)})
         except Exception as exc:
-            self._write(request_id, "failed", {"request_id": request_id, "code": _stable_code(exc)})
+            survey = getattr(exc, "survey", None)
+            self._write(request_id, "failed", {"request_id": request_id, "code": _stable_code(exc),
+                                               **({"survey": survey} if isinstance(survey, dict) else {})})
         return self.status(request_id)
 
 

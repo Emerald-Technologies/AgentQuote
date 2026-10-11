@@ -34,7 +34,6 @@ POST_PARSE_VERSION = "bom-primary-post-parse.v1"
 SEVERITIES = ("information", "warning", "blocking")
 MAX_EVIDENCE = 20
 ATTEMPTS = 2
-CHOICE_MAX_TOKENS = 8192
 _MAX_EXAMPLES = 10
 
 

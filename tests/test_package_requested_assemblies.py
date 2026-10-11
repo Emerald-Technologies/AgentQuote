@@ -370,3 +370,23 @@ def test_an_incomplete_json_reply_from_the_model_library_is_named_without_its_te
     assert "private reply" not in str(caught.value) and caught.value.__cause__ is None
     with pytest.raises(ValueError, match="other"):
         foundry_caller(agent_factory=factory_raising(ValueError("other")))("i", "t")
+
+
+def test_the_survey_call_sets_no_output_cap():
+    # Round 7: on a reasoning model the cap also counted hidden reasoning and cut hard batches short.
+    from bom_processor.package_survey_run import foundry_caller
+    seen = {}
+
+    class Reply:
+        text = '{"version": "package-survey-reply.v2", "files": [], "findings": []}'
+
+    class Factory:
+        def __init__(self, **_):
+            pass
+
+        async def run(self, _text, options):
+            seen.update(options)
+            return Reply()
+
+    foundry_caller(agent_factory=Factory)("instructions", "text")
+    assert "max_tokens" not in seen and seen["response_format"] == {"type": "json_object"}
