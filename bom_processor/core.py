@@ -47,6 +47,7 @@ _PACKAGE_FILE_NAME = re.compile(r"^[^\\/:\x00-\x1f\x7f]{1,256}$")
 MAX_PACKAGE_FILES = 100
 MAX_PACKAGE_FILE_BYTES = 100_000_000
 MAX_PACKAGE_FILES_BYTES = 500_000_000
+MAX_REQUESTED_ASSEMBLIES = 50
 
 
 class ProcessingError(ValueError):
@@ -398,6 +399,14 @@ class PackageFile:
 
 
 @dataclass(frozen=True)
+class RequestedAssembly:
+    """One assembly the RFQ asks for (QuickQuote rfq_assemblies), for the survey link (round 2)."""
+    assembly_id: str
+    part_number: str
+    revision: str | None
+
+
+@dataclass(frozen=True)
 class ProcessingRequest:
     job_id: str
     customer_key: str
@@ -411,6 +420,8 @@ class ProcessingRequest:
     # None: field absent. Request document ids a person brought back after the package choice set them
     # aside (plan 8.8 step 2, reopen); needs package_files; sorted, unique.
     package_choice_reopen: tuple[str, ...] | None = None
+    # None: field absent. The RFQ's requested assemblies; needs package_files; sorted by id.
+    requested_assemblies: tuple[RequestedAssembly, ...] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ProcessingRequest":
@@ -419,7 +430,7 @@ class ProcessingRequest:
         try:
             unknown = set(value) - {"job_id", "customer_key", "parser_key", "rfq_uuid",
                                     "package_version", "documents", "force_candidate",
-                                    "package_files", "package_choice_reopen"}
+                                    "package_files", "package_choice_reopen", "requested_assemblies"}
             if unknown or value.get("force_candidate", False) not in {False, True}:
                 raise ProcessingError("invalid request")
             files = value.get("package_files")
@@ -431,6 +442,11 @@ class ProcessingRequest:
             if "package_choice_reopen" in value and (not isinstance(reopen, list)
                                                      or any(not isinstance(item, str) for item in reopen)):
                 raise ProcessingError("invalid package choice reopen")
+            assemblies = value.get("requested_assemblies")
+            if "requested_assemblies" in value and (not isinstance(assemblies, list) or any(
+                    not isinstance(item, dict) or set(item) != {"assembly_id", "part_number", "revision"}
+                    for item in assemblies)):
+                raise ProcessingError("invalid requested assemblies")
             request = cls(
                 value.get("job_id", ""), value.get("customer_key", ""),
                 value.get("parser_key", ""), value.get("rfq_uuid", ""),
@@ -439,6 +455,7 @@ class ProcessingRequest:
                 value.get("force_candidate", False),
                 None if files is None else tuple(PackageFile(**item) for item in files),
                 None if reopen is None else tuple(reopen),
+                None if assemblies is None else tuple(RequestedAssembly(**item) for item in assemblies),
             )
         except (TypeError, KeyError) as exc:
             raise ProcessingError("invalid request") from exc
@@ -485,6 +502,27 @@ class ProcessingRequest:
                     or list(reopen) != sorted(set(reopen))
                     or any(item not in document_ids for item in reopen)):
                 raise ProcessingError("invalid package choice reopen")
+        if self.requested_assemblies is not None:
+            self._validate_requested_assemblies()
+
+    def _validate_requested_assemblies(self) -> None:
+        items = self.requested_assemblies
+        if self.package_files is None or not isinstance(items, tuple) or not 1 <= len(items) <= MAX_REQUESTED_ASSEMBLIES:
+            raise ProcessingError("invalid requested assemblies")
+        for item in items:
+            if (not isinstance(item.assembly_id, str) or not _UUID.fullmatch(item.assembly_id)
+                    or item.assembly_id != item.assembly_id.lower()
+                    or not isinstance(item.part_number, str) or not 1 <= len(item.part_number) <= 100
+                    or item.part_number != item.part_number.strip()
+                    or any(ord(character) < 32 for character in item.part_number)
+                    or (item.revision is not None and (
+                        not isinstance(item.revision, str) or not 1 <= len(item.revision) <= 50
+                        or item.revision != item.revision.strip()
+                        or any(ord(character) < 32 for character in item.revision)))):
+                raise ProcessingError("invalid requested assemblies")
+        ids = [item.assembly_id for item in items]
+        if ids != sorted(set(ids)):
+            raise ProcessingError("invalid requested assemblies")
 
     def _validate_package_files(self) -> None:
         files = self.package_files or ()
@@ -531,6 +569,11 @@ class ProcessingRequest:
             ]
         if self.package_choice_reopen is not None:
             payload["package_choice_reopen"] = list(self.package_choice_reopen)
+        if self.requested_assemblies is not None:
+            payload["requested_assemblies"] = [
+                {"assembly_id": item.assembly_id, "part_number": item.part_number, "revision": item.revision}
+                for item in self.requested_assemblies
+            ]
         return _sha256(_json_bytes(payload))
 
 

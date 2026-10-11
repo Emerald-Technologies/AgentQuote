@@ -12,14 +12,19 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .assembly_core import find_assembly, revision_contradicts
 from .document_role import ROLES
 from .package_survey import SurveyBatch, SurveyError, SurveyView, cell_text
 from .semantic import AssemblyIdentity
 
 REPLY_VERSION = "package-survey-reply.v1"
 SURVEY_VERSION = "package-survey.v1"
+# Round 2: each file is also linked to a requested assembly or none, confirmed by code.
+REPLY_VERSION_V2 = "package-survey-reply.v2"
+SURVEY_VERSION_V2 = "package-survey.v2"
 MAX_EVIDENCE = 20
 MAX_IDENTITY_EVIDENCE = 5
+MAX_LINK_EVIDENCE = 3
 SEVERITIES = ("information", "warning", "blocking")
 
 
@@ -102,6 +107,36 @@ def _assembly(view: SurveyView, file_id: str, value: Any) -> dict[str, Any] | No
     return {"name": name, "revision": revision}
 
 
+def _link(view: SurveyView, file_id: str, value: Any, assembly: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The agent's link to a requested assembly, confirmed only when cited text names its core number.
+
+    An unconfirmed link is kept and shown; it never decides anything (round 2, D1/D2).
+    """
+    if value is None:
+        return None
+    refs = {item["ref"]: item for item in view.requested}
+    if (not isinstance(value, dict) or set(value) != {"ref", "matched_core", "evidence"}
+            or value["ref"] not in refs or not _text(value["matched_core"], 100)
+            or not isinstance(value["evidence"], list) or not 1 <= len(value["evidence"]) <= MAX_LINK_EVIDENCE):
+        raise SurveyError("SURVEY_REQUESTED_ASSEMBLY_INVALID")
+    requested = refs[value["ref"]]
+    evidence = [_evidence(view, file_id, item) for item in value["evidence"]]
+    matched = None
+    for cited in evidence + (assembly["name"] if assembly is not None else []):
+        found = find_assembly(requested["part_number"], cited["value"])
+        if found is not None:
+            matched = {"text": found, **{key: cited[key] for key in ("source", "cell") if key in cited}}
+            break
+    revision = assembly["revision"][0]["value"] if assembly is not None and assembly["revision"] else None
+    differs = revision_contradicts(requested["revision"], revision)
+    confirmed = matched is not None and not differs
+    return {"assembly_id": requested["assembly_id"], "ref": value["ref"],
+            "link": "confirmed" if confirmed else "unconfirmed",
+            "unconfirmed_reason": None if confirmed else (
+                "revision_differs" if matched is not None else "number_not_found"),
+            "matched": matched, "matched_core": value["matched_core"], "evidence": evidence}
+
+
 def _code_finding(code: str, severity: str, rationale: str) -> dict[str, Any]:
     return {"code": code, "severity": severity, "rationale": rationale, "raised_by": "code"}
 
@@ -111,8 +146,10 @@ def _key(value: str) -> str:
 
 
 def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
-    if (not isinstance(proposal, dict) or set(proposal) != {
-            "file_id", "role", "assembly", "possibly_shared", "rationale", "evidence", "findings"}
+    keys = {"file_id", "role", "assembly", "possibly_shared", "rationale", "evidence", "findings"}
+    if view.requested:
+        keys.add("requested_assembly")
+    if (not isinstance(proposal, dict) or set(proposal) != keys
             or proposal["role"] not in ROLES or type(proposal["possibly_shared"]) is not bool
             or not _text(proposal["rationale"], 1000)
             or not isinstance(proposal["evidence"], list) or len(proposal["evidence"]) > MAX_EVIDENCE):
@@ -121,6 +158,7 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
     if proposal["role"] != "other" and not evidence:
         raise SurveyError("SURVEY_ROLE_EVIDENCE_REQUIRED")
     assembly = _assembly(view, file_id, proposal["assembly"])
+    link = _link(view, file_id, proposal["requested_assembly"], assembly) if view.requested else None
     findings = [{**item, "raised_by": "agent"} for item in _findings(proposal["findings"])]
     item = view.files[file_id]
     entry = view.entries[file_id]
@@ -146,15 +184,22 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
             ("unreadable", "SURVEY_FILE_UNREADABLE", "The file could not be opened; its role rests on its name and type.")):
         if entry.get(flag):
             findings.append(_code_finding(code, "information", text))
+    if link is not None and link["link"] == "unconfirmed":
+        findings.append(_code_finding("SURVEY_MAPPING_UNCONFIRMED", "warning",
+                                      "The file was linked to a requested assembly, but no cited text names its "
+                                      "part number with an agreeing revision; the link decides nothing."))
     identity = None
     if assembly is not None:
         identity = {"name": assembly["name"][0]["value"],
                     "revision": assembly["revision"][0]["value"] if assembly["revision"] else ""}
-    return {"file_id": file_id, "path": item.path, "chain": list(item.chain), "sha256": item.sha256,
-            "size_bytes": item.size_bytes, "kind": entry["kind"], "role": role,
-            "assembly": identity, "assembly_evidence": assembly,
-            "possibly_shared": proposal["possibly_shared"], "rationale": proposal["rationale"],
-            "evidence": evidence, "findings": findings}
+    record = {"file_id": file_id, "path": item.path, "chain": list(item.chain), "sha256": item.sha256,
+              "size_bytes": item.size_bytes, "kind": entry["kind"], "role": role,
+              "assembly": identity, "assembly_evidence": assembly,
+              "possibly_shared": proposal["possibly_shared"], "rationale": proposal["rationale"],
+              "evidence": evidence, "findings": findings}
+    if view.requested:
+        record["requested_assembly"] = link
+    return record
 
 
 def verify_batch(view: SurveyView, batch: SurveyBatch, reply: Any) -> tuple[list[dict], list[dict]]:
@@ -173,7 +218,8 @@ def verify_batch_files(view: SurveyView, batch: SurveyBatch,
     refuses only that file (plan 8.8 step 7, A032 diagnosis).
     """
     if (not isinstance(reply, dict) or set(reply) != {"version", "files", "findings"}
-            or reply["version"] != REPLY_VERSION or not isinstance(reply["files"], list)):
+            or reply["version"] != (REPLY_VERSION_V2 if view.requested else REPLY_VERSION)
+            or not isinstance(reply["files"], list)):
         raise SurveyError("SURVEY_REPLY_INVALID")
     proposals: dict[str, Any] = {}
     for proposal in reply["files"]:
@@ -229,6 +275,21 @@ def assemble(view: SurveyView, records: list[dict], package_findings: list[dict]
     unassigned = [record["file_id"] for record in records if record["assembly"] is None]
     blocking = any(item["severity"] == "blocking" for item in findings) or any(
         item["severity"] == "blocking" for record in records for item in record["findings"])
-    return {"version": SURVEY_VERSION, "view_sha256": view.sha256, "model_calls": model_calls,
-            "files": [by_id[file_id] for file_id in view.ids], "assemblies": summary,
-            "unassigned": unassigned, "findings": findings, "has_blocking_findings": blocking}
+    survey = {"version": SURVEY_VERSION_V2 if view.requested else SURVEY_VERSION, "view_sha256": view.sha256,
+              "model_calls": model_calls, "files": [by_id[file_id] for file_id in view.ids],
+              "assemblies": summary, "unassigned": unassigned, "findings": findings,
+              "has_blocking_findings": blocking}
+    if view.requested:
+        survey["requested_assemblies"] = [_requested_group(item, [by_id[file_id] for file_id in view.ids])
+                                          for item in view.requested]
+    return survey
+
+
+def _requested_group(requested: dict[str, Any], records: list[dict]) -> dict[str, Any]:
+    """Files whose link to this requested assembly code confirmed; unconfirmed links group nothing."""
+    linked = [record for record in records
+              if (record.get("requested_assembly") or {}).get("link") == "confirmed"
+              and record["requested_assembly"]["assembly_id"] == requested["assembly_id"]]
+    return {"assembly_id": requested["assembly_id"], "ref": requested["ref"],
+            "part_number": requested["part_number"], "revision": requested["revision"],
+            "files": {role: [record["file_id"] for record in linked if record["role"] == role] for role in ROLES}}

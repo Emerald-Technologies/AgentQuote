@@ -10,6 +10,9 @@ Decisions are fail-safe: a document is set aside only when the survey has no blo
 and either the survey calls it a non-BOM (plan 8.2-2) or the agent's primary choice for its
 assembly agreed with the column-read cross-check (plan 8.2-8). Anything else is processed as
 before, so a doubtful choice reaches the existing human review instead of dropping a file.
+With requested assemblies (v2, round 2), BOMs are grouped by their code-confirmed link to a
+requested assembly, and a BOM linked to none is set aside as not_mapped, reopenable by a
+person (Nick, D2, 2026-10-10).
 Run python -m pytest tests/test_bom_package_choice.py.
 """
 from __future__ import annotations
@@ -23,6 +26,10 @@ from .core import BlobConflictError, BlobNotFoundError, ProcessingRequest
 
 REQUEST_VERSION = "bom-package-choice-request.v1"
 RESULT_VERSION = "bom-package-choice.v1"
+# Round 2 (Nick 2026-10-10): requests that carry requested_assemblies link files to them; v1 stays readable.
+REQUEST_VERSION_V2 = "bom-package-choice-request.v2"
+RESULT_VERSION_V2 = "bom-package-choice.v2"
+RESULT_VERSIONS = {REQUEST_VERSION: RESULT_VERSION, REQUEST_VERSION_V2: RESULT_VERSION_V2}
 MAX_METADATA = 8 * 1024 * 1024
 _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}")
 _HASH = re.compile(r"[0-9a-f]{64}")
@@ -53,11 +60,12 @@ def _hash(value: Any) -> str:
 
 
 def choice_request(request: ProcessingRequest) -> dict[str, Any]:
-    """Request identity: the package files and the BOM documents; nothing else."""
+    """Request identity: the package files, the BOM documents and any requested assemblies."""
     request.validate()
     if request.package_files is None:
         raise PackageChoiceError("PACKAGE_FILES_REQUIRED")
-    body = {"version": REQUEST_VERSION, "customer_key": request.customer_key,
+    linked = request.requested_assemblies is not None
+    body = {"version": REQUEST_VERSION_V2 if linked else REQUEST_VERSION, "customer_key": request.customer_key,
             "rfq_uuid": request.rfq_uuid.lower(), "package_version": request.package_version,
             "package_files": [{"document_id": item.document_id, "file_name": item.file_name,
                                "blob_path": item.blob_path, "size_bytes": item.size_bytes,
@@ -65,6 +73,9 @@ def choice_request(request: ProcessingRequest) -> dict[str, Any]:
             "documents": [{"document_id": item.document_id, "blob_path": item.blob_path,
                            "size_bytes": item.size_bytes, "sha256": item.sha256.lower()}
                           for item in request.documents]}
+    if linked:
+        body["requested_assemblies"] = [{"assembly_id": item.assembly_id, "part_number": item.part_number,
+                                         "revision": item.revision} for item in request.requested_assemblies]
     return {**body, "request_id": _hash(body)}
 
 
@@ -80,7 +91,8 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     from .package_survey import build_view, expand_package
     from .package_survey_run import survey_view
 
-    view = build_view(expand_package(roots))
+    linked = "requested_assemblies" in request
+    view = build_view(expand_package(roots), request.get("requested_assemblies"))
     survey = survey_view(view, call)
     calls = survey["model_calls"]
     choices = []
@@ -90,11 +102,13 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     # An unclassified spreadsheet makes all choice results unusable; avoid paid calls. Unclassified
     # non-spreadsheet files are a warning and do not stop the choice.
     blocked = any(item["severity"] == "blocking" for item in failures)
-    for group in ([] if blocked else survey["assemblies"]):
+    for group in ([] if blocked else survey["requested_assemblies"] if linked else survey["assemblies"]):
         boms = group["files"]["bom"]
         if len(boms) < 2:
             continue
-        candidate_view = build_candidate_view(view, group["name"], boms)
+        name = group["part_number"] if linked else group["name"]
+        owner = {"assembly_id": group["assembly_id"]} if linked else {}
+        candidate_view = build_candidate_view(view, name, boms)
         try:
             choice, used = run_choice(candidate_view, call)
         except ChoiceError as exc:
@@ -102,12 +116,12 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
             failed_files.update(boms)
             failures.append({"code": "CHOICE_ASSEMBLY_FAILED", "severity": "warning", "raised_by": "code",
                              "rationale": "No primary BOM was chosen after two attempts; all BOMs of this assembly are retained for review.",
-                             "file_ids": list(boms), "assembly": group["name"]})
-            choices.append({"assembly": group["name"], "view_sha256": candidate_view.sha256,
+                             "file_ids": list(boms), "assembly": name})
+            choices.append({"assembly": name, **owner, "view_sha256": candidate_view.sha256,
                             "choice": None, "set_aside_digests": {}, "failure_code": _stable_code(exc)})
             continue
         calls += used
-        choices.append({"assembly": group["name"], "view_sha256": candidate_view.sha256,
+        choices.append({"assembly": name, **owner, "view_sha256": candidate_view.sha256,
                         "choice": choice, "set_aside_digests": set_aside_digests(choice, candidate_view)})
     records = {record["file_id"]: record for record in survey["files"]}
     by_hash: dict[str, list[str]] = {}
@@ -123,6 +137,9 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     for document in request["documents"]:
         file_ids = sorted(by_hash.get(document["sha256"], []), key=lambda value: int(value[1:]))
         roles = sorted({records[file_id]["role"] for file_id in file_ids})
+        # Requested assemblies this document's copies are confirmed to belong to (v2 only).
+        links = sorted({records[file_id]["requested_assembly"]["assembly_id"] for file_id in file_ids
+                        if (records[file_id].get("requested_assembly") or {}).get("link") == "confirmed"})
         decision, reason, disposition = "process", "only_bom", None
         if not file_ids:
             reason = "not_in_package"
@@ -135,6 +152,12 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
             reason = "choice_failed"
         elif "bom" not in roles:
             decision, reason = "excluded", roles[0] if len(roles) == 1 else "not_bom"
+        elif linked and not links:
+            # D2: a BOM of no requested assembly is set aside, never parsed; a person can reopen it.
+            decision, reason = "excluded", "not_mapped"
+        elif linked and len(links) > 1:
+            # Copies confirmed for different requested assemblies: not proven, a person decides.
+            reason = "links_not_consistent"
         else:
             labelled = [labels[file_id] for file_id in file_ids if file_id in labels]
             if labelled:
@@ -154,10 +177,14 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                              if records[file_id]["assembly"] is not None})
         documents.append({"document_id": document["document_id"], "sha256": document["sha256"],
                           "decision": decision, "reason": reason, "disposition": disposition,
-                          "survey_file_ids": file_ids, "roles": roles, "assemblies": assemblies})
+                          "survey_file_ids": file_ids, "roles": roles, "assemblies": assemblies,
+                          **({"requested_assembly_ids": links} if linked else {})})
     processed = [item["document_id"] for item in documents if item["decision"] == "process"]
     if not processed:
-        raise PackageChoiceError("PACKAGE_NO_BOM")
+        raise PackageChoiceError("PACKAGE_NO_REQUESTED_BOM" if any(item["reason"] == "not_mapped" for item in documents)
+                                 else "PACKAGE_NO_BOM")
+    if linked:
+        failures.extend(_link_findings(documents, records))
     primaries = []
     for entry in choices:
         if entry["choice"] is None or not entry["choice"]["automatic_selection_allowed"]:
@@ -176,9 +203,32 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
             "assemblies": sorted({records[file_id]["assembly"]["name"] for file_id in ids
                                   if records[file_id]["assembly"] is not None}),
             "file_paths": [view.files[file_id].path for file_id in sorted(ids)]})
-    return {"version": RESULT_VERSION, "request_id": request["request_id"], "model_calls": calls,
-            "survey": survey, "choices": choices, "documents": documents,
-            "primary_selections": primaries, "findings": findings}
+    result = {"version": RESULT_VERSION_V2 if linked else RESULT_VERSION, "request_id": request["request_id"],
+              "model_calls": calls, "survey": survey, "choices": choices, "documents": documents,
+              "primary_selections": primaries, "findings": findings}
+    if linked:
+        result["requested_assemblies"] = request["requested_assemblies"]
+    return result
+
+
+def _link_findings(documents: list[dict[str, Any]], records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Package warnings for BOMs set aside as not_mapped; each stops automatic acceptance."""
+    groups: dict[str, list[str]] = {"SURVEY_BOM_NOT_MAPPED": [], "SURVEY_MAPPING_UNCONFIRMED": []}
+    for document in documents:
+        if document["reason"] != "not_mapped":
+            continue
+        files = [records[file_id] for file_id in document["survey_file_ids"] if records[file_id]["role"] == "bom"]
+        unconfirmed = any((record.get("requested_assembly") or {}).get("link") == "unconfirmed" for record in files)
+        groups["SURVEY_MAPPING_UNCONFIRMED" if unconfirmed else "SURVEY_BOM_NOT_MAPPED"].extend(
+            record["file_id"] for record in files)
+    rationale = {
+        "SURVEY_BOM_NOT_MAPPED": "These BOM files belong to no requested assembly; they are set aside and a person can bring one back.",
+        "SURVEY_MAPPING_UNCONFIRMED": ("These BOM files were linked to a requested assembly that no cited text confirms; "
+                                       "they are set aside and a person can bring one back.")}
+    findings = [{"code": code, "severity": "warning", "raised_by": "code", "rationale": rationale[code],
+                 "file_ids": sorted(set(ids), key=lambda value: int(value[1:]))}
+                for code, ids in groups.items() if ids]
+    return findings
 
 
 class PackageChoiceService:
@@ -228,18 +278,20 @@ class PackageChoiceService:
         if value is None:
             raise PackageChoiceError("PACKAGE_CHOICE_NOT_FOUND")
         body = {key: item for key, item in value.items() if key != "request_id"}
-        if value.get("version") != REQUEST_VERSION or value.get("request_id") != request_id or _hash(body) != request_id:
+        if (value.get("version") not in RESULT_VERSIONS or value.get("request_id") != request_id
+                or _hash(body) != request_id
+                or ("requested_assemblies" in value) != (value["version"] == REQUEST_VERSION_V2)):
             raise PackageChoiceError("PACKAGE_CHOICE_ARTIFACT_CORRUPT")
         return value
 
     def status(self, request_id: str) -> dict[str, Any]:
-        self.request(request_id)
+        expected = RESULT_VERSIONS[self.request(request_id)["version"]]
         completed = self._read(request_id, "completed")
         if completed is not None:
             result = self._read(request_id, "result")
             if (result is None or set(completed) != {"request_id", "result_sha256"}
                     or completed["request_id"] != request_id or _hash(result) != completed["result_sha256"]
-                    or result.get("version") != RESULT_VERSION or result.get("request_id") != request_id):
+                    or result.get("version") != expected or result.get("request_id") != request_id):
                 raise PackageChoiceError("PACKAGE_CHOICE_RESULT_CORRUPT")
             return {"request_id": request_id, "status": "completed",
                     "result_sha256": completed["result_sha256"], "result": result}

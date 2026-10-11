@@ -14,8 +14,8 @@ import asyncio
 import json
 from typing import Any, Callable
 
-from .package_survey import (SPREADSHEET_KINDS, SURVEY_INSTRUCTIONS, SurveyError, build_view,
-                             expand_package, plan_batches, sub_batch)
+from .package_survey import (SPREADSHEET_KINDS, SurveyError, build_view, expand_package,
+                             plan_batches, sub_batch, survey_instructions)
 from .package_survey_check import assemble, verify_batch_files
 
 SURVEY_MAX_TOKENS = 8192
@@ -52,7 +52,7 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
             current = batch if len(pending) == len(batch.file_ids) else sub_batch(view, pending)
             try:
                 found, findings, failed = verify_batch_files(
-                    view, current, call(SURVEY_INSTRUCTIONS, current.user_text + (feedback or "")))
+                    view, current, call(survey_instructions(view), current.user_text + (feedback or "")))
             except Exception as exc:
                 # The reply as a whole was unusable: every pending file is asked again.
                 failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
@@ -109,7 +109,8 @@ def _unclassified(view: Any, records: list[dict], pending: list[str], codes: dic
                             "sha256": item.sha256, "size_bytes": item.size_bytes, "kind": entry["kind"],
                             "role": "other", "classification_status": "unclassified",
                             "assembly": None, "assembly_evidence": None, "possibly_shared": False,
-                            "rationale": rationale, "evidence": [], "findings": [finding]})
+                            "rationale": rationale, "evidence": [], "findings": [finding],
+                            **({"requested_assembly": None} if view.requested else {})})
     return findings
 
 

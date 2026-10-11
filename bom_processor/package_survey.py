@@ -29,6 +29,8 @@ _PATH_SECRET = re.compile(r"(?:https?://|www\.)[^\s<>]+|[\w.+-]+@[\w.-]+\.[A-Za-
                           r"|(?<![A-Za-z0-9+=])[A-Za-z0-9+=]{32,}(?![A-Za-z0-9+=])", re.I)
 
 VIEW_VERSION = "package-survey-view.v1"
+# Round 2: the view also lists the RFQ's requested assemblies (short refs R1..., never ids).
+VIEW_VERSION_V2 = "package-survey-view.v2"
 TOP_ROWS = 20
 MAX_COLUMNS = 512
 FILE_CELL_LIMIT = 400
@@ -98,10 +100,24 @@ class SurveyView:
     shown: dict[str, dict[tuple[str, int, int], Any]]
     package: dict[str, Any]
     sha256: str
+    # Requested assemblies as {ref, assembly_id, part_number, revision}; empty for a v1 view.
+    requested: tuple[dict[str, Any], ...] = ()
 
     @property
     def ids(self) -> tuple[str, ...]:
         return tuple(self.entries)
+
+    @property
+    def version(self) -> str:
+        return VIEW_VERSION_V2 if self.requested else VIEW_VERSION
+
+    def header(self) -> dict[str, Any]:
+        """What every batch repeats: version, package summary and any requested assemblies."""
+        header: dict[str, Any] = {"version": self.version, "package": self.package}
+        if self.requested:
+            header["requested_assemblies"] = [{"ref": item["ref"], "part_number": item["part_number"],
+                                               "revision": item["revision"]} for item in self.requested]
+        return header
 
 
 @dataclass(frozen=True)
@@ -435,7 +451,8 @@ def _folders(files: list[PackageFile]) -> dict[str, Any]:
     return package
 
 
-def build_view(files: list[PackageFile]) -> SurveyView:
+def build_view(files: list[PackageFile], requested: list[dict[str, Any]] | None = None) -> SurveyView:
+    """requested: the request's requested_assemblies (assembly_id, part_number, revision), or None."""
     if not files:
         raise SurveyError("SURVEY_EMPTY_PACKAGE")
     ids = {item.path: f"F{index}" for index, item in enumerate(files, 1)}
@@ -451,16 +468,20 @@ def build_view(files: list[PackageFile]) -> SurveyView:
         entries[file_id], shown[file_id] = _entry(file_id, item, same)
         mapped[file_id] = item
     package = _folders(files)
-    digest = sha256(_compact({"version": VIEW_VERSION, "package": package,
-                              "files": list(entries.values()),
-                              "sha256": [item.sha256 for item in files]}).encode()).hexdigest()
-    return SurveyView(mapped, entries, shown, package, digest)
+    refs = tuple({"ref": f"R{index}", "assembly_id": item["assembly_id"], "part_number": item["part_number"],
+                  "revision": item["revision"]} for index, item in enumerate(requested or [], 1))
+    body: dict[str, Any] = {"version": VIEW_VERSION_V2 if refs else VIEW_VERSION, "package": package,
+                            "files": list(entries.values()), "sha256": [item.sha256 for item in files]}
+    if refs:
+        body["requested_assemblies"] = list(refs)
+    digest = sha256(_compact(body).encode()).hexdigest()
+    return SurveyView(mapped, entries, shown, package, digest, refs)
 
 
 def plan_batches(view: SurveyView, *, char_limit: int = BATCH_CHAR_LIMIT,
                  file_limit: int = BATCH_FILE_LIMIT) -> list[SurveyBatch]:
     """Files in path order, so folders stay together; every file is in exactly one batch."""
-    base = len(_compact({"version": VIEW_VERSION, "package": view.package, "classify": [], "files": []}))
+    base = len(_compact({**view.header(), "classify": [], "files": []}))
     if base + FILE_CHAR_LIMIT * 2 > char_limit:
         raise SurveyError("SURVEY_BATCH_LIMIT")
     groups: list[list[str]] = [[]]
@@ -478,8 +499,7 @@ def plan_batches(view: SurveyView, *, char_limit: int = BATCH_CHAR_LIMIT,
 def sub_batch(view: SurveyView, file_ids: list[str] | tuple[str, ...]) -> SurveyBatch:
     """The view of exactly these files; a retry asks again only about the files that were refused."""
     group = list(file_ids)
-    return SurveyBatch(tuple(group), _compact({"version": VIEW_VERSION, "package": view.package,
-                                               "classify": group,
+    return SurveyBatch(tuple(group), _compact({**view.header(), "classify": group,
                                                "files": [view.entries[i] for i in group]}))
 
 
@@ -514,3 +534,31 @@ SURVEY_INSTRUCTIONS = (
     "{code, severity, rationale}; severity is information, warning or blocking; use blocking only when "
     "no reasonable choice exists. Output JSON only."
 )
+
+# Round 2 (QuickQuote D1, Nick 2026-10-10): link files to the requested assemblies the way an
+# experienced reviewer reads part numbers; code then confirms each link (assembly_core.py).
+LINK_INSTRUCTIONS = (
+    "requested_assemblies lists the assemblies the customer asked us to quote, each with a ref, part_number "
+    "and revision. Link each file to the requested assembly it belongs to, or null. Read numbers as an "
+    "experienced reviewer would: our part numbers often wrap the customer's number with a customer-code "
+    "prefix joined to the front (for example ENE or SNC) and a build suffix (for example -TK); either, both "
+    "or neither may be present, and customer files usually show the customer's own number, sometimes with "
+    "our prefix. Compare the core number: its groups of digits and letters-with-digits, in order, ignoring "
+    "letter case, separators (space, -, _, .), our prefix and our suffix. A different number in any group "
+    "is a different item (011-0810-00 is not 010-0810-U2; -01 is not -02); never link by elimination. A "
+    "related number such as a bare board, or a product or customer name, supports a link but is not enough "
+    "on its own. Revisions are written loosely (V10p1-B, v10p1 and V10.1 can be the same); a clearly "
+    "different revision is a contradiction. requested_assembly is null or {ref, matched_core, evidence}: "
+    "ref is one of the requested refs; matched_core is the core number you matched, at most 100 characters; "
+    "evidence is a list of 1 to 3 evidence items that cite the path text or shown cell carrying that "
+    "number, in the same form as evidence. "
+)
+SURVEY_INSTRUCTIONS_V2 = SURVEY_INSTRUCTIONS.replace(
+    "version='package-survey-reply.v1'", "version='package-survey-reply.v2'").replace(
+    "each with exactly file_id, role, assembly, possibly_shared, rationale, evidence, findings.",
+    "each with exactly file_id, role, assembly, requested_assembly, possibly_shared, rationale, evidence, "
+    "findings.").replace("Output JSON only.", LINK_INSTRUCTIONS + "Output JSON only.")
+
+
+def survey_instructions(view: SurveyView) -> str:
+    return SURVEY_INSTRUCTIONS_V2 if view.requested else SURVEY_INSTRUCTIONS
