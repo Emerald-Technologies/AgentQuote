@@ -70,21 +70,22 @@ def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
     if item["source"] == "path":
         found = _match(value, view.files[file_id].path)
         if found is None:
-            raise SurveyError("SURVEY_EVIDENCE_NOT_IN_PATH")
+            raise SurveyError("SURVEY_EVIDENCE_NOT_IN_PATH", rejected={"source": "path", "value": value})
         return {"source": "path", "value": found}
     cell = item["cell"]
     if (not isinstance(cell, dict) or set(cell) != {"sheet", "row", "column"}
             or not isinstance(cell["sheet"], str)
             or type(cell["row"]) is not int or type(cell["column"]) is not int):
         raise SurveyError("SURVEY_EVIDENCE_LOCATOR_INVALID")
+    locator = {"sheet": cell["sheet"], "row": cell["row"], "column": cell["column"]}
     actual = view.shown[file_id].get((cell["sheet"], cell["row"], cell["column"]))
     if actual is None:
         # Only cells that were shown can be cited; a hidden cell is not evidence the agent saw.
-        raise SurveyError("SURVEY_EVIDENCE_CELL_NOT_SHOWN")
+        raise SurveyError("SURVEY_EVIDENCE_CELL_NOT_SHOWN", rejected={"source": "cell", "value": value, "cell": locator})
     text = cell_text(actual)
     found = value if text.strip() == value else _match(value, text)
     if found is None:
-        raise SurveyError("SURVEY_EVIDENCE_VALUE_CHANGED")
+        raise SurveyError("SURVEY_EVIDENCE_VALUE_CHANGED", rejected={"source": "cell", "value": value, "cell": locator})
     return {"source": "cell", "value": found,
             "cell": {"sheet": cell["sheet"], "row": cell["row"], "column": cell["column"]}}
 
@@ -157,7 +158,20 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
 
 
 def verify_batch(view: SurveyView, batch: SurveyBatch, reply: Any) -> tuple[list[dict], list[dict]]:
-    """Records for exactly the batch's files, plus package-level agent findings."""
+    """Records for exactly the batch's files, plus package-level agent findings; any refusal raises."""
+    records, findings, failed = verify_batch_files(view, batch, reply)
+    if failed:
+        raise next(iter(failed.values()))
+    return records, findings
+
+
+def verify_batch_files(view: SurveyView, batch: SurveyBatch,
+                       reply: Any) -> tuple[list[dict], list[dict], dict[str, SurveyError]]:
+    """Records for the files that pass, package-level agent findings, and each refused file's error.
+
+    A malformed reply or wrong file coverage still refuses the whole reply; one refused record
+    refuses only that file (plan 8.8 step 7, A032 diagnosis).
+    """
     if (not isinstance(reply, dict) or set(reply) != {"version", "files", "findings"}
             or reply["version"] != REPLY_VERSION or not isinstance(reply["files"], list)):
         raise SurveyError("SURVEY_REPLY_INVALID")
@@ -169,14 +183,15 @@ def verify_batch(view: SurveyView, batch: SurveyBatch, reply: Any) -> tuple[list
         proposals[file_id] = proposal
     if set(proposals) != set(batch.file_ids):
         raise SurveyError("SURVEY_COVERAGE_INVALID")
-    records = []
+    findings = [{**item, "raised_by": "agent"} for item in _findings(reply["findings"])]
+    records, failed = [], {}
     for file_id in batch.file_ids:
         try:
             records.append(_record(view, file_id, proposals[file_id]))
         except SurveyError as exc:
             # The survey id (F1...) is not customer data; the retry and the record can name the file.
-            raise SurveyError(str(exc), file_id) from None
-    return records, [{**item, "raised_by": "agent"} for item in _findings(reply["findings"])]
+            failed[file_id] = SurveyError(str(exc), file_id, exc.rejected)
+    return records, findings, failed
 
 
 def assemble(view: SurveyView, records: list[dict], package_findings: list[dict],

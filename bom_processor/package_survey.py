@@ -43,11 +43,16 @@ SPREADSHEET_KINDS = frozenset({"spreadsheet_ooxml", "spreadsheet_xls", "spreadsh
 
 
 class SurveyError(ValueError):
-    """Stable failure code without customer values; file_id is the survey id (F1...) when known."""
+    """Stable failure code; file_id is the survey id (F1...) when known.
 
-    def __init__(self, code: str, file_id: str | None = None):
+    rejected holds the agent's refused citation (source, value, cell) for the stored result
+    only; it is never put in the message, logs or retry text.
+    """
+
+    def __init__(self, code: str, file_id: str | None = None, rejected: dict | None = None):
         super().__init__(code)
         self.file_id = file_id
+        self.rejected = rejected
 
 
 class _Unreadable(Exception):
@@ -461,10 +466,15 @@ def plan_batches(view: SurveyView, *, char_limit: int = BATCH_CHAR_LIMIT,
             size = base
         groups[-1].append(file_id)
         size += cost
-    return [SurveyBatch(tuple(group), _compact({"version": VIEW_VERSION, "package": view.package,
-                                                "classify": group,
-                                                "files": [view.entries[i] for i in group]}))
-            for group in groups]
+    return [sub_batch(view, group) for group in groups]
+
+
+def sub_batch(view: SurveyView, file_ids: list[str] | tuple[str, ...]) -> SurveyBatch:
+    """The view of exactly these files; a retry asks again only about the files that were refused."""
+    group = list(file_ids)
+    return SurveyBatch(tuple(group), _compact({"version": VIEW_VERSION, "package": view.package,
+                                               "classify": group,
+                                               "files": [view.entries[i] for i in group]}))
 
 
 SURVEY_INSTRUCTIONS = (

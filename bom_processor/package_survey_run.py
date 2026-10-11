@@ -1,11 +1,12 @@
 """Run stage 1 (package survey): one model call per batch, every reply checked.
 
 Inputs: package root files as (name, bytes) and a caller that sends one batch to
-the agent. Output: the survey record (package_survey_check.assemble). A reply
-that fails a check is retried once with the stable failure code and the failing
-survey file id; each attempt's code and file id are kept in the finding; a second
-failure leaves its files unclassified with a blocking finding. Other batches
-continue; package choice retains every BOM when a batch failed (plan 8.8 step 6). Run python -m pytest tests/test_package_survey.py.
+the agent. Output: the survey record (package_survey_check.assemble). Files whose
+records pass are kept; only refused files are asked again, once, with their
+stable codes and survey ids. A file still refused is unclassified: a spreadsheet
+blocks (package choice retains every BOM), any other kind is a warning. Each
+attempt's codes and the refused citations are kept in the finding.
+Run python -m pytest tests/test_package_survey.py.
 """
 from __future__ import annotations
 
@@ -13,9 +14,9 @@ import asyncio
 import json
 from typing import Any, Callable
 
-from .package_survey import (SURVEY_INSTRUCTIONS, SurveyBatch, SurveyError, build_view,
-                             expand_package, plan_batches)
-from .package_survey_check import verify_batch, assemble
+from .package_survey import (SPREADSHEET_KINDS, SURVEY_INSTRUCTIONS, SurveyError, build_view,
+                             expand_package, plan_batches, sub_batch)
+from .package_survey_check import assemble, verify_batch_files
 
 SURVEY_MAX_TOKENS = 8192
 SURVEY_RESPONSE_FORMAT = {"type": "json_object"}
@@ -38,50 +39,89 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
     records: list[dict] = []
     package_findings: list[dict] = []
     for batch in batches:
-        failure, failed_file = None, None
+        pending = list(batch.file_ids)
+        codes: dict[str, str] = {}
+        rejected: dict[str, dict[str, Any]] = {}
         attempts: list[dict[str, Any]] = []
+        feedback, agent_findings_kept = None, False
         for _ in range(ATTEMPTS_PER_BATCH):
             if calls >= ceiling:
-                failure, failed_file = "SURVEY_CALL_LIMIT", None
+                codes.update({file_id: "SURVEY_CALL_LIMIT" for file_id in pending})
                 break
             calls += 1
-            text = batch.user_text if failure is None else _retry_text(batch, failure, failed_file)
+            current = batch if len(pending) == len(batch.file_ids) else sub_batch(view, pending)
             try:
-                found, findings = verify_batch(view, batch, call(SURVEY_INSTRUCTIONS, text))
+                found, findings, failed = verify_batch_files(
+                    view, current, call(SURVEY_INSTRUCTIONS, current.user_text + (feedback or "")))
             except Exception as exc:
+                # The reply as a whole was unusable: every pending file is asked again.
                 failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
-                failed_file = exc.file_id if isinstance(exc, SurveyError) else None
-                attempts.append({"failure_code": failure, "file_id": failed_file})
+                codes.update({file_id: failure for file_id in pending})
+                attempts.append({"failure_code": failure, "file_id": None})
+                feedback = _retry_text(failure)
                 continue
             records.extend(found)
-            package_findings.extend(findings)
-            failure = None
-            break
-        if failure is not None:
-            code = "SURVEY_CALL_LIMIT" if failure == "SURVEY_CALL_LIMIT" else "SURVEY_BATCH_FAILED"
-            finding = {"code": code, "severity": "blocking", "raised_by": "code",
-                       "rationale": "These files could not be classified; every BOM is retained for review.",
-                       "file_ids": list(batch.file_ids), "failure_code": failure,
-                       "attempt_failures": attempts}
-            package_findings.append(finding)
-            for file_id in batch.file_ids:
-                item, entry = view.files[file_id], view.entries[file_id]
-                records.append({"file_id": file_id, "path": item.path, "chain": list(item.chain),
-                                "sha256": item.sha256, "size_bytes": item.size_bytes, "kind": entry["kind"],
-                                "role": "other", "classification_status": "unclassified",
-                                "assembly": None, "assembly_evidence": None, "possibly_shared": False,
-                                "rationale": finding["rationale"], "evidence": [], "findings": [finding]})
+            if not agent_findings_kept:
+                # A retry repeats the package view; its package findings would be duplicates.
+                package_findings.extend(findings)
+                agent_findings_kept = True
+            for file_id, error in failed.items():
+                codes[file_id] = str(error)
+                attempts.append({"failure_code": str(error), "file_id": file_id})
+                if error.rejected is not None:
+                    rejected[file_id] = {"file_id": file_id, "failure_code": str(error), **error.rejected}
+            pending = [file_id for file_id in batch.file_ids if file_id in failed]
+            if not pending:
+                break
+            feedback = _retry_text([{"file_id": file_id, "failure_code": codes[file_id]} for file_id in pending])
+        package_findings.extend(_unclassified(view, records, pending, codes, attempts, rejected))
     return assemble(view, records, package_findings, model_calls=calls)
 
 
-def _retry_text(batch: SurveyBatch, failure: str, file_id: str | None = None) -> str:
-    # Only the stable check code and survey id are returned to the agent, never source values.
-    feedback: dict[str, Any] = {"previous_reply_rejected": failure}
-    if file_id is not None:
-        feedback["file_id"] = file_id
-    feedback["instruction"] = ("Return a complete corrected reply for every id in classify"
-                               + ("; correct the record for file_id." if file_id is not None else "."))
-    return batch.user_text + json.dumps(feedback, separators=(",", ":"))
+def _unclassified(view: Any, records: list[dict], pending: list[str], codes: dict[str, str],
+                  attempts: list[dict], rejected: dict[str, dict]) -> list[dict]:
+    """Records and findings for files still refused after the retry.
+
+    A refused spreadsheet could be a BOM, so it blocks and package choice retains every BOM.
+    A refused PDF, drawing, Gerber or text file is listed with a warning and does not block.
+    """
+    sheets = [file_id for file_id in pending if view.entries[file_id]["kind"] in SPREADSHEET_KINDS]
+    others = [file_id for file_id in pending if file_id not in sheets]
+    findings = []
+    for group, blocking in ((sheets, True), (others, False)):
+        if not group:
+            continue
+        failure = codes[group[0]]
+        if blocking:
+            code = "SURVEY_CALL_LIMIT" if failure == "SURVEY_CALL_LIMIT" else "SURVEY_BATCH_FAILED"
+            rationale = "These files could not be classified; every BOM is retained for review."
+        else:
+            code = "SURVEY_FILES_UNCLASSIFIED"
+            rationale = "These files are not spreadsheets and could not be classified; they are listed for review and do not block BOM selection."
+        finding = {"code": code, "severity": "blocking" if blocking else "warning", "raised_by": "code",
+                   "rationale": rationale, "file_ids": list(group), "failure_code": failure,
+                   "attempt_failures": attempts,
+                   "rejected_citations": [rejected[file_id] for file_id in group if file_id in rejected]}
+        findings.append(finding)
+        for file_id in group:
+            item, entry = view.files[file_id], view.entries[file_id]
+            records.append({"file_id": file_id, "path": item.path, "chain": list(item.chain),
+                            "sha256": item.sha256, "size_bytes": item.size_bytes, "kind": entry["kind"],
+                            "role": "other", "classification_status": "unclassified",
+                            "assembly": None, "assembly_evidence": None, "possibly_shared": False,
+                            "rationale": rationale, "evidence": [], "findings": [finding]})
+    return findings
+
+
+def _retry_text(rejected: str | list[dict[str, str]]) -> str:
+    # Only stable check codes and survey ids are returned to the agent, never source values.
+    if isinstance(rejected, str):
+        feedback = {"previous_reply_rejected": rejected,
+                    "instruction": "Return a complete corrected reply for every id in classify."}
+    else:
+        feedback = {"previous_reply_rejected": rejected,
+                    "instruction": "These records were refused; return a complete corrected reply for every id in classify."}
+    return json.dumps(feedback, separators=(",", ":"))
 
 
 def foundry_caller(client: Any = None, agent_factory: Any = None) -> Caller:

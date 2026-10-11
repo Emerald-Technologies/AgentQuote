@@ -18,10 +18,11 @@ def _summary(state: dict) -> dict:
     if state["status"] == "failed":
         line["code"] = state.get("code")
     survey = (state.get("result") or {}).get("survey") or {}
-    failures = [{"code": item["code"], "failure_code": item.get("failure_code"),
-                 "files": len(item.get("file_ids", [])), "attempts": item.get("attempt_failures", [])}
+    # Refused citation values stay in the stored result; the log line carries codes and ids only.
+    failures = [{"code": item["code"], "severity": item.get("severity"), "failure_code": item.get("failure_code"),
+                 "file_ids": item.get("file_ids", []), "attempts": item.get("attempt_failures", [])}
                 for item in survey.get("findings", [])
-                if item.get("code") in ("SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT")]
+                if item.get("code") in ("SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "SURVEY_FILES_UNCLASSIFIED")]
     if failures:
         line["survey_failures"] = failures
     return line

@@ -517,3 +517,33 @@ def test_survey_finds_every_package_file_by_hash():
     view = build_view(expand_package([("package.zip", PACKAGE)]))
     hashes = {item.sha256 for item in view.files.values()}
     assert {hashlib.sha256(data).hexdigest() for data in DOCS.values()} <= hashes
+
+
+class DrawingAgent(Agent):
+    """Survey answers from Agent, plus a drawing whose cited name text is not in its path."""
+
+    def __call__(self, instructions, text):
+        body, _ = json.JSONDecoder().raw_decode(text)
+        if "classify" not in body:
+            return super().__call__(instructions, text)
+        drawings = [entry for entry in body["files"] if entry["path"].endswith(".pdf")]
+        reply = super().__call__(instructions, json.dumps(
+            {**body, "files": [entry for entry in body["files"] if entry not in drawings]}))
+        reply["files"] += [{"file_id": entry["id"], "role": "other", "possibly_shared": False,
+                            "assembly": {"name": [{"source": "path", "value": "ASSY-999"}], "revision": []},
+                            "rationale": "Stub.", "evidence": [], "findings": []} for entry in drawings]
+        return reply
+
+
+def test_refused_drawing_does_not_stop_the_primary_choice():
+    roots = [("package.zip", archive({**FILES, "A/ASSY-100 drawing.pdf": b"%PDF-1.4 synthetic"}))]
+    request = {"request_id": "r1", "documents": [{"document_id": doc, "sha256": hashlib.sha256(data).hexdigest()}
+                                                 for doc, data in sorted(DOCS.items())]}
+    result = decide(request, roots, DrawingAgent())
+    assert {item["document_id"]: (item["decision"], item["reason"]) for item in result["documents"]} == {
+        "doc-mod": ("process", "primary"), "doc-plain": ("excluded", "redundant"),
+        "doc-other": ("process", "only_bom"), "doc-mpi": ("excluded", "work_instruction")}
+    # Survey, one retry for the drawing alone, then the choice for the contested assembly.
+    assert result["model_calls"] == 3
+    warning = next(item for item in result["findings"] if item["code"] == "SURVEY_FILES_UNCLASSIFIED")
+    assert warning["severity"] == "warning" and warning["file_paths"] == ["package.zip/A/ASSY-100 drawing.pdf"]

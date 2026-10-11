@@ -85,10 +85,12 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     calls = survey["model_calls"]
     choices = []
     failed_files = set()
-    failures = [item for item in survey["findings"]
-                if item["code"] in {"SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT"} and item["raised_by"] == "code"]
-    # Failed survey batches make all choice results unusable; avoid paid calls.
-    for group in ([] if failures else survey["assemblies"]):
+    failures = [item for item in survey["findings"] if item["raised_by"] == "code"
+                and item["code"] in {"SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "SURVEY_FILES_UNCLASSIFIED"}]
+    # An unclassified spreadsheet makes all choice results unusable; avoid paid calls. Unclassified
+    # non-spreadsheet files are a warning and do not stop the choice.
+    blocked = any(item["severity"] == "blocking" for item in failures)
+    for group in ([] if blocked else survey["assemblies"]):
         boms = group["files"]["bom"]
         if len(boms) < 2:
             continue

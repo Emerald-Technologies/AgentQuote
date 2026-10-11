@@ -390,40 +390,85 @@ def test_tolerant_matching_still_refuses_partial_or_absent_text(evidence, code):
     assert finding["failure_code"] == code and result["has_blocking_findings"]
 
 
-def failing_pdf_run():
+def refused_run(name, citation, calls=(1, 2)):
+    """A030-shaped run whose agent cites text that is not in the named file, on the given calls."""
     view = build_view(expand_package(a030_like()))
-    pdf = by_name(view)["ASSY-100 drawing.pdf"]
+    target = by_name(view)[name]
 
-    def mutate(reply, _count):
+    def mutate(reply, count):
         for item in reply["files"]:
-            if item["file_id"] == pdf:
-                item["assembly"] = {"name": [path("private-response-value")], "revision": []}
+            if item["file_id"] == target and count in calls:
+                item["assembly"] = {"name": [copy.deepcopy(citation)], "revision": []}
         return reply
     _, agent, survey = run(mutate=mutate)
-    return pdf, agent, survey
+    return target, agent, survey
 
 
-def test_retry_names_the_failing_file_and_each_attempt_is_recorded():
-    pdf, agent, survey = failing_pdf_run()
-    assert len(agent.sent) == 2
-    text = agent.sent[1][1]
-    _, end = json.JSONDecoder().raw_decode(text)
-    assert json.loads(text[end:]) == {
-        "previous_reply_rejected": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf,
-        "instruction": "Return a complete corrected reply for every id in classify; correct the record for file_id."}
-    finding = next(f for f in survey["findings"] if f["code"] == "SURVEY_BATCH_FAILED")
+def retry_feedback(agent):
+    batch, end = json.JSONDecoder().raw_decode(agent.sent[1][1])
+    return batch["classify"], json.loads(agent.sent[1][1][end:])
+
+
+def test_one_refused_drawing_keeps_the_other_files_and_does_not_block():
+    pdf, agent, survey = refused_run("ASSY-100 drawing.pdf", path("private-response-value"))
+    assert len(agent.sent) == survey["model_calls"] == 2
+    classify, feedback = retry_feedback(agent)
+    # The retry asks only about the refused file and never repeats the refused value.
+    assert classify == [pdf] and feedback == {
+        "previous_reply_rejected": [{"file_id": pdf, "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH"}],
+        "instruction": "These records were refused; return a complete corrected reply for every id in classify."}
+    assert "private-response-value" not in agent.sent[1][1]
+    assert not survey["has_blocking_findings"]
+    assert [f["file_id"] for f in survey["files"] if f.get("classification_status") == "unclassified"] == [pdf]
+    assert {group["name"] for group in survey["assemblies"]} == {"ASSY-100", "ASSY-200"}
+    finding = next(f for f in survey["findings"] if f["code"] == "SURVEY_FILES_UNCLASSIFIED")
+    assert finding["severity"] == "warning" and finding["file_ids"] == [pdf]
     assert finding["attempt_failures"] == [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2
-    assert "private-response-value" not in json.dumps(survey) and "private-response-value" not in text
+    # The stored result keeps what the agent wrote, so a refusal can be diagnosed.
+    assert finding["rejected_citations"] == [{"file_id": pdf, "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH",
+                                              "source": "path", "value": "private-response-value"}]
 
 
-def test_choice_job_log_line_carries_only_codes_ids_and_counts():
+def test_retry_that_corrects_the_refused_file_classifies_everything():
+    pdf, agent, survey = refused_run("ASSY-100 drawing.pdf", path("private-response-value"), calls=(1,))
+    assert survey["model_calls"] == 2 and retry_feedback(agent)[0] == [pdf]
+    assert not survey["has_blocking_findings"]
+    assert not any(f.get("classification_status") == "unclassified" for f in survey["files"])
+    assert not any(f["code"].startswith("SURVEY_") and f["raised_by"] == "code" and "file_ids" in f
+                   for f in survey["findings"])
+
+
+def test_refused_spreadsheet_still_blocks_so_every_bom_is_retained():
+    bom, _, survey = refused_run("ASSY-200 BOM.xlsx", cell("BOM", 1, 2, "private-response-value"))
+    assert survey["has_blocking_findings"]
+    finding = next(f for f in survey["findings"] if f["code"] == "SURVEY_BATCH_FAILED")
+    assert finding["severity"] == "blocking" and finding["file_ids"] == [bom]
+    assert finding["failure_code"] == "SURVEY_EVIDENCE_VALUE_CHANGED"
+    assert finding["rejected_citations"][0]["cell"] == {"sheet": "BOM", "row": 1, "column": 2}
+    assert sum(f.get("classification_status") == "unclassified" for f in survey["files"]) == 1
+
+
+def test_unusable_reply_retries_the_whole_batch():
+    def mutate(reply, count):
+        if count == 1:
+            reply["version"] = "private-response-value"
+        return reply
+    view, agent, survey = run(mutate=mutate)
+    classify, feedback = retry_feedback(agent)
+    assert classify == list(view.ids) and feedback == {
+        "previous_reply_rejected": "SURVEY_REPLY_INVALID",
+        "instruction": "Return a complete corrected reply for every id in classify."}
+    assert not survey["has_blocking_findings"] and survey["model_calls"] == 2
+
+
+def test_choice_job_log_line_carries_only_codes_and_ids():
     from choice_job import _summary
-    pdf, _, survey = failing_pdf_run()
+    pdf, _, survey = refused_run("ASSY-100 drawing.pdf", path("private-response-value"))
     line = _summary({"request_id": "r1", "status": "completed", "result": {"survey": survey}})
     assert line == {"request_id": "r1", "status": "completed", "survey_failures": [{
-        "code": "SURVEY_BATCH_FAILED", "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "files": 8,
-        "attempts": [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2}]}
-    assert "package.zip" not in json.dumps(line)
+        "code": "SURVEY_FILES_UNCLASSIFIED", "severity": "warning", "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH",
+        "file_ids": [pdf], "attempts": [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2}]}
+    assert "private-response-value" not in json.dumps(line) and "package.zip" not in json.dumps(line)
     assert _summary({"request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}) == {
         "request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}
     assert _summary({"request_id": "r3", "status": "completed", "result": {"survey": {"findings": []}}}) == {
