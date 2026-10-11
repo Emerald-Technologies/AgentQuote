@@ -43,6 +43,15 @@ ROW_MAP_RULE = (
 EXCEPTION_POLICY_RULE = (
     "never use bare except, except Exception or except BaseException; catch specific exceptions such as ValueError or KeyError, or let errors propagate; a broad handler may contain only a raise statement, never pass, print, return, a fallback value or sys.exit"
 )
+# Enforced by _validate_code (rule html_xls_banned_workbook_api) for every source type; the A035
+# author broke it unseen (round 2, item 4). read_excel is banned only for html_table_xls sources.
+BANNED_CALL_RULE = (
+    "never call eval, exec, compile, os.system, popen or pandas.read_html, for any source type"
+)
+HTML_XLS_WORKBOOK_RULE = (
+    "for source_subtype html_table_xls, never call pandas.read_excel or open the file as a workbook; "
+    "it is an HTML table, so parse it with html.parser.HTMLParser"
+)
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
     "write exactly the supplied canonical columns in the supplied order and at least one data row; when any line has more than 8 manufacturer/MPN pairs, append manufacturer_9, manufacturer_item_number_9, and so on in that order up to the widest line (at most 50 pairs), the same columns for every row, never dropping a pair",
@@ -61,11 +70,13 @@ CANONICAL_OUTPUT_RULES = (
     "read only --input and write only --output and, when given, --row-map; do not access network",
     # Enforced by _validate_code (broad_exception_handler); live authors kept breaking it unseen.
     EXCEPTION_POLICY_RULE,
+    BANNED_CALL_RULE,
     ROW_MAP_RULE,
 )
 HTML_XLS_RULES = (
     "for source_subtype html_table_xls, use only stdlib html.parser.HTMLParser with bounded inert table extraction",
     "for source_subtype html_table_xls, never use pandas.read_html, network access, rendering, eval, or XML parsing",
+    HTML_XLS_WORKBOOK_RULE,
     "for source_subtype html_table_xls, map extracted rows to the standard XLSX output format",
     "for source_subtype html_table_xls, preserve the actual source category in bom_notes when useful, but never fabricate a category or row",
     "map real source rows only; never fabricate fallback rows or substitute identity with UNKNOWN, N/A, TBD, TBC, or placeholders",

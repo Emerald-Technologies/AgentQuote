@@ -93,6 +93,7 @@ def test_failed_association_author_next_slot_gets_explicit_import_guidance():
     assert "do not import" in guidance and "os" in guidance and "subprocess" in guidance
     assert "argparse" in guidance and "pathlib" in guidance and "openpyxl" in guidance
     assert "except Exception" in guidance and "re-raises" in guidance
+    assert "pandas.read_html" in guidance and "pandas.read_excel" in guidance and "HTMLParser" in guidance
     assert len(guidance) < 1000
     assert all(storage.registry[path] == data for path, data in first_claims.items())
     assert all(storage.registry[path] == data for path, data in terminal_paths.items())

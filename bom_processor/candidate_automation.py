@@ -469,6 +469,9 @@ class CandidateAutomationService:
                 "and pandas/openpyxl for workbook parsing; no network, subprocess or dynamic imports. "
                 "Never use bare except, except Exception or except BaseException unless the "
                 "handler only re-raises; catch specific exceptions or let errors propagate. "
+                "Never call eval, exec, compile, os.system, popen or pandas.read_html; for an "
+                "html_table_xls source never call pandas.read_excel, parse the HTML table with "
+                "html.parser.HTMLParser. "
                 "This guidance does not identify the previous failure's exact import."
             )
         if failure_event:

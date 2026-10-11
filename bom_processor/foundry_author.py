@@ -31,7 +31,8 @@ SYSTEM_INSTRUCTION = (
     "read the supplied BOM, and write a real XLSX workbook to --output using pandas "
     "or openpyxl. Follow every canonical output rule and exact ordered column list in "
     "the user message. Reopen and check the workbook before successful exit. Do not "
-    "use network, subprocesses, dynamic code execution, or tools. Never use bare except, "
+    "use network, subprocesses, dynamic code execution, or tools; never call eval, exec, "
+    "compile, os.system, popen or pandas.read_html. Never use bare except, "
     "except Exception or except BaseException unless the handler only re-raises; catch "
     "specific exceptions or let errors propagate. Return source only. "
     "Map source component taxonomy (including Capacitor, Resistor, and PCB assembly) "
@@ -279,7 +280,9 @@ class FoundryModelAuthor:
             "Never invent an identifier. If no supported identifier exists, return null for name and a blocking "
             "finding. Preserve vertical manufacturer alternatives as alternatives of the component, not extra "
             "priced components. Preserve document identities and quantities without treating them as assemblies. "
-            "No network, subprocesses, dynamic execution or tools. No bare except, except Exception "
+            "No network, subprocesses, dynamic execution or tools; never call eval, exec, compile, os.system, "
+            "popen or pandas.read_html, and never pandas.read_excel on an html_table_xls source. "
+            "No bare except, except Exception "
             "or except BaseException unless the handler only re-raises. Output JSON only."
         )
 

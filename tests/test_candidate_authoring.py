@@ -82,6 +82,8 @@ def test_authoring_stores_only_quarantined_immutable_artifacts_without_execution
     assert prompt.rules == CANONICAL_OUTPUT_RULES
     # The enforced broad-exception rule is stated to the author, not only checked afterwards.
     assert any("except Exception" in rule and "raise statement" in rule for rule in prompt.rules)
+    # The banned calls (rule html_xls_banned_workbook_api) are stated too (round 2, item 4).
+    assert any("os.system" in rule and "pandas.read_html" in rule for rule in prompt.rules)
     assert any("real XLSX" in rule for rule in prompt.rules)
     assert any("actual document ID in item_number" in rule for rule in prompt.rules)
     assert any("not manufacturer/MPN pairs" in rule for rule in prompt.rules)
@@ -103,6 +105,7 @@ def test_html_rules_require_source_taxonomy_mapping_without_fabrication():
     rules = model.calls[0][0].rules
     assert any("Resistor" in rule and "item_category='Part'" in rule for rule in rules)
     assert any("actual source category" in rule and "never fabricate" in rule for rule in rules)
+    assert any("pandas.read_excel" in rule and "HTMLParser" in rule for rule in rules)
 
 
 def test_changed_code_creates_new_candidate_without_replacing_prior_artifacts():
