@@ -40,6 +40,9 @@ ROW_MAP_RULE = (
     "Build the row map from the same reading that writes the output; validation checks it against every "
     "row of the source and fails on any unaccounted, double-counted or mis-cited row"
 )
+EXCEPTION_POLICY_RULE = (
+    "never use bare except, except Exception or except BaseException; catch specific exceptions such as ValueError or KeyError, or let errors propagate; a broad handler may contain only a raise statement, never pass, print, return, a fallback value or sys.exit"
+)
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
     "write exactly the supplied canonical columns in the supplied order and at least one data row; when any line has more than 8 manufacturer/MPN pairs, append manufacturer_9, manufacturer_item_number_9, and so on in that order up to the widest line (at most 50 pairs), the same columns for every row, never dropping a pair",
@@ -56,6 +59,8 @@ CANONICAL_OUTPUT_RULES = (
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
     "read only --input and write only --output and, when given, --row-map; do not access network",
+    # Enforced by _validate_code (broad_exception_handler); live authors kept breaking it unseen.
+    EXCEPTION_POLICY_RULE,
     ROW_MAP_RULE,
 )
 HTML_XLS_RULES = (

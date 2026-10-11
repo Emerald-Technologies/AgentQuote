@@ -80,6 +80,7 @@ def test_author_contract_states_validator_critical_rules():
     assert "Reopen" in SYSTEM_INSTRUCTION
     assert "Capacitor" in SYSTEM_INSTRUCTION
     assert "reserve item_category='Document'" in SYSTEM_INSTRUCTION
+    assert "except Exception" in SYSTEM_INSTRUCTION and "re-raises" in SYSTEM_INSTRUCTION
 
 
 def test_strip_fences_only_removes_outer_fence():

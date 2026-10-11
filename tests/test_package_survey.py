@@ -473,3 +473,33 @@ def test_choice_job_log_line_carries_only_codes_and_ids():
         "request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}
     assert _summary({"request_id": "r3", "status": "completed", "result": {"survey": {"findings": []}}}) == {
         "request_id": "r3", "status": "completed"}
+
+
+def test_file_paths_are_shown_as_written_except_key_like_runs():
+    key = "AbCdEf0123456789AbCdEf0123456789XyZ0"
+    roots = [("RFQ-PACKAGE-TWO-ASSY.zip", archive({
+        "ENE010-0810-U2-TK/3-27-2026_assy_YonduV10p1_014-0810-U2-U3.pdf": b"%PDF-1.4 synthetic",
+        f"keys/{key}.txt": b"plain text"}))]
+    view = build_view(expand_package(roots))
+    shown = {entry["path"] for entry in view.entries.values()}
+    # The A034 drawing name was hidden by the shared token rule; names must stay citable.
+    assert "RFQ-PACKAGE-TWO-ASSY.zip/ENE010-0810-U2-TK/3-27-2026_assy_YonduV10p1_014-0810-U2-U3.pdf" in shown
+    assert "RFQ-PACKAGE-TWO-ASSY.zip/keys/[REDACTED].txt" in shown
+    assert not any(key in path for path in shown)
+    folders = {item["folder"] for item in view.package["folders"]}
+    assert "RFQ-PACKAGE-TWO-ASSY.zip/ENE010-0810-U2-TK" in folders
+
+
+def test_a_path_citation_of_a_long_file_name_is_accepted():
+    name = "ENE010-0810-U2-TK/3-27-2026_assy_YonduV10p1_014-0810-U2-U3.pdf"
+    roots = [("RFQ-PACKAGE-TWO-ASSY.zip", archive({name: b"%PDF-1.4 synthetic"}))]
+
+    def agent(_instructions, user_text):
+        batch, _ = json.JSONDecoder().raw_decode(user_text)
+        cited = batch["files"][0]["path"].rsplit("/", 1)[-1]
+        return {"version": "package-survey-reply.v1", "files": [record(
+            batch["classify"][0], "other", assembly={"name": [path("ENE010-0810-U2-TK")], "revision": []},
+            evidence=[path(cited)])], "findings": []}
+    result = survey_package(roots, agent)
+    assert result["model_calls"] == 1 and not result["has_blocking_findings"]
+    assert not any(f.get("classification_status") == "unclassified" for f in result["files"])

@@ -22,6 +22,12 @@ from typing import Any
 from .document_role import ROLE_DEFINITIONS
 from .foundry_author import _SECRET
 
+# File and folder names are evidence the survey must see and cite exactly. The shared rule would
+# hide any 32+ run of letters, digits, "-", "_" and "/", which is an ordinary file path; for
+# names only links, e-mail addresses and key-like runs with no separators are hidden.
+_PATH_SECRET = re.compile(r"(?:https?://|www\.)[^\s<>]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"
+                          r"|(?<![A-Za-z0-9+=])[A-Za-z0-9+=]{32,}(?![A-Za-z0-9+=])", re.I)
+
 VIEW_VERSION = "package-survey-view.v1"
 TOP_ROWS = 20
 MAX_COLUMNS = 512
@@ -364,7 +370,7 @@ def _compact(value: Any) -> str:
 
 def _entry(file_id: str, item: PackageFile, same: list[str]) -> tuple[dict[str, Any], dict]:
     kind = "archive_unreadable" if item.unreadable else file_kind(item.chain[-1], item.data)
-    entry: dict[str, Any] = {"id": file_id, "path": _SECRET.sub("[REDACTED]", item.path),
+    entry: dict[str, Any] = {"id": file_id, "path": _PATH_SECRET.sub("[REDACTED]", item.path),
                              "size": item.size_bytes, "kind": kind}
     if same:
         entry["same_bytes_as"] = same
@@ -412,7 +418,7 @@ def _folders(files: list[PackageFile]) -> dict[str, Any]:
         folder = item.path.rsplit("/", 1)[0] if "/" in item.path else ""
         name = item.chain[-1].rsplit("/", 1)[-1]
         extension = name.rsplit(".", 1)[-1].casefold() if "." in name else ""
-        record = summary.setdefault(folder, {"folder": _SECRET.sub("[REDACTED]", folder), "files": 0, "types": {}})
+        record = summary.setdefault(folder, {"folder": _PATH_SECRET.sub("[REDACTED]", folder), "files": 0, "types": {}})
         record["files"] += 1
         record["types"][extension] = record["types"].get(extension, 0) + 1
     folders, chars, omitted = [], 0, 0

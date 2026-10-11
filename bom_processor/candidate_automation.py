@@ -467,6 +467,8 @@ class CandidateAutomationService:
                 + ", ".join(sorted(_BANNED_MODULES))
                 + ". Use argparse for input/output arguments, pathlib or open for local paths, "
                 "and pandas/openpyxl for workbook parsing; no network, subprocess or dynamic imports. "
+                "Never use bare except, except Exception or except BaseException unless the "
+                "handler only re-raises; catch specific exceptions or let errors propagate. "
                 "This guidance does not identify the previous failure's exact import."
             )
         if failure_event:

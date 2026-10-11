@@ -31,7 +31,9 @@ SYSTEM_INSTRUCTION = (
     "read the supplied BOM, and write a real XLSX workbook to --output using pandas "
     "or openpyxl. Follow every canonical output rule and exact ordered column list in "
     "the user message. Reopen and check the workbook before successful exit. Do not "
-    "use network, subprocesses, dynamic code execution, or tools. Return source only. "
+    "use network, subprocesses, dynamic code execution, or tools. Never use bare except, "
+    "except Exception or except BaseException unless the handler only re-raises; catch "
+    "specific exceptions or let errors propagate. Return source only. "
     "Map source component taxonomy (including Capacitor, Resistor, and PCB assembly) "
     "to canonical item_category='Part'; reserve item_category='Document' for source "
     "rows that are documents, drawings, or specifications. Preserve the actual source "
@@ -277,7 +279,8 @@ class FoundryModelAuthor:
             "Never invent an identifier. If no supported identifier exists, return null for name and a blocking "
             "finding. Preserve vertical manufacturer alternatives as alternatives of the component, not extra "
             "priced components. Preserve document identities and quantities without treating them as assemblies. "
-            "No network, subprocesses, dynamic execution or tools. Output JSON only."
+            "No network, subprocesses, dynamic execution or tools. No bare except, except Exception "
+            "or except BaseException unless the handler only re-raises. Output JSON only."
         )
 
         async def invoke() -> dict[str, Any]:

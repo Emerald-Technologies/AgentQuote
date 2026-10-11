@@ -80,6 +80,8 @@ def test_authoring_stores_only_quarantined_immutable_artifacts_without_execution
     assert source == SOURCE
     assert SOURCE.decode(errors="ignore") not in repr(prompt)
     assert prompt.rules == CANONICAL_OUTPUT_RULES
+    # The enforced broad-exception rule is stated to the author, not only checked afterwards.
+    assert any("except Exception" in rule and "raise statement" in rule for rule in prompt.rules)
     assert any("real XLSX" in rule for rule in prompt.rules)
     assert any("actual document ID in item_number" in rule for rule in prompt.rules)
     assert any("not manufacturer/MPN pairs" in rule for rule in prompt.rules)
