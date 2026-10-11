@@ -139,7 +139,7 @@ def run(roots=None, answers=None, **kwargs):
     ({"source": "path", "value": None}, "SURVEY_EVIDENCE_VALUE_TYPE_INVALID"),
     ({"source": "path", "value": ""}, "SURVEY_EVIDENCE_VALUE_EMPTY"),
     ({"source": "path", "value": "private-response-value" * 20}, "SURVEY_EVIDENCE_VALUE_LIMIT"),
-    ({"source": "path", "value": " private-response-value"}, "SURVEY_EVIDENCE_VALUE_WHITESPACE"),
+    ({"source": "path", "value": "   "}, "SURVEY_EVIDENCE_VALUE_EMPTY"),
 ])
 def test_evidence_rejection_names_rule_without_leaking_reply_or_adding_retries(evidence, code):
     roots = [("bom.xlsx", xlsx({"BOM": BOM_ROWS}))]
@@ -353,3 +353,78 @@ def test_roots_are_validated():
     for roots in ([], [("a/b.zip", b"")], [("x.zip", "text")], [("a.zip", b""), ("A.ZIP", b"")]):
         with pytest.raises(SurveyError):
             expand_package(roots)
+
+
+SPACED_ROOTS = [("Pkg.zip", archive({"FAB DWG ASSY-100 REV-4.xlsx": xlsx({"BOM": BOM_ROWS})}))]
+
+
+def single_file_agent(**fields):
+    def agent(_instructions, user_text):
+        batch, _ = json.JSONDecoder().raw_decode(user_text)
+        return {"version": "package-survey-reply.v1",
+                "files": [record(batch["classify"][0], "bom", **copy.deepcopy(fields))], "findings": []}
+    return agent
+
+
+def test_evidence_ignores_surrounding_spaces_case_and_spacing_and_records_source_text():
+    agent = single_file_agent(
+        assembly={"name": [path(" assy-100 "), cell("BOM", 1, 2, " assy-100")], "revision": [path("rev-4")]},
+        evidence=[path("fab  dwg"), cell("BOM", 3, 2, "part number ")])
+    result = survey_package(SPACED_ROOTS, agent)
+    assert result["model_calls"] == 1 and not result["has_blocking_findings"]
+    item = result["files"][0]
+    assert item["role"] == "bom" and item["assembly"] == {"name": "ASSY-100", "revision": "REV-4"}
+    assert [e["value"] for e in item["evidence"]] == ["FAB DWG", "Part Number"]
+    assert [e["value"] for e in item["assembly_evidence"]["name"]] == ["ASSY-100", "ASSY-100"]
+
+
+@pytest.mark.parametrize("evidence,code", [
+    (path("SSY-100"), "SURVEY_EVIDENCE_NOT_IN_PATH"),
+    (path("ASSY-1000"), "SURVEY_EVIDENCE_NOT_IN_PATH"),
+    (path("FABDWG"), "SURVEY_EVIDENCE_NOT_IN_PATH"),
+    (cell("BOM", 1, 2, "SSY-100"), "SURVEY_EVIDENCE_VALUE_CHANGED"),
+])
+def test_tolerant_matching_still_refuses_partial_or_absent_text(evidence, code):
+    result = survey_package(SPACED_ROOTS, single_file_agent(evidence=[evidence]))
+    finding = next(f for f in result["findings"] if f["code"] == "SURVEY_BATCH_FAILED")
+    assert finding["failure_code"] == code and result["has_blocking_findings"]
+
+
+def failing_pdf_run():
+    view = build_view(expand_package(a030_like()))
+    pdf = by_name(view)["ASSY-100 drawing.pdf"]
+
+    def mutate(reply, _count):
+        for item in reply["files"]:
+            if item["file_id"] == pdf:
+                item["assembly"] = {"name": [path("private-response-value")], "revision": []}
+        return reply
+    _, agent, survey = run(mutate=mutate)
+    return pdf, agent, survey
+
+
+def test_retry_names_the_failing_file_and_each_attempt_is_recorded():
+    pdf, agent, survey = failing_pdf_run()
+    assert len(agent.sent) == 2
+    text = agent.sent[1][1]
+    _, end = json.JSONDecoder().raw_decode(text)
+    assert json.loads(text[end:]) == {
+        "previous_reply_rejected": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf,
+        "instruction": "Return a complete corrected reply for every id in classify; correct the record for file_id."}
+    finding = next(f for f in survey["findings"] if f["code"] == "SURVEY_BATCH_FAILED")
+    assert finding["attempt_failures"] == [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2
+    assert "private-response-value" not in json.dumps(survey) and "private-response-value" not in text
+
+
+def test_choice_job_log_line_carries_only_codes_ids_and_counts():
+    from choice_job import _summary
+    pdf, _, survey = failing_pdf_run()
+    line = _summary({"request_id": "r1", "status": "completed", "result": {"survey": survey}})
+    assert line == {"request_id": "r1", "status": "completed", "survey_failures": [{
+        "code": "SURVEY_BATCH_FAILED", "failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "files": 8,
+        "attempts": [{"failure_code": "SURVEY_EVIDENCE_NOT_IN_PATH", "file_id": pdf}] * 2}]}
+    assert "package.zip" not in json.dumps(line)
+    assert _summary({"request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}) == {
+        "request_id": "r2", "status": "failed", "code": "PACKAGE_FILE_UNAVAILABLE"}
+    assert _summary({"request_id": "r3", "status": "completed", "result": {"survey": {"findings": []}}}) == {
+        "request_id": "r3", "status": "completed"}

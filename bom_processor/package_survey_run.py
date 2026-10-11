@@ -2,7 +2,8 @@
 
 Inputs: package root files as (name, bytes) and a caller that sends one batch to
 the agent. Output: the survey record (package_survey_check.assemble). A reply
-that fails a check is retried once with the stable failure code; a second
+that fails a check is retried once with the stable failure code and the failing
+survey file id; each attempt's code and file id are kept in the finding; a second
 failure leaves its files unclassified with a blocking finding. Other batches
 continue; package choice retains every BOM when a batch failed (plan 8.8 step 6). Run python -m pytest tests/test_package_survey.py.
 """
@@ -37,17 +38,20 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
     records: list[dict] = []
     package_findings: list[dict] = []
     for batch in batches:
-        failure = None
+        failure, failed_file = None, None
+        attempts: list[dict[str, Any]] = []
         for _ in range(ATTEMPTS_PER_BATCH):
             if calls >= ceiling:
-                failure = "SURVEY_CALL_LIMIT"
+                failure, failed_file = "SURVEY_CALL_LIMIT", None
                 break
             calls += 1
-            text = batch.user_text if failure is None else _retry_text(batch, failure)
+            text = batch.user_text if failure is None else _retry_text(batch, failure, failed_file)
             try:
                 found, findings = verify_batch(view, batch, call(SURVEY_INSTRUCTIONS, text))
             except Exception as exc:
                 failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
+                failed_file = exc.file_id if isinstance(exc, SurveyError) else None
+                attempts.append({"failure_code": failure, "file_id": failed_file})
                 continue
             records.extend(found)
             package_findings.extend(findings)
@@ -57,7 +61,8 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
             code = "SURVEY_CALL_LIMIT" if failure == "SURVEY_CALL_LIMIT" else "SURVEY_BATCH_FAILED"
             finding = {"code": code, "severity": "blocking", "raised_by": "code",
                        "rationale": "These files could not be classified; every BOM is retained for review.",
-                       "file_ids": list(batch.file_ids), "failure_code": failure}
+                       "file_ids": list(batch.file_ids), "failure_code": failure,
+                       "attempt_failures": attempts}
             package_findings.append(finding)
             for file_id in batch.file_ids:
                 item, entry = view.files[file_id], view.entries[file_id]
@@ -69,12 +74,14 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
     return assemble(view, records, package_findings, model_calls=calls)
 
 
-def _retry_text(batch: SurveyBatch, failure: str) -> str:
-    # Only the stable check code is returned to the agent, never source values.
-    return batch.user_text + json.dumps(
-        {"previous_reply_rejected": failure,
-         "instruction": "Return a complete corrected reply for every id in classify."},
-        separators=(",", ":"))
+def _retry_text(batch: SurveyBatch, failure: str, file_id: str | None = None) -> str:
+    # Only the stable check code and survey id are returned to the agent, never source values.
+    feedback: dict[str, Any] = {"previous_reply_rejected": failure}
+    if file_id is not None:
+        feedback["file_id"] = file_id
+    feedback["instruction"] = ("Return a complete corrected reply for every id in classify"
+                               + ("; correct the record for file_id." if file_id is not None else "."))
+    return batch.user_text + json.dumps(feedback, separators=(",", ":"))
 
 
 def foundry_caller(client: Any = None, agent_factory: Any = None) -> Caller:

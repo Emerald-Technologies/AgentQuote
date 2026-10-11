@@ -3,7 +3,8 @@
 Inputs: the SurveyView from package_survey.py and the agent reply for one batch.
 Output: verified per-file records and code findings. Roles and assemblies are the
 agent's judgment; code proves every cited cell was shown with that value, every
-cited path text is in the file's path, and every file has exactly one record.
+cited path text is in the file's path (letter case and spacing aside, recorded as
+written in the source), and every file has exactly one record.
 No I/O or model calls. Run python -m pytest tests/test_package_survey.py.
 """
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .assembly_association import _within_cell
 from .document_role import ROLES
 from .package_survey import SurveyBatch, SurveyError, SurveyView, cell_text
 from .semantic import AssemblyIdentity
@@ -38,6 +38,17 @@ def _findings(value: Any) -> list[dict[str, Any]]:
     return [dict(finding) for finding in value]
 
 
+def _match(value: str, text: str) -> str | None:
+    """The source text the agent cited: a whole token, ignoring letter case and the width of spaces.
+
+    Returns the text exactly as written in the path or cell, so records keep the source's spelling.
+    A value glued to other letters or digits ('06' inside '006') is still refused.
+    """
+    pattern = r"\s+".join(re.escape(part) for part in value.split())
+    found = re.search(r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])", text, re.IGNORECASE)
+    return found.group(0) if found else None
+
+
 def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
     """One cited item, checked against the original value (never the shortened display)."""
     if not isinstance(item, dict):
@@ -50,16 +61,17 @@ def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
     value = item["value"]
     if not isinstance(value, str):
         raise SurveyError("SURVEY_EVIDENCE_VALUE_TYPE_INVALID")
+    # Surrounding spaces carry no meaning; the cited text must still be in the source.
+    value = value.strip()
     if not value:
         raise SurveyError("SURVEY_EVIDENCE_VALUE_EMPTY")
     if len(value) > 256:
         raise SurveyError("SURVEY_EVIDENCE_VALUE_LIMIT")
-    if value != value.strip():
-        raise SurveyError("SURVEY_EVIDENCE_VALUE_WHITESPACE")
     if item["source"] == "path":
-        if not _within_cell(value, view.files[file_id].path):
+        found = _match(value, view.files[file_id].path)
+        if found is None:
             raise SurveyError("SURVEY_EVIDENCE_NOT_IN_PATH")
-        return {"source": "path", "value": value}
+        return {"source": "path", "value": found}
     cell = item["cell"]
     if (not isinstance(cell, dict) or set(cell) != {"sheet", "row", "column"}
             or not isinstance(cell["sheet"], str)
@@ -70,9 +82,10 @@ def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
         # Only cells that were shown can be cited; a hidden cell is not evidence the agent saw.
         raise SurveyError("SURVEY_EVIDENCE_CELL_NOT_SHOWN")
     text = cell_text(actual)
-    if text.strip() != item["value"] and not _within_cell(item["value"], text):
+    found = value if text.strip() == value else _match(value, text)
+    if found is None:
         raise SurveyError("SURVEY_EVIDENCE_VALUE_CHANGED")
-    return {"source": "cell", "value": item["value"],
+    return {"source": "cell", "value": found,
             "cell": {"sheet": cell["sheet"], "row": cell["row"], "column": cell["column"]}}
 
 
@@ -156,7 +169,13 @@ def verify_batch(view: SurveyView, batch: SurveyBatch, reply: Any) -> tuple[list
         proposals[file_id] = proposal
     if set(proposals) != set(batch.file_ids):
         raise SurveyError("SURVEY_COVERAGE_INVALID")
-    records = [_record(view, file_id, proposals[file_id]) for file_id in batch.file_ids]
+    records = []
+    for file_id in batch.file_ids:
+        try:
+            records.append(_record(view, file_id, proposals[file_id]))
+        except SurveyError as exc:
+            # The survey id (F1...) is not customer data; the retry and the record can name the file.
+            raise SurveyError(str(exc), file_id) from None
     return records, [{**item, "raised_by": "agent"} for item in _findings(reply["findings"])]
 
 

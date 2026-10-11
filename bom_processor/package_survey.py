@@ -43,7 +43,11 @@ SPREADSHEET_KINDS = frozenset({"spreadsheet_ooxml", "spreadsheet_xls", "spreadsh
 
 
 class SurveyError(ValueError):
-    """Stable failure code without customer values."""
+    """Stable failure code without customer values; file_id is the survey id (F1...) when known."""
+
+    def __init__(self, code: str, file_id: str | None = None):
+        super().__init__(code)
+        self.file_id = file_id
 
 
 class _Unreadable(Exception):
