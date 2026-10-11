@@ -208,6 +208,9 @@ class ParentPackageService:
                 continue
             groups.append(projected)
         groups = self._reconcile_review_groups(groups, dispositions, primaries)
+        linked = choice_result is not None and "requested_assemblies" in choice_result
+        if linked:
+            groups = requested_links(groups, choice_result)
         complete &= all(group.get("status") in ("ready", "excluded") for group in groups)
         used_mappings = {key for group in groups for key in group.get("mapping_keys", [])}
         used_dispositions = {key for group in groups for key in group.get("disposition_keys", [])}
@@ -221,10 +224,13 @@ class ParentPackageService:
                 "assembly_mappings": mappings, "conflict_dispositions": dispositions}
         if choice_result is not None:
             failures = [item for item in choice_result["findings"]
-                        if item["code"] in {"SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "CHOICE_ASSEMBLY_FAILED"}
-                        and item.get("raised_by") == "code"]
+                        if item["code"] in PACKAGE_CHOICE_FINDING_CODES and item.get("raised_by") == "code"]
             if failures:
                 body["package_choice_findings"] = failures
+        if linked:
+            # One row per surveyed file for the person's review (round 2); bound by manifest_sha256.
+            body["requested_assemblies"] = choice_result["requested_assemblies"]
+            body["package_files"] = package_file_rows(choice_result)
         return {**body, "manifest_sha256": _hash(body)}
 
     def approve(self, *, plan_id: str, review_manifest_sha256: str,
@@ -1083,3 +1089,84 @@ class ParentPackageService:
     @staticmethod
     def _resolved_prefix(plan_id: str, approval_id: str) -> str:
         return f"packages/{plan_id}/resolved/{approval_id}"
+
+
+# Package-choice warnings shown to the person; any of them stops automatic acceptance.
+PACKAGE_CHOICE_FINDING_CODES = frozenset({
+    "SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "CHOICE_ASSEMBLY_FAILED", "SURVEY_FILES_UNCLASSIFIED",
+    "SURVEY_BOM_NOT_MAPPED", "SURVEY_MAPPING_UNCONFIRMED"})
+
+
+def package_file_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """One row per surveyed file: type, requested-assembly link and the package-choice decision."""
+    by_file = {file_id: item for item in result["documents"] for file_id in item["survey_file_ids"]}
+    rows = []
+    for record in result["survey"]["files"]:
+        document = by_file.get(record["file_id"])
+        link = record.get("requested_assembly")
+        if document is None:
+            decision, reason = "not_parsed", "not_staged" if record["role"] == "bom" else record["role"]
+        elif document["decision"] == "excluded":
+            decision, reason = "excluded", document["reason"]
+        else:
+            decision = "primary" if document["reason"] == "primary" else "process"
+            reason = document["reason"]
+        rows.append({"file_id": record["file_id"], "path": record["path"], "kind": record["kind"],
+                     "role": record["role"],
+                     "classification_status": record.get("classification_status", "classified"),
+                     "requested_assembly_id": None if link is None else link["assembly_id"],
+                     "link": "none" if link is None else link["link"],
+                     "decision": decision, "reason": reason,
+                     "document_id": None if document is None else document["document_id"]})
+    return rows
+
+
+def _link_reason(matched: dict[str, Any]) -> str:
+    if matched["source"] == "path":
+        return f"{matched['text']} found in the file or folder name"
+    return f"{matched['text']} found in sheet {matched['cell']['sheet']}, row {matched['cell']['row']}"
+
+
+def requested_links(groups: list[dict[str, Any]], result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Mark each ready group whose requested assembly is obvious (round 2, D3, Nick 2026-10-10).
+
+    All four must hold: (1) every source document of the group has a confirmed survey link, all to the
+    same requested assembly; (2) the part number read during parsing names no other requested assembly;
+    (3) the parsed revision does not contradict the requested one; (4) no other ready group links to that
+    assembly. Anything else leaves the binding to a person. Same core-number rule as the survey.
+    """
+    from .assembly_core import find_assembly, revision_contradicts
+    requested = {item["assembly_id"]: item for item in result["requested_assemblies"]}
+    documents = {item["document_id"]: item for item in result["documents"]}
+    records = {item["file_id"]: item for item in result["survey"]["files"]}
+    proposed: dict[int, dict[str, Any]] = {}
+    for index, group in enumerate(groups):
+        if group.get("status") != "ready":
+            continue
+        sources = [documents.get(document_id) for document_id in group["document_ids"]]
+        if not sources or any(item is None or not item.get("requested_assembly_ids") for item in sources):
+            continue
+        links = {assembly_id for item in sources for assembly_id in item["requested_assembly_ids"]}
+        if len(links) != 1:
+            continue
+        assembly_id = next(iter(links))
+        identity = group["evidence"]["assembly_identity"]
+        if any(find_assembly(other["part_number"], identity["name"]) is not None
+               for key, other in requested.items() if key != assembly_id):
+            continue
+        if revision_contradicts(requested[assembly_id]["revision"], identity.get("revision")):
+            continue
+        matched = next((records[file_id]["requested_assembly"]["matched"]
+                        for item in sources for file_id in item["survey_file_ids"]
+                        if (records[file_id].get("requested_assembly") or {}).get("link") == "confirmed"
+                        and records[file_id]["requested_assembly"]["assembly_id"] == assembly_id), None)
+        if matched is None:
+            continue
+        proposed[index] = {"assembly_id": assembly_id, "matched_text": matched["text"],
+                           "reason": _link_reason(matched)}
+    counts: dict[str, int] = {}
+    for link in proposed.values():
+        counts[link["assembly_id"]] = counts.get(link["assembly_id"], 0) + 1
+    return [{**group, "evidence": {**group["evidence"], "requested_link": proposed[index]}}
+            if index in proposed and counts[proposed[index]["assembly_id"]] == 1 else group
+            for index, group in enumerate(groups)]

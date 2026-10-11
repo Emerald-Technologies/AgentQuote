@@ -13,13 +13,54 @@ from .package_resolution import ParentPackageService, PackageResolutionError, _h
 
 POLICY = "conflict-free-bom-resolution.v1"
 VERSION = "package-system-acceptance.v1"
+# Round 2 (D3 level 2, Nick 2026-10-10): with requested assemblies, a group may also bind by its
+# obvious requested link; the proof records each binding. v1 proofs stay valid.
+POLICY_V2 = "conflict-free-bom-resolution.v2"
+VERSION_V2 = "package-system-acceptance.v2"
+POLICIES = {VERSION: POLICY, VERSION_V2: POLICY_V2}
 AUTHORITY = "agentquote-bom-qualifier"
 
 
 def system_acceptance_identity(record: dict) -> dict:
-    return {key: record.get(key) for key in (
-        "version", "plan_id", "review_manifest_sha256", "review", "authority",
-        "policy_version", "assembly_identities", "caller_application")}
+    keys = ["version", "plan_id", "review_manifest_sha256", "review", "authority",
+            "policy_version", "assembly_identities", "caller_application"]
+    if record.get("version") == VERSION_V2:
+        keys.append("bindings")
+    return {key: record.get(key) for key in keys}
+
+
+def _identity(name: str, revision: str | None) -> dict:
+    return {"name": name.strip().casefold(), "revision": (revision or "").strip().casefold()}
+
+
+def requested_bindings(groups: list[dict], requested: list[dict], identities: list[dict]) -> list[dict]:
+    """One binding per requested assembly: exact parsed identity, else the group's obvious link.
+
+    The caller's identities must be exactly the plan's requested assemblies; a group with neither
+    an exact identity nor a link, a disagreement between the two, or incomplete or repeated coverage
+    refuses (SYSTEM_ASSEMBLY_COVERAGE_INVALID). Pure.
+    """
+    expected = sorted((_identity(item["part_number"], item["revision"]) for item in requested),
+                      key=lambda item: (item["name"], item["revision"]))
+    if expected != identities:
+        raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
+    bindings = []
+    for group in groups:
+        identity = group["evidence"]["assembly_identity"]
+        parsed = _identity(identity["name"], identity.get("revision", ""))
+        exact = [item["assembly_id"] for item in requested
+                 if _identity(item["part_number"], item["revision"]) == parsed]
+        link = group["evidence"].get("requested_link")
+        if len(exact) == 1 and (link is None or link["assembly_id"] == exact[0]):
+            bindings.append({"assembly_id": exact[0], "group_id": group["group_id"], "mode": "exact"})
+        elif not exact and link is not None:
+            bindings.append({"assembly_id": link["assembly_id"], "group_id": group["group_id"],
+                             "mode": "linked", "reason": link["reason"]})
+        else:
+            raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
+    if sorted(item["assembly_id"] for item in bindings) != sorted(item["assembly_id"] for item in requested):
+        raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
+    return sorted(bindings, key=lambda item: item["assembly_id"])
 
 
 class SystemPackageService(ParentPackageService):
@@ -110,6 +151,7 @@ class SystemPackageService(ParentPackageService):
             raise PackageResolutionError("SYSTEM_REVIEW_NOT_QUALIFIED")
         actual = []
         covered = []
+        ready = []
         for group in review["groups"]:
             if group.get("status") == "excluded" and group.get("kind") == "excluded":
                 # Set aside by a completed package choice that code cross-checked.
@@ -129,17 +171,29 @@ class SystemPackageService(ParentPackageService):
                 raise PackageResolutionError("SYSTEM_REVIEW_REQUIRES_EXCEPTION")
             actual.append(evidence["assembly_identity"])
             covered.extend(group["document_ids"])
+            ready.append(group)
         actual.sort(key=lambda item: (item["name"], item["revision"]))
         plan = self._plan(plan_id)
-        if (actual != identities or len(covered) != len(set(covered))
+        bindings = None
+        if review.get("requested_assemblies") is not None:
+            try:
+                bindings = requested_bindings(ready, review["requested_assemblies"], identities)
+            except PackageResolutionError as exc:
+                if _guard is not None:
+                    _guard.reject(exc)
+                raise
+        if ((bindings is None and actual != identities) or len(covered) != len(set(covered))
                 or sorted(covered) != sorted(item["document_id"] for item in plan["sources"])):
             if _guard is not None:
                 _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
-        body = {"version": VERSION, "plan_id": plan_id,
+        version = VERSION if bindings is None else VERSION_V2
+        body = {"version": version, "plan_id": plan_id,
                 "review_manifest_sha256": review_manifest_sha256, "review": review,
-                "authority": AUTHORITY, "policy_version": POLICY,
+                "authority": AUTHORITY, "policy_version": POLICIES[version],
                 "assembly_identities": identities, "caller_application": caller_application}
+        if bindings is not None:
+            body["bindings"] = bindings
         approval_id = _hash(body)
         now = self.clock()
         if now.tzinfo is None:
@@ -163,10 +217,10 @@ class SystemPackageService(ParentPackageService):
 
     def _bound_approval(self, plan_id: str, approval_id: str) -> dict:
         record = _json(self.storage, self._approval_path(plan_id, approval_id))
-        if record.get("version") != VERSION:
+        if record.get("version") not in POLICIES:
             return super()._bound_approval(plan_id, approval_id)
         body = system_acceptance_identity(record)
-        if (record.get("authority") != AUTHORITY or record.get("policy_version") != POLICY
+        if (record.get("authority") != AUTHORITY or record.get("policy_version") != POLICIES[record["version"]]
                 or record.get("plan_id") != plan_id or record.get("approval_id") != approval_id
                 or _hash(body) != approval_id):
             raise PackageResolutionError("SYSTEM_ACCEPTANCE_BINDING_INVALID")

@@ -47,7 +47,8 @@ from bom_processor import (
 from bom_processor.bom_package_choice import PackageChoicePendingError
 from bom_processor.core import CONTRACT_VERSION
 from bom_processor.master_registry import RegistryError
-from bom_processor.package_system_acceptance import SystemPackageService
+from bom_processor.package_system_acceptance import POLICIES as _SYSTEM_POLICIES, SystemPackageService
+SYSTEM_ACCEPTANCE_VERSIONS = frozenset(_SYSTEM_POLICIES)
 
 log = logging.getLogger("agentquote.deterministic_api")
 ROUTE = "/api/v1/bom/process"
@@ -467,7 +468,7 @@ class PackageApi:
                     if value != {} or approval_id is None:
                         raise ValueError
                     bound = service._bound_approval(plan_id, approval_id)
-                    if (bound.get("version") != "package-system-acceptance.v1"
+                    if (bound.get("version") not in SYSTEM_ACCEPTANCE_VERSIONS
                             or bound.get("caller_application") != next(iter(applications))):
                         raise LookupError("system caller mismatch")
                     return 200, service.resolve(plan_id=plan_id, approval_id=approval_id)
@@ -507,7 +508,7 @@ class PackageApi:
                     **({"caller_application": caller_application} if caller_application is not None else {}), **value)
             if action == "resolve" and approval_id is not None and not value:
                 bound = service._bound_approval(plan_id, approval_id)
-                if bound.get("version") == "package-system-acceptance.v1":
+                if bound.get("version") in SYSTEM_ACCEPTANCE_VERSIONS:
                     raise LookupError("system resolution route required")
                 if caller_application is not None:
                     if bound.get("caller_application") != caller_application or bound.get("approver") != actor:
