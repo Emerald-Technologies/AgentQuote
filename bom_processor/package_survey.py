@@ -38,8 +38,9 @@ FILE_CHAR_LIMIT = 12_000
 CELL_TEXT_LIMIT = 200
 FOLDER_SUMMARY_CHAR_LIMIT = 20_000
 BATCH_CHAR_LIMIT = 60_000
-# The reply holds one record per file; 40 records stay well inside SURVEY_MAX_TOKENS.
-BATCH_FILE_LIMIT = 40
+# The reply holds one record per file. Round 6 (A038): v2 records (link and evidence) made 40-record
+# replies reach SURVEY_MAX_TOKENS and arrive as incomplete JSON; 20 records keep each reply about half.
+BATCH_FILE_LIMIT = 20
 OOXML_ENTRY_LIMIT = 2_000
 OOXML_XML_ENTRY_BYTES = 32 * 1024 * 1024
 OOXML_XML_TOTAL_BYTES = 64 * 1024 * 1024
@@ -530,7 +531,7 @@ SURVEY_INSTRUCTIONS = (
     "one item. value is the text exactly as written in that cell or path, or one whole word or "
     "identifier taken from it (for 'Assembly:123-456' cite only '123-456'). assembly is null or "
     "{name: list of 1 to 5 evidence items, revision: list of 0 to 5 evidence items}, preferred first. "
-    "rationale is at most 500 characters. findings, per file and for the package, are lists of "
+    "rationale is at most 200 characters. findings, per file and for the package, are lists of "
     "{code, severity, rationale}; severity is information, warning or blocking; use blocking only when "
     "no reasonable choice exists. Output JSON only."
 )

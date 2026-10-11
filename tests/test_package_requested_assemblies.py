@@ -339,3 +339,34 @@ def test_a_failed_call_records_its_exception_type_and_a_cut_off_reply_is_named()
     attempts = next(item for item in survey["findings"] if item["code"] == "SURVEY_BATCH_FAILED")["attempt_failures"]
     assert attempts == [{"failure_code": "SURVEY_CALL_FAILED", "file_id": None, "exception_type": "TimeoutError"}] * 2
     assert "private transport detail" not in json.dumps(survey)
+
+
+# --- round 6: shorter survey replies (A038) -------------------------------------------------------
+
+def test_survey_batches_hold_at_most_twenty_files_and_ask_for_short_rationales():
+    from bom_processor.package_survey import BATCH_FILE_LIMIT, PackageFile, build_view, plan_batches
+    files = [PackageFile(("package.zip", f"drawings/D-{n:03}.pdf"), f"{n:064x}", 10, b"%PDF")
+             for n in range(1, 46)]
+    batches = plan_batches(build_view(files, REQUESTED))
+    assert BATCH_FILE_LIMIT == 20 and [len(batch.file_ids) for batch in batches] == [20, 20, 5]
+    assert "rationale is at most 200 characters" in SURVEY_INSTRUCTIONS_V2
+
+
+def test_an_incomplete_json_reply_from_the_model_library_is_named_without_its_text():
+    from bom_processor.package_survey import SurveyError
+    from bom_processor.package_survey_run import foundry_caller
+
+    def factory_raising(error):
+        class Factory:
+            def __init__(self, **_):
+                pass
+
+            async def run(self, *_args, **_kwargs):
+                raise error
+        return Factory
+
+    with pytest.raises(SurveyError, match="SURVEY_REPLY_NOT_JSON") as caught:
+        foundry_caller(agent_factory=factory_raising(ValueError('Response text is not valid JSON: "private reply"')))("i", "t")
+    assert "private reply" not in str(caught.value) and caught.value.__cause__ is None
+    with pytest.raises(ValueError, match="other"):
+        foundry_caller(agent_factory=factory_raising(ValueError("other")))("i", "t")

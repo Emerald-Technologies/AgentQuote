@@ -139,9 +139,16 @@ def foundry_caller(client: Any = None, agent_factory: Any = None) -> Caller:
             if factory is None:
                 from agent_framework import Agent
                 factory = Agent
-            response = await factory(client=client, instructions=instructions, tools=[]).run(
-                user_text, options={"max_tokens": SURVEY_MAX_TOKENS,
-                                    "response_format": dict(SURVEY_RESPONSE_FORMAT)})
+            try:
+                response = await factory(client=client, instructions=instructions, tools=[]).run(
+                    user_text, options={"max_tokens": SURVEY_MAX_TOKENS,
+                                        "response_format": dict(SURVEY_RESPONSE_FORMAT)})
+            except ValueError as exc:
+                # The model library parses JSON-mode replies itself and raises ValueError on an incomplete
+                # reply (A038); named here, and the message (which may quote the reply) is never kept.
+                if "not valid JSON" in str(exc):
+                    raise SurveyError("SURVEY_REPLY_NOT_JSON") from None
+                raise
             # A reply cut off at the output limit is reported as such, not as an unusable call (round 3).
             if str(getattr(response, "finish_reason", "") or "").lower().endswith("length"):
                 raise SurveyError("SURVEY_REPLY_TRUNCATED")
