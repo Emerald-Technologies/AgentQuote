@@ -202,7 +202,7 @@ class ParentPackageService:
                 complete = False
                 projected.update({"status": "pending", "mapping_keys": [], "disposition_keys": []})
             else:
-                candidate_groups = self._candidate_groups(assignment, child["review"], mappings)
+                candidate_groups = self._candidate_groups(assignment, child["review"], mappings, choice_result)
                 groups.extend([{**projected, **item} for item in candidate_groups])
                 complete &= all(item["status"] == "ready" for item in candidate_groups)
                 continue
@@ -762,7 +762,8 @@ class ParentPackageService:
             raise PackageResolutionError("APPROVED_ASSIGNMENT_INVALID")
 
     def _candidate_groups(self, assignment: dict[str, Any], review: dict[str, Any],
-                          mappings: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+                          mappings: dict[str, dict[str, str]],
+                          choice_result: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         request_id = assignment["request_id"]
         candidate_id = review.get("candidate_id")
         validation_id = review.get("validation_id")
@@ -807,7 +808,25 @@ class ParentPackageService:
                 else:
                     facts = self._fixture_semantics(data)
                 claimed = fixture.get("assembly_identity")
-                if facts["assembly"] is None:
+                docs = sorted(str(alias.get("document_id")) for alias in fixture.get("source_aliases", []))
+                # Round 5 (Nick 2026-10-11): with requested assemblies, read identity as a person would:
+                # the BOM's own line naming a requested assembly, else the code-confirmed survey link.
+                requested = (requested_identity(choice_result, docs, self._rows(data), facts["assembly"])
+                             if choice_result is not None and "requested_assemblies" in choice_result else None)
+                if requested is not None:
+                    # The stored claim still has to match what the bytes say before it is replaced.
+                    if facts["assembly"] is None:
+                        if isinstance(claimed, dict) and str(claimed.get("name", "")).strip():
+                            raise PackageResolutionError("PACKAGE_SEMANTIC_BINDING")
+                    elif (not isinstance(claimed, dict)
+                            or AssemblyIdentity(str(claimed.get("name", "")),
+                                                str(claimed.get("revision", ""))).normalized()
+                            != facts["assembly"].normalized()):
+                        raise PackageResolutionError("PACKAGE_SEMANTIC_BINDING")
+                    if key in mappings:
+                        raise PackageResolutionError("PACKAGE_REVIEW_INPUT_INVALID")
+                    identity = requested.normalized()
+                elif facts["assembly"] is None:
                     # Bytes carry no assembly identity: a stored claim is never
                     # a substitute; an explicit mapping is required.
                     if isinstance(claimed, dict) and str(claimed.get("name", "")).strip():
@@ -828,7 +847,6 @@ class ParentPackageService:
                 if (fixture.get("fingerprint") != facts["semantic_fingerprint"]
                         or fixture.get("model_summary") != facts["model_summary"]):
                     raise PackageResolutionError("PACKAGE_SEMANTIC_BINDING")
-                docs = sorted(str(alias.get("document_id")) for alias in fixture.get("source_aliases", []))
                 grouped.setdefault(identity, []).append({"fixture_key": key, "document_ids": docs,
                     "storage": "candidate", "output": fixture["output"],
                         "prefix": candidate_prefix,
@@ -1170,3 +1188,46 @@ def requested_links(groups: list[dict[str, Any]], result: dict[str, Any]) -> lis
     return [{**group, "evidence": {**group["evidence"], "requested_link": proposed[index]}}
             if index in proposed and counts[proposed[index]["assembly_id"]] == 1 else group
             for index, group in enumerate(groups)]
+
+
+def requested_identity(result: dict[str, Any], document_ids: list[str], rows: list[dict[str, Any]],
+                       parsed: Any) -> Any:
+    """The assembly a parsed BOM belongs to, read as a person would (round 5, Nick 2026-10-11).
+
+    1. A parsed line whose part number names a requested assembly (core-number rule), e.g. the
+       Level 0 line of the assembly itself: that line's part number and revision.
+    2. Else the requested assembly every source document is code-confirmed to belong to (file
+       name, folder or title cells, checked by the survey), when the parsed identity names none.
+    None leaves today's behaviour: the parsed identity, or a person's mapping. A BOM whose lines or
+    parsed identity name a different requested assembly than its link is never overridden.
+    """
+    from .assembly_core import find_assembly, revision_contradicts
+    from .semantic import AssemblyIdentity
+    requested = {item["assembly_id"]: item for item in result["requested_assemblies"]}
+    documents = {item["document_id"]: item for item in result["documents"]}
+    sources = [documents.get(document_id) for document_id in document_ids]
+    links = {assembly_id for item in sources if item is not None
+             for assembly_id in item.get("requested_assembly_ids", [])}
+    lines: dict[str, Any] = {}
+    for row in rows:
+        number = str(row.get("item_number") or "").strip()
+        for assembly_id, item in requested.items():
+            if number and find_assembly(item["part_number"], number) is not None:
+                lines.setdefault(assembly_id, AssemblyIdentity(number, str(row.get("revision") or "").strip()))
+    if len(lines) == 1:
+        assembly_id, identity = next(iter(lines.items()))
+        if not links or links == {assembly_id}:
+            return identity
+        return None
+    if lines:
+        return None
+    named = {assembly_id for assembly_id, item in requested.items()
+             if parsed is not None and find_assembly(item["part_number"], parsed.name) is not None}
+    confirmed = len(links) == 1 and all(item is not None and item.get("requested_assembly_ids") for item in sources)
+    if confirmed and not named:
+        item = requested[next(iter(links))]
+        # A clearly different parsed revision is a contradiction a person resolves.
+        if parsed is not None and revision_contradicts(item["revision"], parsed.revision):
+            return None
+        return AssemblyIdentity(item["part_number"], item["revision"] or "")
+    return None

@@ -54,14 +54,17 @@ def _semantic_output(output: bytes, source: bytes, subtype: str, *,
         return {**base, "coverage_basis": "empty_output"}
     placeholders = {_norm(value) for value in _PLACEHOLDERS}
     identities = []
-    for _, row in frame.iterrows():
+    for position, (_, row) in enumerate(frame.iterrows(), 2):
         item, name = _norm(row.get("item_number")), _norm(row.get("item_name"))
         if not item or not name or item in placeholders or name in placeholders:
-            return {**base, "coverage_basis": "identity"}
+            # The output worksheet row (header is row 1), so the rewrite knows which line to fix.
+            return {**base, "coverage_basis": "identity", "failed_output_row": position}
         quantity = row.get("quantity")
         document = _norm(row.get("item_category")) == "DOCUMENT"
-        if not document and (isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(float(quantity)) or quantity <= 0):
-            return {**base, "coverage_basis": "quantity"}
+        # A Part quantity of 0 is valid and kept, e.g. do-not-populate or the assembly's own line, which
+        # is not priced (Nick 2026-10-11); a missing, negative or non-numeric quantity is still refused.
+        if not document and (isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(float(quantity)) or quantity < 0):
+            return {**base, "coverage_basis": "quantity", "failed_output_row": position}
         identities.append({item, name})
     source_rows, coverage_basis = 0, "not_applicable"
     if subtype == "html_table_xls":
@@ -124,7 +127,13 @@ def _semantic_feedback(semantic: dict[str, Any]) -> str:
     accounting = semantic.get("row_accounting")
     if isinstance(accounting, dict) and accounting.get("valid") is False:
         return _row_feedback(accounting)
-    return f"semantic_output_invalid coverage_basis={semantic.get('coverage_basis', 'unknown')}"
+    basis = semantic.get('coverage_basis', 'unknown')
+    row = semantic.get("failed_output_row")
+    rule = {"quantity": "a Part needs a finite quantity of 0 or more (0 is kept); never leave it blank or text",
+            "identity": "every line needs a non-placeholder item_number and item_name"}.get(basis)
+    if isinstance(row, int) and rule:
+        return f"semantic_output_invalid coverage_basis={basis} output_row={row}: {rule}"
+    return f"semantic_output_invalid coverage_basis={basis}"
 
 
 def _row_failure(semantic: dict[str, Any], source_evidence: dict[str, Any]) -> dict[str, Any] | None:

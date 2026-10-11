@@ -132,10 +132,13 @@ def test_review_lists_every_surveyed_file_and_the_obvious_link():
 def test_system_acceptance_binds_an_obvious_link_and_records_it():
     service, plan = linked_package(ONE_ENE)
     review = service.review(plan["plan_id"])
+    # Round 5: the parsed identity (Board) names no requested assembly and the survey link is
+    # confirmed, so the review reads the requested assembly as the identity; it binds exactly.
+    assert ready_group(review)["evidence"]["assembly_identity"]["name"] == "ene010-0810-u2-tk"
     accepted = accept(service, plan, review)
     assert accepted["version"] == VERSION_V2 and accepted["policy_version"] == POLICY_V2
     assert accepted["bindings"] == [{"assembly_id": ENE_ID, "group_id": ready_group(review)["group_id"],
-                                     "mode": "linked", "reason": "ENE010-0810-U2 found in the file or folder name"}]
+                                     "mode": "exact"}]
     resolved = service.resolve(plan_id=plan["plan_id"], approval_id=accepted["approval_id"])
     assert [item["document_ids"] for item in resolved["results"]] == [["doc-1"]]
     # Replays re-verify the v2 proof read-only.
@@ -229,3 +232,58 @@ def test_requested_bindings_refuse_disagreement_and_incomplete_coverage():
                    [_group("g1", ["d1"]), _group("g2", ["d2"])]):
         with pytest.raises(PackageResolutionError, match="SYSTEM_ASSEMBLY_COVERAGE_INVALID"):
             requested_bindings(groups, requested, identities)
+
+
+# --- round 5: identity read as a person would (A037) -------------------------------------------
+
+def _identity_result(links_by_document):
+    return {"requested_assemblies": REQUESTED,
+            "documents": [{"document_id": doc, "requested_assembly_ids": links} for doc, links in links_by_document.items()]}
+
+
+def test_identity_from_the_boms_own_assembly_line():
+    from bom_processor.package_resolution import requested_identity
+    from bom_processor.semantic import AssemblyIdentity
+    rows = [{"item_number": "ENE010-0810-U2-TK", "revision": "V10p1-B", "quantity": 0},
+            {"item_number": "ENE011-0810-00", "revision": "V10p1-A", "quantity": 1}]
+    # A037 ENE: the parsed output names no identity; its Level 0 line names the requested assembly.
+    assert requested_identity(_identity_result({"d1": [ENE_ID]}), ["d1"], rows, None) == \
+        AssemblyIdentity("ENE010-0810-U2-TK", "V10p1-B")
+    # The line alone is enough even without a survey link.
+    assert requested_identity(_identity_result({"d1": []}), ["d1"], rows, None) == \
+        AssemblyIdentity("ENE010-0810-U2-TK", "V10p1-B")
+
+
+def test_identity_from_the_confirmed_link_when_no_line_names_an_assembly():
+    from bom_processor.package_resolution import requested_identity
+    from bom_processor.semantic import AssemblyIdentity
+    rows = [{"item_number": "010-002022-01", "revision": None, "quantity": 0},
+            {"item_number": "500-002022-00", "revision": None, "quantity": 1}]
+    # A037 SNC: the parsed identity is the schematic document number, which names no requested assembly.
+    parsed = AssemblyIdentity("010-002022-01", "")
+    assert requested_identity(_identity_result({"d1": [SNC_ID]}), ["d1"], rows, parsed) == \
+        AssemblyIdentity("SNC006-002022-01-TK", "13")
+
+
+@pytest.mark.parametrize("links, rows, parsed", [
+    # No confirmed link and no line naming an assembly: today's behaviour (parsed or a person).
+    ({"d1": []}, [{"item_number": "500-002022-00"}], None),
+    # A line names a different requested assembly than the link.
+    ({"d1": [SNC_ID]}, [{"item_number": "ENE010-0810-U2-TK"}], None),
+    # Lines name two different requested assemblies.
+    ({"d1": [ENE_ID]}, [{"item_number": "ENE010-0810-U2-TK"}, {"item_number": "SNC006-002022-01-TK"}], None),
+    # The parsed identity names a different requested assembly.
+    ({"d1": [ENE_ID]}, [{"item_number": "P-1"}], "SNC006-002022-01"),
+    # A clearly different parsed revision.
+    ({"d1": [SNC_ID]}, [{"item_number": "P-1"}], ("010-002022-01", "12")),
+    # One of two source documents has no confirmed link.
+    ({"d1": [SNC_ID], "d2": []}, [{"item_number": "P-1"}], None),
+])
+def test_identity_is_left_to_today_s_rules_when_not_obvious(links, rows, parsed):
+    from bom_processor.package_resolution import requested_identity
+    from bom_processor.semantic import AssemblyIdentity
+    if isinstance(parsed, str):
+        parsed = AssemblyIdentity(parsed, "")
+    elif isinstance(parsed, tuple):
+        parsed = AssemblyIdentity(*parsed)
+    assert requested_identity(_identity_result(links), sorted(links), rows, parsed) is None

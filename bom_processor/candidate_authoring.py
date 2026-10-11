@@ -63,7 +63,7 @@ CANONICAL_OUTPUT_RULES = (
     "item_number, item_name, and item_category must be non-empty trimmed strings",
     "map source component taxonomy such as Capacitor, Resistor, or PCB assembly to canonical item_category='Part'; reserve item_category='Document' for document, drawing, or specification rows; do not require the source category to already be Part or Document",
     "item_category must be exactly Part or Document after applying the source taxonomy mapping",
-    "Part quantity must be a finite number; Document quantity is not priced, preserve supplied numeric values or None when absent, never invent a quantity",
+    "Part quantity must be a finite number; a quantity of 0 is valid and kept as 0 (for example do-not-populate or the assembly's own top line), never dropped or changed; Document quantity is not priced, preserve supplied numeric values or None when absent, never invent a quantity",
     "for Document rows, use explicit source labels and row context to put the actual document ID in item_number and its revision in revision; a generic Document reference label is not an identity",
     "overloaded Manufacturer / Document ID and MPN / Revision columns contain document identity and revision on document rows, not manufacturer/MPN pairs; leave all manufacturer fields empty for those rows, preserve description and quantity, and fail on ambiguous roles rather than guess",
     "preserve actual Part quantities and all supplied primary and alternate manufacturer/MPN pairs independently of document references",

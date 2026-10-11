@@ -467,3 +467,14 @@ def test_the_failure_event_carries_cited_fields_apart_from_the_status_contract(m
     assert set(event["row_accounting"]) == {"source_sha256", "error", "failed_row_count", "failed_rows",
                                             "unmapped_columns", "pattern_findings"}
     assert "HTML_TABLE_1!3 bom_notes<-col4" in event["failure_message"]
+
+
+def test_a_zero_part_quantity_is_valid_and_a_bad_one_names_its_row():
+    # Round 5 (Nick 2026-10-11): quantity 0 is kept (do-not-populate, the assembly's own line).
+    from bom_processor.candidate_validation import _semantic_feedback, _semantic_output
+    zero = semantic_workbook([("A-1", "Assembly itself", 0), ("A-2", "Widget B", 2)])
+    assert _semantic_output(zero, b"", "xlsx").get("coverage_basis") != "quantity"
+    negative = semantic_workbook([("A-1", "Widget A", 1), ("A-2", "Widget B", -1)])
+    result = _semantic_output(negative, b"", "xlsx")
+    assert result["coverage_basis"] == "quantity" and result["failed_output_row"] == 3
+    assert "output_row=3" in _semantic_feedback(result) and "0 or more" in _semantic_feedback(result)
