@@ -20,7 +20,8 @@ from row_map_fixtures import attach_row_map
 
 SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.csv"
 # Holds every value workbook() writes, so row accounting (plan 8.8 step 4a) can cite it.
-SOURCE = b"mystery,name,qty\nX,Widget,2\n"
+# A maker pair: a BOM without any manufacturer/MPN pair stops for a person (round 8).
+SOURCE = b"mystery,name,qty,maker,maker part\nX,Widget,2,Acme,A-100\n"
 CODE = b'''import argparse\nparser = argparse.ArgumentParser()\nparser.add_argument("--input", required=True)\nparser.add_argument("--output", required=True)\nparser.add_argument("--row-map", required=True)\nargs = parser.parse_args()\n'''
 NOW = datetime(2026, 9, 21, 3, 0, tzinfo=timezone.utc)
 
@@ -28,7 +29,7 @@ NOW = datetime(2026, 9, 21, 3, 0, tzinfo=timezone.utc)
 def workbook():
     row = {column: None for column in CANONICAL_COLUMNS}
     row.update(line_number=1, item_number="X", item_name="Widget",
-               item_category="Part", quantity=2.0)
+               item_category="Part", quantity=2.0, manufacturer_1="Acme", manufacturer_item_number_1="A-100")
     stream = io.BytesIO()
     pd.DataFrame([row], columns=CANONICAL_COLUMNS).to_excel(stream, index=False)
     return stream.getvalue()
@@ -119,7 +120,7 @@ def test_approved_signature_is_derived_from_candidate_profile_for_same_source():
     # The validated parser read the code-found heading row, so the heading rule is approved.
     assert signature["signature_hash"] == VariantSignature.from_profile(
         request["profile"], heading=True).signature_hash
-    assert signature["required_heading"] == {"Sheet1": ["mystery", "name", "qty"]}
+    assert signature["required_heading"] == {"Sheet1": ["mystery", "name", "qty", "maker", "maker_part"]}
     selected = BlobRegistryReader(storage.download_registry).select(
         "Customer1", "customer-key", SOURCE, ".csv")
     assert selected.variant.signature_hash == signature["signature_hash"]

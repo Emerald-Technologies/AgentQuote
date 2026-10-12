@@ -54,7 +54,8 @@ def test_shared_semantic_facts_count_mpns_without_nan(count):
     assert facts.model_summary["mpn_count"] == count
 
 
-@pytest.mark.parametrize("count", [0, 1, 3, 8])
+# 0 pairs now stops for a person (round 8): tests/test_manufacturer_data_review.py.
+@pytest.mark.parametrize("count", [1, 3, 8])
 def test_validation_status_and_parent_review_share_exact_semantic_facts(count):
     source = b"Part,Qty\nR1,1\n"
     source_path = f"cust/rfq-{RFQ}/package-1/original-boms/doc-1.csv"

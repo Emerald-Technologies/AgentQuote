@@ -59,10 +59,10 @@ def test_row_pair_count_follows_the_widest_line_and_refuses_above_the_maximum():
 def test_output_validation_accepts_a_20_pair_workbook_and_checks_every_pair():
     _validate_xlsx_bytes(workbook([row(pairs=20)], 20), 100)
     _validate_xlsx_bytes(workbook([row(pairs=3)], 8), 100)
-    broken = row(pairs=20)
-    broken["manufacturer_item_number_17"] = None
-    with pytest.raises(ProcessingError, match="manufacturer pair invalid"):
-        _validate_xlsx_bytes(workbook([broken], 20), 100)
+    # A lone half is kept as found (round 8, Nick 2026-10-11), at any pair index.
+    lone = row(pairs=20)
+    lone["manufacturer_item_number_17"] = None
+    _validate_xlsx_bytes(workbook([lone], 20), 100)
     stream = io.BytesIO()
     pd.DataFrame([row(pairs=9)], columns=canonical_columns(9)).drop(columns=["manufacturer_item_number_9"]).to_excel(stream, index=False)
     with pytest.raises(ProcessingError, match="parsed schema invalid"):

@@ -16,13 +16,14 @@ from row_map_fixtures import attach_row_map
 
 SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.csv"
 # Holds every value workbook() writes, so row accounting (plan 8.8 step 4a) can cite it.
-SOURCE = b"mystery,name,qty\nP1,Widget,2\n"
+SOURCE = b"mystery,name,qty,maker,maker part\nP1,Widget,2,Acme,A-100\n"
 HTML_SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.xls"
-HTML_SOURCE = (b"<html><body><table><tr><th>item_number</th><th>item_name</th><th>quantity</th></tr>"
-               b"<tr><td>A-1</td><td>Widget A</td><td>1</td></tr>"
-               b"<tr><td>A-2</td><td>Widget B</td><td>2</td></tr>"
-               b"<tr><td>A-3</td><td>Widget C</td><td>3</td></tr>"
-               b"<tr><td>A-4</td><td>Widget D</td><td>4</td></tr>"
+# Maker columns: a BOM with part lines but no complete manufacturer/MPN pair stops for a person (round 8).
+HTML_SOURCE = (b"<html><body><table><tr><th>item_number</th><th>item_name</th><th>quantity</th><th>maker</th><th>maker part</th></tr>"
+               b"<tr><td>A-1</td><td>Widget A</td><td>1</td><td>Acme</td><td>M-A-1</td></tr>"
+               b"<tr><td>A-2</td><td>Widget B</td><td>2</td><td>Acme</td><td>M-A-2</td></tr>"
+               b"<tr><td>A-3</td><td>Widget C</td><td>3</td><td>Acme</td><td>M-A-3</td></tr>"
+               b"<tr><td>A-4</td><td>Widget D</td><td>4</td><td>Acme</td><td>M-A-4</td></tr>"
                b"</table></body></html>")
 CODE = '''import argparse
 parser = argparse.ArgumentParser()
@@ -38,7 +39,7 @@ def workbook(valid=True):
     row = {column: None for column in columns}
     if valid:
         row.update(line_number=1, item_number="P1", item_name="Widget",
-                   item_category="Part", quantity=2.0)
+                   item_category="Part", quantity=2.0, manufacturer_1="Acme", manufacturer_item_number_1="A-100")
     stream = io.BytesIO()
     pd.DataFrame([row], columns=columns).to_excel(stream, index=False)
     return stream.getvalue()
@@ -49,7 +50,8 @@ def semantic_workbook(rows):
     for line_number, (item_number, item_name, quantity) in enumerate(rows, 1):
         row = {column: None for column in CANONICAL_COLUMNS}
         row.update(line_number=line_number, item_number=item_number, item_name=item_name,
-                   item_category="Part", quantity=quantity)
+                   item_category="Part", quantity=quantity, manufacturer_1="Acme",
+                   manufacturer_item_number_1=f"M-{item_number}")
         values.append(row)
     stream = io.BytesIO()
     pd.DataFrame(values, columns=CANONICAL_COLUMNS).to_excel(stream, index=False)
@@ -236,7 +238,7 @@ def test_worker_output_hash_mismatch_fails_closed():
 def test_grouped_validation_pass_fail_and_existing_result_replay():
     second_path = "customer/rfq-id/package-1/original-boms/doc-2.csv"
     # Same values as SOURCE (the double writes one output for both), different bytes.
-    second = b"mystery,name,qty\nP1,Widget,2\nend of list\n"
+    second = b"mystery,name,qty,maker,maker part\nP1,Widget,2,Acme,A-100\nend of list\n"
     storage = InMemoryStorage(sources={SOURCE_PATH: SOURCE, second_path: second})
     profile = profile_bytes(SOURCE, ".csv")
     request = persist_candidate(storage, "Customer1", "customer-key", profile, ({
@@ -268,7 +270,7 @@ def test_grouped_validation_pass_fail_and_existing_result_replay():
 
 def test_grouped_validation_fails_aggregate_when_one_fixture_fails():
     second_path = "customer/rfq-id/package-1/original-boms/doc-2.csv"
-    second = b"mystery,name,qty\nP1,Widget,2\nend of list\n"
+    second = b"mystery,name,qty,maker,maker part\nP1,Widget,2,Acme,A-100\nend of list\n"
     storage = InMemoryStorage(sources={SOURCE_PATH: SOURCE, second_path: second})
     request = persist_candidate(storage, "Customer1", "customer-key", profile_bytes(SOURCE, ".csv"), ({
         "document_id": "doc1", "blob_path": SOURCE_PATH, "size_bytes": len(SOURCE),

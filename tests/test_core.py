@@ -171,12 +171,17 @@ def test_parser_failure_and_timeout_are_safe(parser, error):
     ({"line_number": 2}, "line numbers"),
     ({"item_name": " Widget"}, "string value"),
     ({"quantity": float("inf")}, "quantity"),
-    ({"manufacturer_1": "Acme"}, "manufacturer pair"),
 ])
 def test_strict_schema_validation(changes, error):
     blob = workbook(**changes)
     with pytest.raises(ProcessingError, match=error):
         BomProcessor(storage(blob)).process(request(blob))
+
+
+def test_a_lone_manufacturer_is_valid_output():
+    # Kept as found, not refused (round 8, Nick 2026-10-11).
+    blob = workbook(manufacturer_1="Acme")
+    BomProcessor(storage(blob)).process(request(blob))
 
 
 def test_existing_conflicting_output_fails_closed():

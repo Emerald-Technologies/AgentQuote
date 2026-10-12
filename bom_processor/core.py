@@ -795,8 +795,6 @@ def _validate_xlsx(path: Path, max_rows: int) -> None:
     quantities = pd.to_numeric(frame.loc[required_quantity, "quantity"], errors="coerce")
     if quantities.isna().any() or not quantities.map(math.isfinite).all():
         raise ProcessingError("quantity invalid")
-    for index in range(1, pair_count + 1):
-        manufacturers = frame[f"manufacturer_{index}"].map(_is_present)
-        part_numbers = frame[f"manufacturer_item_number_{index}"].map(_is_present)
-        if not manufacturers.equals(part_numbers):
-            raise ProcessingError("manufacturer pair invalid")
+    # A pair may hold only a manufacturer or only an MPN: the source row is kept as found, never
+    # dropped or completed (round 8, A040, Nick 2026-10-11). A BOM with part lines but no complete
+    # pair stops for a person in candidate validation instead.

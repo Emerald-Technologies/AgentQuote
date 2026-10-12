@@ -28,8 +28,9 @@ ROW_MAP_RULE = (
     "\"skipped\": [...], \"ignored_columns\": [...]}. Sheet names, rows and columns refer to the --input "
     "workbook (1-based, the row numbers a spreadsheet shows; for HTML tables the n-th table row). "
     "lines has one entry per output data row: {\"output_row\": the output worksheet row number (first data "
-    "row is 2), \"sheet\", \"rows\": every source row that makes this line, including alternate-manufacturer "
-    "rows, \"fields\": {output column name: [source row, source column] of the cell the value came from}}. "
+    "row is 2), \"sheet\", \"rows\": a flat list of the integer row numbers on that sheet that make this "
+    "line, including alternate-manufacturer rows (for example [6] or [6, 7]; the sheet name goes only in "
+    "\"sheet\", never [sheet, row] pairs), \"fields\": {output column name: [source row, source column] of the cell the value came from}}. "
     "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
     "when the value is one separated part of a combined cell; use {\"derived\": reason} only for "
     "unit_of_measure or bom_notes values not copied from one cell. Every listed row must supply at least "
@@ -68,7 +69,12 @@ CANONICAL_OUTPUT_RULES = (
     "overloaded Manufacturer / Document ID and MPN / Revision columns contain document identity and revision on document rows, not manufacturer/MPN pairs; leave all manufacturer fields empty for those rows, preserve description and quantity, and fail on ambiguous roles rather than guess",
     "preserve actual Part quantities and all supplied primary and alternate manufacturer/MPN pairs independently of document references",
     "all populated strings must be trimmed; use None for unavailable optional values",
-    "manufacturer_N and manufacturer_item_number_N must either both be populated or both be empty for every pair N written",
+    # Round 8 (A040, Nick 2026-10-11): the former both-or-neither rule left a real row with one half
+    # no legal output, so the parser crashed on it. A lone half is kept as found.
+    "a source row that gives only a manufacturer or only a manufacturer part number keeps that value in its pair and leaves the other half empty; never fail on it, drop it or invent the missing half",
+    # Round 8 (A040): a parser dropped a 'Manufacturers Part Number' column through a keyword rule.
+    # Header words are clues, not rules (Nick 2026-10-11).
+    "decide each source column's role the way a person would, from its header and its data together; header words are clues, not rules (a 'Manufacturers Part Number' column holds the MPN even though its header contains 'manufacturer'); write the roles you decided into the parser for this layout, for example by the exact header labels you read, never as generic keyword rules that could drop a column you can see",
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
     "read only --input and write only --output and, when given, --row-map; do not access network",

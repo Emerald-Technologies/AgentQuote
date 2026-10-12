@@ -118,6 +118,44 @@ def _assembly_dict(assembly: Any) -> dict[str, str] | None:
     return {"name": name, "revision": revision}
 
 
+# Round 8 (Nick 2026-10-11): part lines but not one complete manufacturer/MPN pair suggests the
+# manufacturer data is missing altogether; a person decides, no automatic attempt follows.
+MANUFACTURER_REVIEW_REASON = "manufacturer_data_review_required"
+
+
+def _manufacturer_pairs(output: bytes) -> tuple[int, int]:
+    """(Part lines, Part lines with at least one pair holding both a manufacturer and an MPN)."""
+    import io
+    import pandas as pd
+    frame = pd.read_excel(io.BytesIO(output), engine="openpyxl", dtype=object)
+    indexes = sorted({int(name.rsplit("_", 1)[1]) for name in map(str, frame.columns)
+                      if re.fullmatch(r"manufacturer_item_number_[1-9][0-9]{0,3}", name)})
+
+    def text(value: Any) -> str:
+        return "" if value is None or (isinstance(value, float) and math.isnan(value)) else str(value).strip()
+
+    parts = complete = 0
+    for _, row in frame.iterrows():
+        if _norm(row.get("item_category")) != "PART":
+            continue
+        parts += 1
+        if any(text(row.get(f"manufacturer_{index}")) and text(row.get(f"manufacturer_item_number_{index}"))
+               for index in indexes):
+            complete += 1
+    return parts, complete
+
+
+def _manufacturer_check(semantic: dict[str, Any], output: bytes) -> tuple[dict[str, Any], str | None]:
+    """A valid result with part lines but no complete pair becomes a person-review stop."""
+    if semantic.get("valid") is not True:
+        return semantic, None
+    parts, complete = _manufacturer_pairs(output)
+    if not parts or complete:
+        return semantic, None
+    return ({**semantic, "valid": False, "result": "manufacturer_data_missing", "coverage_basis": "manufacturer_pairs",
+             "manufacturer_pairs": {"part_lines": parts, "complete_pair_lines": 0}}, MANUFACTURER_REVIEW_REASON)
+
+
 def _semantic_feedback(semantic: dict[str, Any]) -> str:
     roles = semantic.get("document_roles")
     if isinstance(roles, dict) and roles.get("valid") is False:
@@ -127,6 +165,8 @@ def _semantic_feedback(semantic: dict[str, Any]) -> str:
     accounting = semantic.get("row_accounting")
     if isinstance(accounting, dict) and accounting.get("valid") is False:
         return _row_feedback(accounting)
+    if semantic.get("result") == "manufacturer_data_missing":
+        return "manufacturer_data_missing: part lines but no complete manufacturer/MPN pair; a person reviews this BOM"
     basis = semantic.get('coverage_basis', 'unknown')
     row = semantic.get("failed_output_row")
     rule = {"quantity": "a Part needs a finite quantity of 0 or more (0 is kept); never leave it blank or text",
@@ -156,10 +196,29 @@ def _row_fields(semantic: dict[str, Any]) -> list[dict[str, Any]]:
     return list(accounting.get("field_mismatches", []))[:MAX_REFINEMENT_ROWS]
 
 
+# The expected shape for each malformed-row-map code, so a rewrite can correct it (round 8, A040: two
+# attempts repeated [sheet, row] pairs when the feedback only named the code).
+_ROW_MAP_SHAPES = {
+    "ROW_MAP_KEYS_INVALID": "the top level has exactly version, lines, skipped and ignored_columns",
+    "ROW_MAP_LINES_INVALID": "lines is a non-empty list with one entry per output data row",
+    "ROW_MAP_LINE_INVALID": "each line has exactly output_row, sheet, rows and fields",
+    "ROW_MAP_OUTPUT_ROW_INVALID": "output_row is the output worksheet row number (first data row is 2), each used once",
+    "ROW_MAP_SHEET_INVALID": "sheet is the exact name of a worksheet in --input",
+    "ROW_MAP_ROWS_INVALID": "rows is a flat list of distinct integer row numbers on that line's sheet, for example [6] or [6, 7]; never [sheet, row] pairs",
+    "ROW_MAP_FIELDS_INVALID": "fields uses only output column names other than line_number and item_category",
+    "ROW_MAP_LINK_INVALID": "each field link is [row, column], [row, column, \"part\"] with integers from 1, or {\"derived\": reason}",
+    "ROW_MAP_OUTPUT_COVERAGE_INVALID": "every output data row appears in exactly one line",
+    "ROW_MAP_SKIP_INVALID": "each skipped entry has sheet, rows as [[first, last], ...] integer ranges, reason and rationale",
+    "ROW_MAP_IGNORED_INVALID": "each ignored_columns entry has sheet, an integer column from 1 and a reason, each column once",
+}
+
+
 def _row_feedback(accounting: dict[str, Any]) -> str:
     """Bounded locations and codes only; the author re-reads values from the source itself."""
     if "error" in accounting:
-        return f"row_map_invalid:{accounting['error']}; write --row-map as the bom-row-map.v1 rule describes"
+        shape = _ROW_MAP_SHAPES.get(accounting["error"])
+        return (f"row_map_invalid:{accounting['error']}; " + (f"{shape}; " if shape else "")
+                + "write --row-map as the bom-row-map.v1 rule describes")
     rows = "; ".join(f"{item['sheet']}!{item['row']}:{item['code']}" for item in accounting.get("failed_rows", [])[:20])
     cited = ", ".join(f"{item['sheet']}!{item['row']} {item['field']}<-col{item['column']}{' part' if item['part'] else ''}"
                       for item in accounting.get("field_mismatches", [])[:10])
@@ -387,6 +446,9 @@ class CandidateValidationService:
                             "coverage_basis": "semantic_validation_failed"}
         if schema_valid and self.row_map_required:
             semantic = self._with_row_accounting(semantic, source, source_evidence, item, output, worker)
+        review_reason = None
+        if schema_valid:
+            semantic, review_reason = _manufacturer_check(semantic, output)
         validation_valid = schema_valid and semantic["valid"] is True
         arena_evidence = None
         if (schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls"
@@ -459,7 +521,7 @@ class CandidateValidationService:
                 {"error_type": "SemanticError",
                  "error_message": _semantic_feedback(semantic)},
                 row_accounting=_row_failure(semantic, source_evidence),
-                row_accounting_fields=_row_fields(semantic))
+                row_accounting_fields=_row_fields(semantic), review_reason=review_reason)
             failure = CandidateValidationError("SEMANTIC_INVALID")
             failure.feedback_recorded = recorded
             raise failure
@@ -512,6 +574,9 @@ class CandidateValidationService:
                     infer_document_assembly=association is None) if schema_valid else {"valid": False, "result": "schema_invalid"}
                 if schema_valid and self.row_map_required:
                     semantic = self._with_row_accounting(semantic, source, source_evidence, item, output, worker)
+                review_reason = None
+                if schema_valid:
+                    semantic, review_reason = _manufacturer_check(semantic, output)
                 policy = None
                 if schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls" and is_arena_source(source):
                     policy = validate_arena(source, output, source_sha256=source_evidence["sha256"].lower(),
@@ -529,9 +594,11 @@ class CandidateValidationService:
                     if rows is not None:
                         record["row_accounting_failure"] = rows
                     record["failure"] = {"code": "SCHEMA_INVALID" if not schema_valid else "SEMANTIC_INVALID",
-                                         "repairable": True,
+                                         "repairable": review_reason is None,
                                          "classification": {"error_type": "ValidationError",
                                              "error_message": "output schema invalid" if not schema_valid else _semantic_feedback(semantic)}}
+                    if review_reason is not None:
+                        record["failure"]["review_reason"] = review_reason
             except Exception as exc:
                 all_valid = False
                 code_value = exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"
@@ -863,6 +930,9 @@ class CandidateValidationService:
              "error_code": "GROUP_VALIDATION_FAILED", "failure": "GroupedValidationError",
              "failure_message": " | ".join(messages)[:500], "repairable": repairable,
              "fixtures": failures}
+        reasons = sorted({failure["review_reason"] for failure in failures if failure.get("review_reason")})
+        if reasons:
+            event["review_reason"] = reasons[0]
         rows = [fixture["row_accounting_failure"] for fixture in evidence["fixtures"]
                 if isinstance(fixture.get("row_accounting_failure"), dict)]
         if rows:
@@ -881,7 +951,8 @@ class CandidateValidationService:
                                        error_code: str,
                                        classification: dict[str, str] | None,
                                        row_accounting: dict[str, Any] | None = None,
-                                       row_accounting_fields: list[dict[str, Any]] | None = None) -> bool:
+                                       row_accounting_fields: list[dict[str, Any]] | None = None,
+                                       review_reason: str | None = None) -> bool:
         """Persist an immutable validation-failed event for the refinement loop.
 
         Best effort: a failure to write the event must not mask the original
@@ -891,7 +962,9 @@ class CandidateValidationService:
             event = {
                 "version": VALIDATION_VERSION,
                 "failure_feedback_policy": FAILURE_FEEDBACK_POLICY,
-                "repairable": error_code in {"WORKER_PARSER_FAILED", "SCHEMA_INVALID", "SEMANTIC_INVALID"},
+                # A person-review stop (round 8) is not repaired by another automatic attempt.
+                "repairable": review_reason is None and error_code in {"WORKER_PARSER_FAILED", "SCHEMA_INVALID", "SEMANTIC_INVALID"},
+                **({"review_reason": review_reason} if review_reason is not None else {}),
                 "event": "candidate.validation_failed",
                 "request_id": self.request_id,
                 "candidate_id": self.candidate_id,

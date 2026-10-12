@@ -142,8 +142,9 @@ def test_validated_heading_requires_every_validated_file_to_agree():
 
 # End to end: a parser approved for one assembly's BOM is selected for the next assembly's BOM.
 SOURCE_PATH = "customer/rfq-id/package-1/original-boms/doc.csv"
-SOURCE = b"Assembly A-100\nmystery,name,qty\nX,Widget,2\n"
-NEXT = b"Assembly B-200\nmystery,name,qty\nY,Gadget,5\nZ,Sprocket,1\n"
+# Maker pairs: a BOM without any manufacturer/MPN pair stops for a person (round 8).
+SOURCE = b"Assembly A-100\nmystery,name,qty,maker,maker part\nX,Widget,2,Acme,A-100\n"
+NEXT = b"Assembly B-200\nmystery,name,qty,maker,maker part\nY,Gadget,5,Acme,G-5\nZ,Sprocket,1,Acme,S-1\n"
 CODE = b'''import argparse\nparser = argparse.ArgumentParser()\nparser.add_argument("--input", required=True)\nparser.add_argument("--output", required=True)\nparser.add_argument("--row-map", required=True)\nargs = parser.parse_args()\n'''
 NOW = datetime(2026, 10, 9, 3, 0, tzinfo=timezone.utc)
 
@@ -161,7 +162,8 @@ class Worker:
 
     def start(self, item):
         row = {column: None for column in CANONICAL_COLUMNS}
-        row.update(line_number=1, item_number="X", item_name="Widget", item_category="Part", quantity=2.0)
+        row.update(line_number=1, item_number="X", item_name="Widget", item_category="Part", quantity=2.0,
+                   manufacturer_1="Acme", manufacturer_item_number_1="A-100")
         stream = io.BytesIO()
         pd.DataFrame([row], columns=CANONICAL_COLUMNS).to_excel(stream, index=False)
         output = stream.getvalue()
@@ -200,7 +202,7 @@ def approve(header_row):
 def test_parser_approved_for_one_assembly_is_selected_for_the_next_assemblys_bom():
     storage = approve(header_row=2)
     signature = json.loads(storage.registry["approved/Customer1/mystery-csv/1/signature.json"])
-    assert signature["required_heading"] == {"Sheet1": ["mystery", "name", "qty"]}
+    assert signature["required_heading"] == {"Sheet1": ["mystery", "name", "qty", "maker", "maker_part"]}
     selected = BlobRegistryReader(storage.download_registry).select("Customer1", "customer-key", NEXT, ".csv")
     assert selected.variant.variant_id == "mystery-csv"
 

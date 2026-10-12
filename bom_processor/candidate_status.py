@@ -243,7 +243,10 @@ class CandidateStatusService:
                             result["automation_error"] = outcome
                             result["row_accounting"] = failure_event["row_accounting"]
                     elif failure_event is not None:
-                        result["automation_error"] = "validation_failure_requires_review"
+                        # Round 8: a BOM without any manufacturer/MPN pair is named, not a generic stop.
+                        reason = failure_event.get("review_reason")
+                        result["automation_error"] = (reason if reason == "manufacturer_data_review_required"
+                                                      else "validation_failure_requires_review")
                 except Exception:
                     result.setdefault("automation_error", "author_refinement_start_failed")
         return result
