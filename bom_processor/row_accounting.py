@@ -173,6 +173,8 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
     # Which output field cited which source column on a mismatched row (round 4, A037): locations
     # and field names only, so the refinement can say what to correct without customer values.
     mismatches: list[dict[str, Any]] = []
+    # Output fields written without a link, per line (round 11, A043: the rewrite saw only the row).
+    unlinked: list[dict[str, Any]] = []
 
     def fail(key: tuple[str, int], code: str) -> None:
         failed.setdefault(key, code)
@@ -210,8 +212,12 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 fail(key, "ROW_IN_TWO_LINES")
             else:
                 owner[key] = out
-        if output_fields.get(out, set()) - set(fields):
+        missing = output_fields.get(out, set()) - set(fields)
+        if missing:
             fail(first, "FIELD_NOT_LINKED")
+            for field in sorted(missing):
+                if len(unlinked) < MAX_RECORDED_MISMATCHES:
+                    unlinked.append({"sheet": first[0], "row": first[1], "field": field})
         contributed: set[int] = set()
         for field, link in fields.items():
             target = parsed.cells.get((out_sheet, out, columns.index(field) + 1))
@@ -290,9 +296,12 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
             continue
         names = [part for part in _PARTS.split(_text(original.cells[(sheet, row, mfr)])) if part]
         codes = [part for part in _PARTS.split(_text(original.cells[(sheet, row, mpn)])) if part]
-        if len(names) != len(codes):
+        # One maker with several part numbers is one pair per part number, as a person reads it
+        # (round 11, A043 row 81: "NICHTEK" with "PDCQ580JB-SMB, PDCQ580JU-SMB").
+        single_maker = len(names) == 1 and len(codes) > 1
+        if len(names) != len(codes) and not single_maker:
             fail((sheet, row), "COMBINED_PAIR_COUNT_MISMATCH")
-        elif part_links[(sheet, row, mfr)] != len(names) or part_links[(sheet, row, mpn)] != len(codes):
+        elif part_links[(sheet, row, mpn)] != len(codes) or (not single_maker and part_links[(sheet, row, mfr)] != len(names)):
             fail((sheet, row), "COMBINED_PART_NOT_CARRIED")
 
     skipped = proposal["skipped"]
@@ -373,6 +382,7 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                         for (sheet, row), code in recorded[:MAX_RECORDED_ROWS]],
         "failure_codes": dict(sorted(Counter(code for code in failed.values()).items())),
         "field_mismatches": mismatches,
+        "unlinked_fields": unlinked,
         "unmapped_columns": [{"sheet": sheet, "column": column}
                              for sheet, column in unmapped[:MAX_RECORDED_COLUMNS]],
         "ignored_but_used_columns": [{"sheet": sheet, "column": column}

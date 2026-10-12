@@ -31,7 +31,11 @@ def failed_row_excerpt(source: bytes, extension: str, failure: dict[str, Any],
     previous row map cited, shown as "cited" so the parser can see which link to correct.
     """
     cited: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    unlinked: dict[tuple[str, int], list[str]] = {}
     for item in fields or []:
+        if item.get("unlinked"):
+            unlinked.setdefault((item["sheet"], item["row"]), []).append(item["field"])
+            continue
         cited.setdefault((item["sheet"], item["row"]), []).append(
             {"field": item["field"], "column": item["column"], "part": bool(item["part"])})
     inventory = source_inventory(source, extension)
@@ -52,6 +56,8 @@ def failed_row_excerpt(source: bytes, extension: str, failure: dict[str, Any],
                  "cells": by_row.get(key, [])}
         if key in cited:
             entry["cited"] = cited[key]
+        if key in unlinked:
+            entry["unlinked"] = unlinked[key]
         cost = len(json.dumps(entry, ensure_ascii=False))
         if size + cost > MAX_EXCERPT_CHARS:
             truncated = True
@@ -69,7 +75,9 @@ def refinement_instructions(excerpt: dict[str, Any], round_number: int, rounds: 
             "sheet, the 1-based row, the failure code and that row's cells as [column, value]; "
             "context_row_above rows are supplied only so an alternate row can find its parent. Codes: "
             "ROW_UNACCOUNTED (row neither in a line nor skipped), ROW_IN_TWO_LINES, ROW_IN_LINE_AND_SKIPPED, "
-            "ROW_CONTRIBUTES_NOTHING (listed in a line but no value cited from it), FIELD_NOT_LINKED, "
+            "ROW_CONTRIBUTES_NOTHING (listed in a line but no value cited from it), FIELD_NOT_LINKED (unlinked lists "
+            "the output fields the parser wrote for this line with no link: cite the source cell each value came "
+            "from, or {\"derived\": reason} for a unit_of_measure or bom_notes value not copied from one cell), "
             "FIELD_VALUE_MISMATCH (cited cell does not hold the output value; cited lists each output field and "
             "the source column your row map gave for it, so compare that column's value in cells with what "
             "the parser wrote: cite the column that holds the value, or {\"derived\": reason} for a value the "

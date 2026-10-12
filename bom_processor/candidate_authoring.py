@@ -76,6 +76,8 @@ CANONICAL_OUTPUT_RULES = (
     "a source row that gives only a manufacturer or only a manufacturer part number keeps that value in its pair and leaves the other half empty; never fail on it, drop it or invent the missing half",
     # Round 8 (A040): a parser dropped a 'Manufacturers Part Number' column through a keyword rule.
     # Header words are clues, not rules (Nick 2026-10-11).
+    # Round 11 (A043): one maker with several part numbers in one cell, and commas inside names.
+    "one manufacturer with several part numbers in one cell gives one pair per part number, each with that manufacturer; separators such as commas are clues, not rules: a comma inside a company name (', Inc.') or inside a part number ('BAS21,235') does not split it",
     "decide each source column's role the way a person would, from its header and its data together; header words are clues, not rules (a 'Manufacturers Part Number' column holds the MPN even though its header contains 'manufacturer'); write the roles you decided into the parser for this layout, for example by the exact header labels you read, never as generic keyword rules that could drop a column you can see",
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not

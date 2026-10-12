@@ -189,11 +189,13 @@ def _row_failure(semantic: dict[str, Any], source_evidence: dict[str, Any]) -> d
 
 
 def _row_fields(semantic: dict[str, Any]) -> list[dict[str, Any]]:
-    """Cited field and column per mismatched row (round 4), kept apart from the status contract."""
+    """Cited field and column per mismatched row (round 4) and each unlinked field (round 11), kept apart
+    from the status contract."""
     accounting = semantic.get("row_accounting")
     if not isinstance(accounting, dict) or accounting.get("valid") is not False:
         return []
-    return list(accounting.get("field_mismatches", []))[:MAX_REFINEMENT_ROWS]
+    unlinked = [{**item, "column": None, "part": False, "unlinked": True} for item in accounting.get("unlinked_fields", [])]
+    return (list(accounting.get("field_mismatches", [])) + unlinked)[:MAX_REFINEMENT_ROWS]
 
 
 # The expected shape for each malformed-row-map code, so a rewrite can correct it (round 8, A040: two
@@ -222,6 +224,7 @@ def _row_feedback(accounting: dict[str, Any]) -> str:
     rows = "; ".join(f"{item['sheet']}!{item['row']}:{item['code']}" for item in accounting.get("failed_rows", [])[:20])
     cited = ", ".join(f"{item['sheet']}!{item['row']} {item['field']}<-col{item['column']}{' part' if item['part'] else ''}"
                       for item in accounting.get("field_mismatches", [])[:10])
+    unlinked = ", ".join(f"{item['sheet']}!{item['row']} {item['field']}" for item in accounting.get("unlinked_fields", [])[:10])
     columns = ", ".join(f"{item['sheet']}!col{item['column']}" for item in accounting.get("unmapped_columns", [])[:10])
     pattern = ", ".join(f"{item['sheet']}!col{item['column']}:{item['code']}"
                         for item in accounting.get("pattern_findings", [])[:10])
@@ -232,6 +235,8 @@ def _row_feedback(accounting: dict[str, Any]) -> str:
         parts.append(f"failed rows: {rows}")
     if cited:
         parts.append(f"cited cells that do not hold the written value (field<-column): {cited}")
+    if unlinked:
+        parts.append(f"output fields written without a link (link the source cell, or derived for unit_of_measure/bom_notes): {unlinked}")
     if columns:
         parts.append(f"unmapped columns with data in BOM lines: {columns}")
     return "; ".join(parts)
@@ -913,6 +918,11 @@ class CandidateValidationService:
             if re.search(r"(?i)\b(?:authorization|bearer|password|secret|token|api[_-]?key|sig)[\"']?\s*(?::|=|\s)", message):
                 message = "sensitive feedback withheld"
             message = " ".join(message.split())
+            if len(message) > 500:
+                # Keep the final error line (round 11, A043: the cut after the traceback header hid it).
+                error = re.findall(r"\b[A-Z][A-Za-z]*(?:Error|Exception|Exit)\b:?[^|]*$", message)
+                head = (error[-1].strip()[:200] + " | ") if error else ""
+                message = head + "..." + message[-(497 - len(head)):]
             return {"error_type": classification["error_type"], "error_message": message[:500]}
         return None
 
