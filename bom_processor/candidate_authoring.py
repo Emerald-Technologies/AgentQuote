@@ -41,7 +41,8 @@ ROW_MAP_RULE = (
     "several values separated by delimiters. skipped "
     "lists every other non-empty source row: {\"sheet\", \"rows\": [[first, last], ...], \"reason\": one of header, "
     "title, blank, total, note, section, signature, other_sheet, other, \"rationale\"}. ignored_columns lists "
-    "every source column holding data in BOM lines that feeds no output field: {\"sheet\", \"column\", \"reason\"}. "
+    "every source column holding data in BOM lines that no linked output field cites, including a column the "
+    "parser only reads to decide item_category or which rows to keep: {\"sheet\", \"column\", \"reason\"}. "
     "Build the row map from the same reading that writes the output; validation checks it against every "
     "row of the source and reports each unaccounted, double-counted or mis-cited row by location, so do not "
     "check row accounting yourself or stop over it"
@@ -80,6 +81,8 @@ CANONICAL_OUTPUT_RULES = (
     # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not
     # accounted for", "Missing item name"); a crash gives the next attempt only an error line, while
     # written output lets validation name the exact rows to fix.
+    # Round 10 (A042): a correct parser took 76 s on a 28 KB BOM and was stopped at the worker's limit.
+    "the parser must finish within a few seconds: read each sheet once (for example iter_rows(values_only=True)) and never call worksheet.cell inside loops over every row and column",
     "never stop on a row or value you are unsure about, such as a row you cannot place, a missing name or an unexpected column: write your best reading of every row with the row map, because validation then names the exact rows to correct; a row that only adds to the line above (an alternate manufacturer, a continued description) belongs to that line's rows; raise only when the input cannot be opened or holds no BOM table",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
     "read only --input and write only --output and, when given, --row-map; do not access network",

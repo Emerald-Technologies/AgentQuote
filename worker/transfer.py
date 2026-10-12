@@ -63,6 +63,25 @@ def _failure_classification(exc: BaseException, *, detail: str = "") -> dict[str
     }
 
 
+def _stop_reason(run_result: dict) -> str:
+    """Why the runtime stopped the parser, in words a rewrite can act on (round 9 retest, A042).
+
+    A parser stopped by the time limit leaves no traceback, so before this the feedback said only
+    "parser failed" and every rewrite repeated the same slow reading.
+    """
+    from .runtime import Limits
+    seconds = int(Limits().timeout_seconds)
+    failure, exit_code = run_result.get("failure"), run_result.get("exit_code")
+    if failure == "timeout" or (failure == "parser_exit" and isinstance(exit_code, int) and exit_code < 0
+                                and not run_result.get("stderr_tail")):
+        return (f"the parser was stopped at the {seconds}-second time limit; read each sheet once "
+                "(for example iter_rows(values_only=True)) and never call worksheet.cell in loops over every row and column")
+    return {"log_limit": "the parser wrote more than the log limit to stdout/stderr",
+            "output_limit": "the parser output exceeded the output size limit",
+            "row_map_limit": "the row map exceeded its size limit",
+            "invalid_output": "the parser exited without writing the output workbook"}.get(str(failure), "")
+
+
 def _input_format_hint(input_bytes: bytes, input_name: str) -> str:
     """Bounded format hint derived from the input's magic bytes.
 
@@ -177,7 +196,7 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         if code != 0 or output is None:
             stderr_tail = str(run_result.get("stderr_tail") or "")
             format_hint = _input_format_hint(source, input_name)
-            detail = " ".join(part for part in (format_hint, stderr_tail) if part)
+            detail = " ".join(part for part in (_stop_reason(run_result), format_hint, stderr_tail) if part)
             raise RuntimeError(f"parser failed{(' | ' + detail) if detail else ''}")
         sidecar = None
         if interpretation_enabled:
