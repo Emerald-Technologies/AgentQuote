@@ -29,7 +29,8 @@ def failed_refinement():
 def test_recovery_consumes_next_slot_and_preserves_prior_bytes():
     storage, budget, authorization = failed_refinement()
     before = dict(storage.registry)
-    assert budget.reserve("author-refinement", "original-candidate", "b" * 64)["reason"] == "budget_no_progress"
+    # Since round 12 (Nick 2026-10-12) polling may also retry a fix that died without a parser; the
+    # authorized recovery below remains the explicit path and is checked on its own here.
     claim = reserve_recovery(budget, authorization)
     assert claim["status"] == "reserved" and claim["slot"] == 3
     assert all(storage.registry[path] == value for path, value in before.items())

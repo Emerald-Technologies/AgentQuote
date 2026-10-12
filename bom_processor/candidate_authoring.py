@@ -53,7 +53,15 @@ EXCEPTION_POLICY_RULE = (
 # Enforced by _validate_code (rule html_xls_banned_workbook_api) for every source type; the A035
 # author broke it unseen (round 2, item 4). read_excel is banned only for html_table_xls sources.
 BANNED_CALL_RULE = (
-    "never call eval, exec, compile, os.system, popen or pandas.read_html, for any source type"
+    "never call the built-in eval, exec or compile, os.system, popen or pandas.read_html, for any source type "
+    "(module functions with those names, such as re.compile, are fine)"
+)
+# Round 12 (A044): a rewrite refused by the code policy produced no parser, and the retry is told why.
+POLICY_RETRY_RULE = (
+    "IMPORTANT: the previous rewrite of this parser was refused by the code policy before it could run; "
+    "follow every import and call rule exactly: import only standard parsing modules, pandas and openpyxl "
+    "(never socket, requests, urllib, http, ftplib, smtplib, telnetlib, subprocess, os, ctypes, cffi, importlib, "
+    "builtins or multiprocessing), never call the built-in eval, exec or compile, and never use a broad except"
 )
 HTML_XLS_WORKBOOK_RULE = (
     "for source_subtype html_table_xls, never call pandas.read_excel or open the file as a workbook; "
@@ -212,10 +220,10 @@ def _validate_code(code: str, source_subtype: str = "") -> bytes:
             if root in _BANNED_MODULES:
                 raise _policy("banned_import")
         elif isinstance(node, ast.Call):
-            name = node.func.id if isinstance(node.func, ast.Name) else (
-                node.func.attr if isinstance(node.func, ast.Attribute) else "")
-            if name in _BANNED_NAMES or (isinstance(node.func, ast.Attribute) and
-                                         node.func.attr in {"system", "popen", "read_html"}):
+            # Only the built-ins are banned by name: re.compile and similar module functions are
+            # ordinary parsing tools (round 12, A044: a rewrite using re.compile was refused).
+            if (isinstance(node.func, ast.Name) and node.func.id in _BANNED_NAMES) or (
+                    isinstance(node.func, ast.Attribute) and node.func.attr in {"system", "popen", "read_html"}):
                 raise _policy("html_xls_banned_workbook_api")
             if source_subtype == "html_table_xls" and isinstance(node.func, ast.Attribute) and node.func.attr == "read_excel":
                 raise _policy("html_xls_banned_workbook_api")
@@ -230,7 +238,7 @@ def _validate_code(code: str, source_subtype: str = "") -> bytes:
 class CandidateAuthoringService:
     def __init__(self, request_id: str, storage: Any, model: ModelAuthor,
                  feedback: str | None = None, *, source_associations: bool = False,
-                 refine: tuple[str, str] | None = None):
+                 refine: tuple[str, str] | None = None, policy_retry: bool = False):
         if not isinstance(request_id, str) or not _ID.fullmatch(request_id):
             raise AuthoringError("INVALID_REQUEST_ID")
         self.request_id, self.storage, self.model = request_id, storage, model
@@ -244,6 +252,9 @@ class CandidateAuthoringService:
                                        and all(isinstance(v, str) and _ID.fullmatch(v) for v in refine)):
             raise AuthoringError("INVALID_REFINEMENT")
         self.refine = refine
+        if type(policy_retry) is not bool:
+            raise ValueError("invalid policy retry flag")
+        self.policy_retry = policy_retry
 
     def _row_refinement(self, fixtures: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Prior code plus the pinned row-accounting failure; refuses anything unbound."""
@@ -310,6 +321,8 @@ class CandidateAuthoringService:
         if request["profile"].get("source_subtype") == "html_table_xls":
             rules += HTML_XLS_RULES
         row_refinement = self._row_refinement(fixtures)
+        if self.policy_retry:
+            rules = rules + (POLICY_RETRY_RULE,)
         if row_refinement is not None:
             # Row-accounting failure, or (round 9) a parser crash: fixed from the prior code.
             rules = rules + (row_refinement["instructions"],)

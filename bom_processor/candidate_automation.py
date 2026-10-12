@@ -450,6 +450,10 @@ class CandidateAutomationService:
             except Exception:
                 return "budget_invalid"
         failure_hash = _sha256(_json_bytes(failure_event)) if phase == "author-refinement" else None
+        try:
+            policy_retry = phase == "author-refinement" and budget.failed_tries(phase, candidate_id, failure_hash) > 0
+        except Exception:
+            policy_retry = False
         reservation = budget.reserve(phase, candidate_id, failure_hash)
         if reservation["status"] != "reserved":
             return reservation["reason"]
@@ -480,6 +484,8 @@ class CandidateAutomationService:
             values["AUTHOR_FEEDBACK"] = (f"Previous parser failed with {failure_event.get('failure') or failure_event.get('error_code')}: "
                                         f"{failure_event.get('failure_message') or ''}")[:1000]
             values.update(self._row_refinement_values(candidate_id, failure_event))
+        if policy_retry:
+            values["AUTHOR_POLICY_RETRY"] = "true"
         try:
             budget.mark_dispatch(reservation)
         except Exception:

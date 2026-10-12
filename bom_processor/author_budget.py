@@ -489,6 +489,21 @@ class Budget:
                 selected = terminal["candidate_id"]
         return selected
 
+    def failed_tries(self, phase: str, source_candidate: str | None, failure_hash: str | None) -> int:
+        """Earlier tries of this exact fix that ended failed without a parser (round 12)."""
+        binding = _membership(self.storage, self.request_id)
+        if binding is None:
+            return 0
+        count = 0
+        for slot in range(1, LIMIT + 1):
+            claim = _read(self.storage, _slot_path(binding[0]["group_id"], slot, "claim"))
+            terminal = _read(self.storage, _slot_path(binding[0]["group_id"], slot, "terminal"))
+            if (claim is not None and claim.get("request_id") == self.request_id and claim.get("phase") == phase
+                    and claim.get("source_candidate") == source_candidate and claim.get("failure_hash") == failure_hash
+                    and terminal is not None and terminal.get("state") == "failed"):
+                count += 1
+        return count
+
     def reserve(self, phase: str, source_candidate: str | None = None,
                 failure_hash: str | None = None) -> dict[str, Any]:
         try:
@@ -514,9 +529,13 @@ class Budget:
                     continue
                 if terminal is not None and terminal["state"] == "completed":
                     selected = terminal["candidate_id"]
+                # A repeat of the same fix is refused, unless the earlier try died before producing a
+                # parser (refused code, failed model call): that try is counted and may be retried
+                # within the limit (round 12, A044 stalled for 8 hours on one refused rewrite).
                 repeated_intent |= (phase == "author-refinement" and prior["phase"] == phase
                                     and prior["source_candidate"] == source_candidate
-                                    and prior["failure_hash"] == failure_hash)
+                                    and prior["failure_hash"] == failure_hash
+                                    and (terminal is None or terminal["state"] != "failed"))
             if ((phase == "author" and selected is not None)
                     or (phase == "author-refinement" and selected != source_candidate)
                     or repeated_intent):

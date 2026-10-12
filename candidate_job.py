@@ -75,6 +75,9 @@ def main() -> int:
         if any(refine_ids) and not all(refine_ids):
             raise ValueError("invalid author refinement environment")
         extra = {"refine": refine_ids} if all(refine_ids) else {}
+        # Round 12: an earlier try of this same fix was refused by the code policy.
+        if os.environ.get("AUTHOR_POLICY_RETRY") == "true":
+            extra["policy_retry"] = True
         # Only pass the feedback keyword when present so older injected doubles
         # that do not accept it continue to work unchanged.
         result = (CandidateAuthoringService(request_id, storage, create_foundry_author(), feedback=feedback,
