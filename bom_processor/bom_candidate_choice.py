@@ -324,6 +324,25 @@ CHOICE_INSTRUCTIONS = (
 Caller = Callable[[str, str], Any]
 
 
+def _alnum(value: Any) -> str:
+    return "".join(character for character in str(value or "").lower() if character.isalnum())
+
+
+def confirmed_by_revision(choice: dict[str, Any], revision: str | None) -> bool:
+    """True when the chosen primary is the only candidate whose own evidence carries the requested revision.
+
+    Round 13 (A044, Nick 2026-10-12): a person reads "MOD BOM ... REV V10p1-B" against a request for
+    V10p1-B and knows which BOM is current. Only distinctive revisions count (at least four letters and
+    digits, mixing both), so short ones such as "13" or "A" never decide on their own.
+    """
+    key = _alnum(revision)
+    if len(key) < 4 or not any(c.isdigit() for c in key) or not any(c.isalpha() for c in key):
+        return False
+    carriers = [item["file_id"] for item in choice["files"]
+                if key in _alnum(item["path"]) or any(key in _alnum(cited.get("value")) for cited in item["evidence"])]
+    return carriers == [choice["primary"]]
+
+
 def run_choice(view: CandidateView, call: Caller) -> tuple[dict[str, Any], int]:
     """One call, one retry with the stable failure code only. Returns (choice, model calls)."""
     failure = None

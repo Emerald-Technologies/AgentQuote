@@ -202,12 +202,23 @@ def test_real_parser_preserves_alternatives_documents_and_resolves_two_assemblie
 def test_real_parser_conflict_blocks_package_approval_and_publication():
     store, packages, plan, review, executions = execute_package(conflict=True)
     assert len(executions) == 3
-    assert review == {"exception": "PACKAGE_CONFLICT_DISPOSITION_REQUIRED"}
+    # Round 13: the review shows the choice (complete, not approval-ready) instead of failing.
+    assert review["complete"] is True and review["approval_ready"] is False
     from bom_processor import PackageResolutionError
-    with pytest.raises(PackageResolutionError, match="PACKAGE_CONFLICT_DISPOSITION_REQUIRED"):
-        packages.approve(plan_id=plan["plan_id"], review_manifest_sha256="a"*64,
+    with pytest.raises(PackageResolutionError, match="PACKAGE_REVIEW_BINDING"):
+        packages.approve(plan_id=plan["plan_id"], review_manifest_sha256=review["manifest_sha256"],
                          approver="offline-test")
     assert not any("/resolved/" in path for path in store.outputs)
+    # A person's pick: the preview with the decision is approval-ready and approval binds to exactly it.
+    group = next(item for item in review["groups"] if item.get("disposition_keys"))
+    pick = group["evidence"]["fixtures"][0]["fixture_key"]
+    decisions = {group["group_id"]: pick}
+    preview = packages.review(plan["plan_id"], conflict_dispositions=decisions)
+    assert preview["approval_ready"] is True and preview["conflict_dispositions"] == decisions
+    approval = packages.approve(plan_id=plan["plan_id"], review_manifest_sha256=preview["manifest_sha256"],
+                                conflict_dispositions=decisions, approver="offline-test")
+    resolved = packages.resolve(plan_id=plan["plan_id"], approval_id=approval["approval_id"])
+    assert resolved["status"] == "completed"
 
 
 def test_application_factory_passes_association_policy_to_controller_and_job(monkeypatch):

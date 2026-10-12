@@ -94,7 +94,7 @@ def _stable_code(exc: BaseException) -> str:
 
 def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller) -> dict[str, Any]:
     """Survey, choose and decide per request document. Pure apart from model calls."""
-    from .bom_candidate_choice import ATTEMPTS, ChoiceError, run_choice, set_aside_digests
+    from .bom_candidate_choice import ATTEMPTS, ChoiceError, confirmed_by_revision, run_choice, set_aside_digests
     from .bom_candidate_view import build_candidate_view
     from .package_survey import build_view, expand_package
     from .package_survey_run import survey_view
@@ -132,6 +132,20 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                             "choice": None, "set_aside_digests": {}, "failure_code": _stable_code(exc)})
             continue
         calls += used
+        if not choice["automatic_selection_allowed"]:
+            requested = next((item for item in request.get("requested_assemblies", [])
+                              if item["assembly_id"] == group.get("assembly_id")), None)
+            if requested is not None and confirmed_by_revision(choice, requested.get("revision")):
+                # The pick is the only candidate carrying the requested revision (round 13).
+                choice = {**choice, "automatic_selection_allowed": True, "selection_basis": "requested_revision"}
+            else:
+                # Nick 2026-10-12: parse only the model's pick and set the others aside with a warning;
+                # a person can bring one back. Nothing is parsed twice.
+                choice = {**choice, "automatic_selection_allowed": True, "selection_basis": "model_unconfirmed"}
+                failures.append({"code": "CHOICE_UNCONFIRMED", "severity": "warning", "raised_by": "code",
+                                 "rationale": "The main BOM was picked but the content check could not confirm it; "
+                                              "the other BOMs were set aside and can be brought back.",
+                                 "file_ids": list(boms), "assembly": name})
         choices.append({"assembly": name, **owner, "view_sha256": candidate_view.sha256,
                         "choice": choice, "set_aside_digests": set_aside_digests(choice, candidate_view)})
     records = {record["file_id"]: record for record in survey["files"]}

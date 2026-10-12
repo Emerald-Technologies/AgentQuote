@@ -140,18 +140,21 @@ def test_choice_sets_aside_the_redundant_bom_and_the_work_instruction():
     assert state["result"]["model_calls"] == 2
 
 
-def test_a_choice_code_does_not_confirm_keeps_every_bom_in_processing():
-    # The agent calls the larger BOM redundant: the column read disagrees, so nothing is set aside.
+def test_an_unconfirmed_pick_is_parsed_alone_and_the_others_are_set_aside_with_a_warning():
+    # Round 13 (Nick 2026-10-12): the column read disagrees with "redundant", so the pick is not confirmed;
+    # only the pick is parsed, the other BOM is set aside (a person can bring it back) and a warning says so.
     agent = Agent(labels={"ASSY-100 MOD BOM.xlsx": "redundant"}, primary_name="ASSY-100 BOM.xlsx")
     _, _, _, state = completed_service(agent)
-    assert decisions(state)["doc-mod"] == ("process", "choice_needs_review")
-    assert decisions(state)["doc-plain"] == ("process", "choice_needs_review")
-    assert state["result"]["primary_selections"] == []
+    assert decisions(state)["doc-plain"] == ("process", "primary")
+    assert decisions(state)["doc-mod"] == ("excluded", "redundant")
+    assert [item["code"] for item in state["result"]["findings"]].count("CHOICE_UNCONFIRMED") == 1
+    assert state["result"]["choices"][0]["choice"]["selection_basis"] == "model_unconfirmed"
 
 
-def test_obsolete_label_cannot_be_confirmed_by_data_so_the_file_stays():
+def test_an_unconfirmed_obsolete_label_still_parses_only_the_pick():
     _, _, _, state = completed_service(Agent(labels={"ASSY-100 BOM.xlsx": "obsolete"}))
-    assert decisions(state)["doc-plain"] == ("process", "choice_needs_review")
+    assert decisions(state)["doc-plain"] == ("excluded", "obsolete")
+    assert "CHOICE_UNCONFIRMED" in [item["code"] for item in state["result"]["findings"]]
 
 
 def test_request_identity_and_api_side_never_calls_the_model():

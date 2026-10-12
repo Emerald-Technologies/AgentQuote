@@ -235,8 +235,12 @@ def test_byte_derived_semantics_reject_metadata_tamper_and_uom_conflicts():
         package_workbook(uom="REEL", assembly=("Board", "A")),
     ])
     package = plan(ParentPackageService(store), request)
+    # Round 13: a conflict waits for a person's pick instead of failing the review.
+    review = ParentPackageService(store).review(package["plan_id"])
+    assert review["complete"] is True and review["approval_ready"] is False
+    group = next(item for item in review["groups"] if item.get("disposition_keys"))
     with pytest.raises(PackageResolutionError, match="PACKAGE_CONFLICT_DISPOSITION_REQUIRED"):
-        ParentPackageService(store).review(package["plan_id"])
+        ParentPackageService(store).review(package["plan_id"], conflict_dispositions={group["group_id"]: "f" * 64})
 
 
 def test_forged_assembly_identity_and_mapping_required_fail_closed():

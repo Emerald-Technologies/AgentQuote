@@ -500,6 +500,14 @@ class PackageApi:
             if not isinstance(value, dict) or any(key in value for key in ("actor", "actor_id", "approver")):
                 raise ValueError
             service = self.service_factory()
+            if action == "review" and approval_id is None:
+                # Read-only preview of the review with a person's decisions applied (round 13); the page
+                # approves against exactly this review. Nothing is written.
+                allowed = {"assembly_mappings", "conflict_dispositions"}
+                if set(value) - allowed:
+                    raise ValueError
+                return 200, service.review(plan_id, assembly_mappings=value.get("assembly_mappings"),
+                                           conflict_dispositions=value.get("conflict_dispositions"))
             if action == "approve" and approval_id is None:
                 allowed = {"review_manifest_sha256", "assembly_mappings", "conflict_dispositions", "reason", "ticket"}
                 if set(value) - allowed or not isinstance(value.get("review_manifest_sha256"), str):

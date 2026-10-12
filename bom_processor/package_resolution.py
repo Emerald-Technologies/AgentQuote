@@ -214,12 +214,18 @@ class ParentPackageService:
         complete &= all(group.get("status") in ("ready", "excluded") for group in groups)
         used_mappings = {key for group in groups for key in group.get("mapping_keys", [])}
         used_dispositions = {key for group in groups for key in group.get("disposition_keys", [])}
-        if used_mappings != set(mappings) or used_dispositions != set(dispositions):
+        if used_mappings != set(mappings) or not set(dispositions) <= used_dispositions:
             raise PackageResolutionError("PACKAGE_REVIEW_INPUT_INVALID")
+        # Decisions are all given (a preview or an approval) or none (the page's review); a review still
+        # waiting for a pick is complete but not approval-ready.
+        pending = used_dispositions - set(dispositions)
+        if pending and dispositions:
+            raise PackageResolutionError("PACKAGE_CONFLICT_DISPOSITION_REQUIRED")
+        ready = complete and not pending
         body = {"version": "package-review.v1", "plan_id": plan_id,
                 "plan_sha256": _hash({key: value for key, value in plan.items() if key != "plan_id"}),
-                "complete": complete, "approval_ready": complete,
-                "status": "awaiting_approval" if complete else "pending",
+                "complete": complete, "approval_ready": ready,
+                "status": "awaiting_approval" if ready else "pending",
                 "source_count": len(plan["sources"]), "groups": groups,
                 "assembly_mappings": mappings, "conflict_dispositions": dispositions}
         if choice_result is not None:
@@ -507,7 +513,10 @@ class ParentPackageService:
             disposition = dispositions.get(group_id)
             disposition_keys: list[str] = []
             if reconciliation.relation == "conflict":
-                if disposition not in {item["fixture_key"] for item in fixtures}:
+                # Without a person's pick the group is shown with its choices (round 13, A044: the review
+                # used to fail with 409, so the page could never offer the choice). A pick that is not
+                # one of the parsed sources is still refused.
+                if disposition is not None and disposition not in {item["fixture_key"] for item in fixtures}:
                     raise PackageResolutionError("PACKAGE_CONFLICT_DISPOSITION_REQUIRED")
                 disposition_keys.append(group_id)
             elif disposition is not None:
@@ -1110,7 +1119,7 @@ class ParentPackageService:
 
 
 # Package-choice warnings shown to the person; any of them stops automatic acceptance.
-PACKAGE_CHOICE_FINDING_CODES = frozenset({
+PACKAGE_CHOICE_FINDING_CODES = frozenset({"CHOICE_UNCONFIRMED",
     "SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "CHOICE_ASSEMBLY_FAILED", "SURVEY_FILES_UNCLASSIFIED",
     "SURVEY_BOM_NOT_MAPPED", "SURVEY_MAPPING_UNCONFIRMED"})
 
