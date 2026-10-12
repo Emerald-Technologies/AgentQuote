@@ -148,7 +148,7 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                      retained_bom_sources: dict | None = None,
                      correction: dict | None = None,
                      review_inputs: dict | None = None,
-                     call_store=None) -> dict:
+                     call_store=None, survey_files: list[dict] | None = None) -> dict:
     """Code derives all identity/checkpoint fields; model may only suggest hints.
 
     Text excerpts are explicitly bounded observations. File coverage is never
@@ -164,7 +164,7 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
                                prompt_sha256=prompt_sha256, run_id=run_id,
                                inventory_limits=inventory_limits,
                                retained_bom_sources=retained_bom_sources, correction=correction,
-                               review_inputs=review_inputs, call_store=call_store)
+                               review_inputs=review_inputs, call_store=call_store, survey_files=survey_files)
     prepared = prepare(context, roots, workbooks, producer=producer, model_name=model_name,
                        policy_version=policy_version, prompt_sha256=prompt_sha256, run_id=run_id,
                        inventory_limits=inventory_limits, include_manufacturing=include_manufacturing,

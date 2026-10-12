@@ -23,7 +23,8 @@ import re
 from typing import Any, Callable
 
 from .package_evidence_contracts import (
-    PackageEvidenceError, association_id, detached, digest, json_bytes, object_hash, require, text, utf16_units,
+    LINK_NOT_TEXT_VERIFIED, PackageEvidenceError, association_id, detached, digest, json_bytes, object_hash, require,
+    text, utf16_units,
 )
 
 PACKET_VERSION = "package-evidence-compact-packet.v1"
@@ -65,7 +66,10 @@ INSTRUCTION = (
     "whole file: text is the whole file when it has 50 lines or fewer, otherwise head (first 40 lines) and tail "
     "(last 10) with linesTotal; Gerber and drill files show header lines only, never coordinates. A shown line "
     "longer than 300 characters ends with '\u2026'. Files without content (PDF, spreadsheets, archives, binary) "
-    "are judged from path, kind and size. sharedCandidates lists part numbers on BOMs of several assemblies that "
+    "are judged from path, kind and size. A file may carry survey, an earlier reader's guess: {assembly (an "
+    "assembly id or null), link (confirmed = checked against the file's content, unconfirmed = from its name and "
+    "path, none = no guess), kind}. It is a clue, never proof: weigh it with the path and content and disagree "
+    "when they disagree. sharedCandidates lists part numbers on BOMs of several assemblies that "
     "also appear in file paths. Decide which files belong to which assemblies and lines the way a person would: "
     "file name and folder are the main clues for Gerber, drill and CAD files; a part number or revision in the "
     "content outranks an uninformative name, and a name or folder naming a different part number or revision than "
@@ -80,7 +84,10 @@ INSTRUCTION = (
     "one of assembly_drawing, assembly_instructions, fabrication_drawing, custom_drawing, artwork, drill; sharing "
     "is not_shared for one assembly, supported or unknown for several; cite is 1 to 50 {file, text} exact quotes, "
     "at least one from the linked file itself, each copied character for character from one shown line of a "
-    "quotable file. A file that is not quotable cannot be linked: use unresolved when it looks needed, otherwise "
+    "quotable file. A file that is not quotable has nothing to quote: link it only to the one assembly its "
+    "survey names, and only when its folder or archive and its name agree with that assembly; its cite then lists "
+    "exact quotes from other quotable files that support the link, or is [] when there are none, and code marks "
+    "the link not text-verified for a person to confirm. Otherwise use unresolved when it looks needed, or "
     "unrelated. PCB files apply to every line with the same PCB part number and revision; never link a file to a "
     "different part number or revision, and do not infer equivalence from file names alone. parts: groups "
     "covering every Part line exactly once, each {lines, partType, sourceRequiresDrawing, sourceRequiresRevision, "
@@ -137,9 +144,12 @@ def _header(lines: list[str]) -> list[str]:
     return [line for line in lines if _GERBER_HEADER.match(line.strip())]
 
 
-def file_view(identity: str, item: dict, path: str, content: str | None, quotable: bool) -> dict:
+def file_view(identity: str, item: dict, path: str, content: str | None, quotable: bool,
+              clue: dict | None = None) -> dict:
     """What the model is shown for one file; the full text stays with code."""
     view: dict[str, Any] = {"id": identity, "path": path, "kind": item["format"], "size": item["sizeBytes"]}
+    if clue is not None:
+        view["survey"] = clue
     if content is None:
         return view
     view["quotable"] = quotable
@@ -214,7 +224,7 @@ def _assembly_keys(part_number: str) -> set[str]:
 class _Plan:
     """Short ids and the per-call split. Short ids are global and stable for one package."""
 
-    def __init__(self, prepared: dict, roots: list[dict], limit: int):
+    def __init__(self, prepared: dict, roots: list[dict], limit: int, survey_files: list[dict] | None = None):
         self.prepared = prepared
         context, inventory, rows = prepared["context"], prepared["inventory"], prepared["rows"]
         self.limit = limit
@@ -222,6 +232,10 @@ class _Plan:
         self.assemblies = context["assemblies"]
         self.asm_short = {a["assemblyUuid"]: f"A{i}" for i, a in enumerate(self.assemblies, 1)}
         self.asm_full = {v: k for k, v in self.asm_short.items()}
+        from .package_evidence_survey_clues import match_clues
+        # Survey clues (plan step 1): code-matched on path and file hash; a hint for the model, and the
+        # only basis on which a file without text may be linked (decision 6).
+        self.clues = match_clues(inventory, names, survey_files, set(self.asm_short))
         texts = {s["evidenceId"]: s["text"] for s in prepared["sources"] if s["page"] is None}
         self.texts = texts
         retained = prepared["retained"]
@@ -233,8 +247,11 @@ class _Plan:
         for item in self.files:
             identity = item["evidenceId"]
             content = texts.get(identity, item["excerpt"])
+            clue = self.clues.get(identity)
+            shown = None if clue is None else {"assembly": self.asm_short.get(clue["assembly"]),
+                                               "link": clue["link"], "kind": clue["kind"]}
             self.views[identity] = file_view(self.file_short[identity], item, self.paths[identity], content,
-                                             identity in texts)
+                                             identity in texts, shown)
         self.lines: list[dict] = []          # compact records in row order
         self.line_asm: dict[str, str] = {}    # L id -> assembly uuid
         self.line_occ: dict[str, str] = {}    # L id -> occurrence id (Part lines only)
@@ -282,8 +299,13 @@ class _Plan:
             tokens = _tokens(self.paths[identity])
             matched = [uuid for uuid, found in keys.items() if any(_names(tokens, k) for k in found)]
             self.file_keys[identity] = {k for found in keys.values() for k in found if _names(tokens, k)}
+            clue = self.clues.get(identity)
             if len(matched) == 1:
                 self.placed[matched[0]].append(identity)
+            elif not matched and clue is not None and clue["assembly"] is not None:
+                # The survey placed it; a path naming several assemblies stays shared (Nick: shared files
+                # are used for each assembly).
+                self.placed[clue["assembly"]].append(identity)
             else:
                 self.shared_files.append(identity)
 
@@ -397,8 +419,8 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
     assemblies = {plan.asm_short[u]: u for u in call["assemblies"]}
     subjects = {**{plan.asm_short[u]: u for u in call["subjects"]}, **part_lines}
 
-    def cites(value: Any, own: str | None) -> list[dict]:
-        _need(type(value) is list and 1 <= len(value) <= 50, "REPLY_CITE_INVALID")
+    def cites(value: Any, own: str | None, minimum: int = 1) -> list[dict]:
+        _need(type(value) is list and minimum <= len(value) <= 50, "REPLY_CITE_INVALID")
         result, seen = [], set()
         for cite in value:
             _need(type(cite) is dict and set(cite) == {"file", "text"} and cite["file"] in files
@@ -451,7 +473,13 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
             if occurrence_ids:
                 derived = {plan.line_asm[plan.occ_line[o]] for o in occurrence_ids}
                 _need(derived == set(uuids), "REPLY_LINK_ASSEMBLY_MISMATCH")
-            _need(identity in plan.texts, "REPLY_LINK_FILE_NOT_QUOTABLE")
+            verified = identity in plan.texts
+            if not verified:
+                # Decision 6: a file without text may be linked only to the one assembly its survey names;
+                # code marks the link not text-verified for a person to confirm.
+                clue = plan.clues.get(identity)
+                _need(clue is not None and clue["assembly"] is not None and set(uuids) == {clue["assembly"]},
+                      "REPLY_LINK_FILE_NOT_QUOTABLE")
             _need(link["role"] in ROLES, "REPLY_LINK_ROLE_INVALID")
             shared = len(uuids) > 1
             _need(link["sharing"] in ({"supported", "unknown"} if shared else {"not_shared"}), "REPLY_LINK_SHARING_INVALID")
@@ -460,7 +488,8 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
             targets.add(target)
             checked.append({"occurrenceIds": sorted(occurrence_ids), "assemblyUuids": sorted(uuids),
                             "role": link["role"], "sharing": link["sharing"],
-                            "rationale": _rationale(link["rationale"]), "citations": cites(link["cite"], identity)})
+                            "rationale": _rationale(link["rationale"]), "textVerified": verified,
+                            "citations": cites(link["cite"], identity if verified else None, 1 if verified else 0)})
         answers[identity] = {"state": state, "replacement": replacement, "category": category,
                              "rationale": _rationale(entry["rationale"]), "links": checked}
     _need(set(answers) == set(files.values()), "REPLY_FILE_COVERAGE")
@@ -679,19 +708,22 @@ def merge(plan: _Plan, calls: list[dict], answers: list[dict | None], failures: 
                 for cite in link["citations"]:
                     if cite not in citations and len(citations) < 50:
                         citations.append(cite)
-            if not any(c["evidenceId"] == identity for c in citations):
+            verified = all(l.get("textVerified", True) for _, l in links)
+            if verified and not any(c["evidenceId"] == identity for c in citations):
                 citations[-1] = next(c for _, l in links for c in l["citations"] if c["evidenceId"] == identity)
             body = {"evidenceId": identity, "occurrenceIds": occurrence_ids, "assemblyUuids": uuids, "scope": scope}
             built.append((body, {"rationale": _join([l["rationale"] for _, l in links]), "role": role,
-                                 "sharing": sharing, "citations": citations}))
+                                 "sharing": sharing, "citations": citations, "verified": verified}))
         if len({association_id(body) for body, _ in built}) != len(built):
             final[identity] = {**entry, "state": "unresolved", "links": [],
                                "rationale": _join(["Merged links of this file conflict.", entry["rationale"]])}
             continue
         for body, extra in built:
-            associations.append({**body, "rationale": extra["rationale"], "citations": []})
+            observed = [] if extra["verified"] else [_clue_citation(plan, identity)]
+            associations.append({**body, "rationale": extra["rationale"], "citations": observed})
             relationships.append({**body, "role": extra["role"], "sharing": extra["sharing"],
-                                  "citations": extra["citations"], "conflicts": []})
+                                  "citations": extra["citations"],
+                                  "conflicts": [] if extra["verified"] else [LINK_NOT_TEXT_VERIFIED]})
     dispositions = [{"evidenceId": identity, "state": entry["state"], "replacementEvidenceId": entry["replacement"],
                      "rationale": entry["rationale"], "citations": []} for identity, entry in final.items()]
     categories = [{"evidenceId": identity, "category": entry["category"]} for identity, entry in final.items()
@@ -714,6 +746,15 @@ def merge(plan: _Plan, calls: list[dict], answers: list[dict | None], failures: 
     if categories:
         hints["categories"] = categories
     return hints, classifications, {"requirements": requirements, "relationships": relationships}
+
+
+def _clue_citation(plan: "_Plan", identity: str) -> dict:
+    """What the review panel shows for a not-text-verified link: the survey's reading of the file."""
+    clue = plan.clues[identity]
+    assembly = next(a for a in plan.assemblies if a["assemblyUuid"] == clue["assembly"])
+    return {"evidenceId": identity, "locator": "package survey",
+            "observation": f"The package survey linked this file to {assembly['partNumber']} ({clue['link']}); "
+                           "linked from that, its folder and its name, not from quoted text. Confirm it."}
 
 
 # ---------------------------------------------------------------- reviewer
@@ -943,13 +984,13 @@ def produce_compact(context: dict, roots: list[dict], workbooks: dict[str, bytes
                     model_name: str, policy_version: str, prompt_sha256: str, run_id: str,
                     inventory_limits=None, retained_bom_sources: dict | None = None, correction: dict | None = None,
                     review_inputs: dict | None = None, call_store: Any = None,
-                    max_call_input_bytes: int = MAX_CALL_INPUT_BYTES) -> dict:
+                    max_call_input_bytes: int = MAX_CALL_INPUT_BYTES, survey_files: list[dict] | None = None) -> dict:
     from .package_evidence_proposal import finish, prepare
     prepared = prepare(context, roots, workbooks, producer=producer, model_name=model_name,
                        policy_version=policy_version, prompt_sha256=prompt_sha256, run_id=run_id,
                        inventory_limits=inventory_limits, include_classification=True, include_manufacturing=True,
                        retained_bom_sources=retained_bom_sources, correction=correction)
-    plan = _Plan(prepared, roots, max_call_input_bytes)
+    plan = _Plan(prepared, roots, max_call_input_bytes, survey_files)
     identity = {"model": model_name, "policyVersion": policy_version, "promptSha256": prompt_sha256}
     calls, answers, failures, made = run_calls(plan, model, identity=identity, correction=correction,
                                                call_store=call_store)

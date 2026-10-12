@@ -48,6 +48,9 @@ ASSESSED_POLICIES = frozenset({"package-evidence-foundry.v3", "package-evidence-
 RETAINED_POLICIES = frozenset({"package-evidence-foundry.v4", "package-evidence-foundry.v5", "package-evidence-foundry.v6"})
 REVIEWED_POLICIES = frozenset({"package-evidence-foundry.v5", "package-evidence-foundry.v6"})
 COMPACT_POLICIES = frozenset({"package-evidence-foundry.v6"})
+# Code-owned relationship conflict (Nick 2026-10-12, decision 6): a file with no quotable text linked
+# from its survey clue, folder and name. Never accepted without a person; model replies cannot set it.
+LINK_NOT_TEXT_VERIFIED = "LINK_NOT_TEXT_VERIFIED"
 
 
 def require(condition: bool, code: str) -> None:

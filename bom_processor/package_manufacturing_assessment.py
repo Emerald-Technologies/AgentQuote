@@ -37,18 +37,24 @@ def assessment_artifact(graph, classification, sources, hints):
     # quote to give. Allowed only as unknown with the code-owned conflict; model replies cannot use it.
     open_allowed = graph["provenance"]["policyVersion"] in COMPACT_POLICIES
 
+    def not_text_verified(item):
+        # Decision 6 (Nick 2026-10-12): a code-built link to a file without text; quotes, if any, come from
+        # other files. Allowed only for the compact policy; the consumer requires a person to confirm it.
+        from .package_evidence_contracts import LINK_NOT_TEXT_VERIFIED
+        return open_allowed and LINK_NOT_TEXT_VERIFIED in item["conflicts"]
+
     def code_open(item):
         return (open_allowed and item["determination"] == "unknown" and item["citations"] == []
                 and "EVIDENCE_CALL_FAILED" in item["conflicts"])
 
-    def citations(values):
+    def citations(values, minimum=1):
         # The model supplies evidenceId, page and the exact quoted text. Code locates the text
         # in that source and records start/end itself (UTF16 units, as the QuickQuote consumer
         # slices). Model-counted offsets were unreliable while the quotes were exact (A029
         # retry ce0346b6), and an exact quote already proves the source contains the statement.
         # Any model-supplied start/end is ignored, never trusted. Text absent from the named
         # source still fails. With several occurrences the first is recorded: any copy proves it.
-        require(type(values) is list and 1 <= len(values) <= 50, "ASSESSMENT_CITATIONS_INVALID")
+        require(type(values) is list and minimum <= len(values) <= 50, "ASSESSMENT_CITATIONS_INVALID")
         seen = set()
         for i, cite in enumerate(values):
             require(type(cite) is dict and {"evidenceId", "page", "text"} <= set(cite)
@@ -102,9 +108,10 @@ def assessment_artifact(graph, classification, sources, hints):
         require(type(identity) is str and identity in associations and identity not in seen, "ASSESSMENT_RELATIONSHIP_COVERAGE_INVALID")
         seen.add(identity)
         require(item["role"] in ROLES and item["sharing"] in {"supported", "unknown", "not_shared"}, "ASSESSMENT_ROLE_INVALID")
-        citations(item["citations"])
         conflicts(item["conflicts"])
-        require(any(c["evidenceId"] == associations[identity]["evidenceId"] for c in item["citations"])
+        unverified = not_text_verified(item)
+        citations(item["citations"], 0 if unverified else 1)
+        require((unverified or any(c["evidenceId"] == associations[identity]["evidenceId"] for c in item["citations"]))
                 and ((associations[identity]["scope"] == "shared") != (item["sharing"] == "not_shared")), "ASSESSMENT_RELATIONSHIP_BINDING_INVALID")
     body = {"version": "package-manufacturing-assessment.v1", "policyVersion": "source-grounded-manufacturing.v1",
         "proposalSha256": graph["proposalSha256"], "classificationSha256": classification["classificationSha256"],

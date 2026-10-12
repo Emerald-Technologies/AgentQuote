@@ -411,6 +411,9 @@ class EvidenceJobService:
             compact = policy["policyVersion"] in COMPACT_POLICIES
             review_inputs: dict | None = {} if reviewed else None
             call_store = CallAnswerStore(self.storage) if compact else None
+            # Survey clues (multi-assembly labor plan step 1); absent or unreadable means none.
+            from .package_evidence_survey_clues import load_survey_files
+            survey_files = load_survey_files(self.storage, request["context"]["bomPlanId"]) if compact else None
             successor = request.get("successor")
             context = request["context"] if successor is None else {
                 **request["context"], "predecessorProposalSha256": successor["predecessorProposalSha256"]}
@@ -421,7 +424,8 @@ class EvidenceJobService:
                 include_classification=classified, include_manufacturing=assessed,
                 retained_bom_sources=request.get("retainedBomSources"),
                 correction=None if successor is None else {"attempt": successor["attempt"], "feedback": successor["feedback"]},
-                review_inputs=review_inputs, **({"call_store": call_store} if compact else {}))
+                review_inputs=review_inputs,
+                **({"call_store": call_store, "survey_files": survey_files} if compact else {}))
             graph = produced["proposal"] if classified else produced
             review = None
             if reviewed and compact:
