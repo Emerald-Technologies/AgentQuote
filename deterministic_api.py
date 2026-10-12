@@ -857,8 +857,10 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             body = self.rfile.read(length)
             package_match = PACKAGE_ROUTE.fullmatch(self.path)
             resolution_match = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
-            if package_match and package_match.group(2) == "approve" and package_api is not None:
-                status, payload = package_api.handle_post(self.headers, package_match.group(1), "approve", body)
+            # "review" is the read-only preview with a person's picks (round 13; A044 got 404 without it).
+            if package_match and package_match.group(2) in {"approve", "review"} and package_api is not None:
+                status, payload = package_api.handle_post(self.headers, package_match.group(1),
+                                                          package_match.group(2), body)
                 self._write(status, payload)
                 return
             if resolution_match and resolution_match.group(3) == "resolve" and package_api is not None:
