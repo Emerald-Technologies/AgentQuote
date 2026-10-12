@@ -51,6 +51,9 @@ COMPACT_POLICIES = frozenset({"package-evidence-foundry.v6"})
 # Code-owned relationship conflict (Nick 2026-10-12, decision 6): a file with no quotable text linked
 # from its survey clue, folder and name. Never accepted without a person; model replies cannot set it.
 LINK_NOT_TEXT_VERIFIED = "LINK_NOT_TEXT_VERIFIED"
+# Code-owned requirement conflict (Nick 2026-10-12): every quote the model gave for it failed the exact-text
+# check, so it is left open for a person (determination unknown, no citations). Model replies cannot set it.
+QUOTE_UNVERIFIED = "EVIDENCE_QUOTE_UNVERIFIED"
 
 
 def require(condition: bool, code: str) -> None:

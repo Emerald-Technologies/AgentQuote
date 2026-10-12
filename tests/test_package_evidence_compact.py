@@ -195,12 +195,12 @@ def test_rerun_repeats_only_the_failed_call():
     (lambda r: r["parts"][1]["lines"].pop(), "REPLY_PART_COVERAGE"),
     (lambda r: r["parts"][1]["lines"].append(r["parts"][0]["lines"][0]), "REPLY_PART_COVERAGE"),
     (lambda r: r["files"].pop(), "REPLY_FILE_COVERAGE"),
-    (lambda r: r["files"][0]["links"][0]["cite"][0].update(text="Invented line"), "REPLY_CITE_NOT_FOUND"),
     (lambda r: r["files"][0]["links"][0].update(lines=["L999"]), "REPLY_LINK_LINES_INVALID"),
     (lambda r: r["requirements"][0]["conflicts"].append(CALL_FAILED), "REPLY_RESERVED_CODE"),
+    (lambda r: r["requirements"][0]["conflicts"].append("EVIDENCE_QUOTE_UNVERIFIED"), "REPLY_RESERVED_CODE"),
     (lambda r: r["requirements"][0]["subjects"].pop(), "REPLY_REQUIREMENT_COVERAGE"),
 ])
-def test_reply_check_refuses_gaps_duplicates_and_invented_quotes(change, code):
+def test_reply_check_refuses_gaps_duplicates_and_reserved_codes(change, code):
     from bom_processor.package_evidence_compact import _CallFailure
     plan = plan_for(package([("ASM-100200", "PCB-555001")], lines=5))
     call = plan.calls()[0]
@@ -211,6 +211,53 @@ def test_reply_check_refuses_gaps_duplicates_and_invented_quotes(change, code):
     with pytest.raises(_CallFailure) as caught:
         check_reply(plan, call, reply)
     assert caught.value.code == code
+
+
+def _checked_reply():
+    plan = plan_for(package([("ASM-100200", "PCB-555001")], lines=5))
+    call = plan.calls()[0]
+    reply = ScriptedModel().propose(plan.packet(call))
+    reply["files"].sort(key=lambda f: not f["links"] or f["links"][0]["role"] != "artwork")
+    return plan, call, reply
+
+
+def test_an_invented_quote_leaves_only_its_file_open_and_keeps_the_rest():
+    # A044 (2026-10-12): one quote from a file the code holds no text for discarded the whole answer twice.
+    plan, call, reply = _checked_reply()
+    first = reply["files"][0]
+    first["links"][0]["cite"] = [{"file": first["file"], "text": "Invented line"}]
+    answer = check_reply(plan, call, reply)
+    identity = plan.file_full[first["file"]]
+    assert answer["files"][identity]["state"] == "unresolved" and answer["files"][identity]["links"] == []
+    assert answer["files"][identity]["rationale"].startswith("Its links could not be verified")
+    kept = [a for i, a in answer["files"].items() if i != identity and a["state"] == "included"]
+    assert kept and all(link["citations"] for a in kept for link in a["links"])
+
+
+def test_a_requirement_without_a_verifiable_quote_is_left_open_for_review():
+    plan, call, reply = _checked_reply()
+    reply["requirements"][0]["cite"] = [{"file": reply["files"][0]["file"], "text": "Invented line"}]
+    reply["requirements"][0]["determination"] = "determined"
+    answer = check_reply(plan, call, reply)
+    subject = next(iter(answer["requirements"]))
+    assert answer["requirements"][subject] == {**answer["requirements"][subject], "determination": "unknown",
+                                               "citations": [], "requiredRoles": []}
+    assert answer["requirements"][subject]["conflicts"][0] == "EVIDENCE_QUOTE_UNVERIFIED"
+
+
+def test_an_open_requirement_and_an_open_file_still_produce_verifiable_artifacts():
+    class Inventing(ScriptedModel):
+        def propose(self, packet):
+            reply = super().propose(packet)
+            linked = [f for f in reply["files"] if f["links"]]
+            linked[0]["links"][0]["cite"] = [{"file": linked[0]["file"], "text": "Invented line"}]
+            reply["requirements"][0]["cite"] = [{"file": linked[0]["file"], "text": "Invented line"}]
+            return reply
+    result = produce(package([("ASM-100200", "PCB-555001")], lines=5), model=Inventing())
+    states = [d["state"] for d in result["proposal"]["dispositions"]]
+    assert "unresolved" in states and "included" in states
+    assert any("EVIDENCE_QUOTE_UNVERIFIED" in r["conflicts"] and r["citations"] == []
+               for r in result["manufacturingAssessment"]["requirements"])
 
 
 # ---------------------------------------------------------------- job service

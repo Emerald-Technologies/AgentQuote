@@ -23,7 +23,7 @@ import re
 from typing import Any, Callable
 
 from .package_evidence_contracts import (
-    LINK_NOT_TEXT_VERIFIED, PackageEvidenceError, association_id, detached, digest, json_bytes, object_hash, require,
+    LINK_NOT_TEXT_VERIFIED, QUOTE_UNVERIFIED, PackageEvidenceError, association_id, detached, digest, json_bytes, object_hash, require,
     text, utf16_units,
 )
 
@@ -395,7 +395,7 @@ def _conflicts(value: Any) -> list[str]:
     result = []
     for item in value:
         _need(type(item) is str and bool(item.strip()) and len(item.strip()) <= 256, "REPLY_CONFLICTS_INVALID")
-        _need(item.strip() != CALL_FAILED, "REPLY_RESERVED_CODE")
+        _need(item.strip() not in (CALL_FAILED, QUOTE_UNVERIFIED), "REPLY_RESERVED_CODE")
         try:
             result.append(text(item.strip(), 256, controls=True))
         except PackageEvidenceError:
@@ -419,24 +419,28 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
     assemblies = {plan.asm_short[u]: u for u in call["assemblies"]}
     subjects = {**{plan.asm_short[u]: u for u in call["subjects"]}, **part_lines}
 
-    def cites(value: Any, own: str | None, minimum: int = 1) -> list[dict]:
-        _need(type(value) is list and minimum <= len(value) <= 50, "REPLY_CITE_INVALID")
+    def cites(value: Any) -> list[dict]:
+        """The quotes that pass the exact-text check. A quote that does not (wrong or non-quotable file, text
+        not in the file, malformed, repeated) is dropped, not fatal: one bad quote used to discard the whole
+        call's answer (A044, 2026-10-12, Nick: drop just those, keep the rest)."""
+        _need(type(value) is list and len(value) <= 50, "REPLY_CITE_INVALID")
         result, seen = [], set()
         for cite in value:
-            _need(type(cite) is dict and set(cite) == {"file", "text"} and cite["file"] in files
-                  and type(cite["text"]) is str and 0 < len(cite["text"]) <= 2000, "REPLY_CITE_INVALID")
+            if not (type(cite) is dict and set(cite) == {"file", "text"} and cite["file"] in files
+                    and type(cite["text"]) is str and 0 < len(cite["text"]) <= 2000):
+                continue
             identity = files[cite["file"]]
-            _need(identity in plan.texts, "REPLY_CITE_NOT_QUOTABLE")
-            _need(cite["text"] in plan.texts[identity], "REPLY_CITE_NOT_FOUND")
+            if identity not in plan.texts or cite["text"] not in plan.texts[identity]:
+                continue
             try:
                 text(cite["text"], 2000, controls=True)
             except PackageEvidenceError:
-                raise _CallFailure("REPLY_CITE_INVALID") from None
+                continue
             key = (identity, cite["text"])
-            _need(key not in seen, "REPLY_CITE_DUPLICATE")
+            if key in seen:
+                continue
             seen.add(key)
             result.append({"evidenceId": identity, "page": None, "text": cite["text"]})
-        _need(own is None or any(c["evidenceId"] == own for c in result), "REPLY_LINK_OWN_CITE_MISSING")
         return result
 
     entries = reply["files"]
@@ -461,7 +465,7 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
         links = entry["links"]
         _need(type(links) is list and len(links) <= 200, "REPLY_LINKS_INVALID")
         _need((state == "included") == bool(links), "REPLY_LINKS_STATE_MISMATCH")
-        checked, targets = [], set()
+        checked, targets, dropped = [], set(), 0
         for link in links:
             _need(type(link) is dict and set(link) == {"lines", "assemblies", "role", "sharing", "rationale", "cite"},
                   "REPLY_LINK_INVALID")
@@ -474,12 +478,17 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
                 derived = {plan.line_asm[plan.occ_line[o]] for o in occurrence_ids}
                 _need(derived == set(uuids), "REPLY_LINK_ASSEMBLY_MISMATCH")
             verified = identity in plan.texts
+            citations = cites(link["cite"])
+            if verified and not any(c["evidenceId"] == identity for c in citations):
+                dropped += 1   # a text file's link needs an exact quote from the file itself
+                continue
             if not verified:
                 # Decision 6: a file without text may be linked only to the one assembly its survey names;
-                # code marks the link not text-verified for a person to confirm.
+                # code marks the link not text-verified for a person to confirm. Otherwise the link is dropped.
                 clue = plan.clues.get(identity)
-                _need(clue is not None and clue["assembly"] is not None and set(uuids) == {clue["assembly"]},
-                      "REPLY_LINK_FILE_NOT_QUOTABLE")
+                if not (clue is not None and clue["assembly"] is not None and set(uuids) == {clue["assembly"]}):
+                    dropped += 1
+                    continue
             _need(link["role"] in ROLES, "REPLY_LINK_ROLE_INVALID")
             shared = len(uuids) > 1
             _need(link["sharing"] in ({"supported", "unknown"} if shared else {"not_shared"}), "REPLY_LINK_SHARING_INVALID")
@@ -489,13 +498,21 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
             checked.append({"occurrenceIds": sorted(occurrence_ids), "assemblyUuids": sorted(uuids),
                             "role": link["role"], "sharing": link["sharing"],
                             "rationale": _rationale(link["rationale"]), "textVerified": verified,
-                            "citations": cites(link["cite"], identity if verified else None, 1 if verified else 0)})
+                            "citations": citations})
+        rationale = _rationale(entry["rationale"])
+        if state == "included" and not checked:
+            # Every link it gave failed the quote check: a person decides (Nick 2026-10-12).
+            state, rationale = "unresolved", text("Its links could not be verified from quoted text; left for review. "
+                                                  + rationale, 2000)
         answers[identity] = {"state": state, "replacement": replacement, "category": category,
-                             "rationale": _rationale(entry["rationale"]), "links": checked}
+                             "rationale": rationale, "links": checked}
     _need(set(answers) == set(files.values()), "REPLY_FILE_COVERAGE")
     for identity, answer in answers.items():
-        if answer["state"] == "superseded":
-            _need(answers[answer["replacement"]]["state"] == "included", "REPLY_REPLACEMENT_INVALID")
+        if answer["state"] == "superseded" and answers[answer["replacement"]]["state"] != "included":
+            # Its replacement lost every link to the quote check; it cannot be proven superseded.
+            answers[identity] = {**answer, "state": "unresolved", "replacement": None,
+                                 "rationale": text("Its replacement could not be verified; left for review. "
+                                                   + answer["rationale"], 2000)}
 
     groups = reply["parts"]
     _need(type(groups) is list, "REPLY_PARTS_INVALID")
@@ -529,9 +546,15 @@ def check_reply(plan: _Plan, call: dict, reply: Any) -> dict:
         _need(type(roles) is list and len(roles) <= 6 and all(r in ROLES for r in roles)
               and len(set(roles)) == len(roles), "REPLY_REQUIREMENT_ROLES_INVALID")
         _need(group["determination"] in {"determined", "unknown"}, "REPLY_REQUIREMENT_DETERMINATION_INVALID")
+        citations = cites(group["cite"])
         body = {"requiredRoles": sorted(roles), "determination": group["determination"],
-                "rationale": _rationale(group["rationale"]), "citations": cites(group["cite"], None),
+                "rationale": _rationale(group["rationale"]), "citations": citations,
                 "conflicts": _conflicts(group["conflicts"])}
+        if not citations:
+            # No quote survived the check: left open for a person, never a determination without support.
+            body = {"requiredRoles": [], "determination": "unknown",
+                    "rationale": text("Its quotes could not be verified; left for review. " + body["rationale"], 2000),
+                    "citations": [], "conflicts": [QUOTE_UNVERIFIED, *body["conflicts"]][:20]}
         for subject in ids:
             _need(subject not in requirements, "REPLY_REQUIREMENT_COVERAGE")
             requirements[subject] = body
@@ -724,8 +747,11 @@ def merge(plan: _Plan, calls: list[dict], answers: list[dict | None], failures: 
             relationships.append({**body, "role": extra["role"], "sharing": extra["sharing"],
                                   "citations": extra["citations"],
                                   "conflicts": [] if extra["verified"] else [LINK_NOT_TEXT_VERIFIED]})
+    # An unresolved file carries the survey's reading so the review can show where it probably belongs.
     dispositions = [{"evidenceId": identity, "state": entry["state"], "replacementEvidenceId": entry["replacement"],
-                     "rationale": entry["rationale"], "citations": []} for identity, entry in final.items()]
+                     "rationale": entry["rationale"],
+                     "citations": [_survey_citation(plan, identity)] if entry["state"] == "unresolved"
+                     and (plan.clues.get(identity) or {}).get("assembly") else []} for identity, entry in final.items()]
     categories = [{"evidenceId": identity, "category": entry["category"]} for identity, entry in final.items()
                   if entry["category"] is not None]
     classifications, requirements = [], []
@@ -755,6 +781,14 @@ def _clue_citation(plan: "_Plan", identity: str) -> dict:
     return {"evidenceId": identity, "locator": "package survey",
             "observation": f"The package survey linked this file to {assembly['partNumber']} ({clue['link']}); "
                            "linked from that, its folder and its name, not from quoted text. Confirm it."}
+
+
+def _survey_citation(plan: "_Plan", identity: str) -> dict:
+    """The survey's reading of an unresolved file, for the person deciding where it belongs."""
+    clue = plan.clues[identity]
+    assembly = next(a for a in plan.assemblies if a["assemblyUuid"] == clue["assembly"])
+    return {"evidenceId": identity, "locator": "package survey",
+            "observation": f"The package survey linked this file to {assembly['partNumber']} ({clue['link']})."}
 
 
 # ---------------------------------------------------------------- reviewer

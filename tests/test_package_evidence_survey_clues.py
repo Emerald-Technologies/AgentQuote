@@ -5,7 +5,7 @@ Run: python -m pytest tests/test_package_evidence_survey_clues.py
 import pytest
 
 from bom_processor.core import InMemoryStorage
-from bom_processor.package_evidence_compact import MAX_CALL_INPUT_BYTES, _CallFailure, _Plan, check_reply
+from bom_processor.package_evidence_compact import MAX_CALL_INPUT_BYTES, _Plan, check_reply
 from bom_processor.package_evidence_contracts import LINK_NOT_TEXT_VERIFIED, digest
 from bom_processor.package_evidence_proposal import prepare
 from bom_processor.package_evidence_survey_clues import load_survey_files, match_clues
@@ -102,7 +102,7 @@ def test_a_file_without_text_is_linked_from_its_clue_and_marked_for_a_person():
 
 
 @pytest.mark.parametrize("survey_files,target", [(None, None), (survey(), "A2"), (survey(link="none"), None)])
-def test_a_file_without_text_is_refused_without_a_matching_clue(survey_files, target):
+def test_a_file_without_text_is_left_open_without_a_matching_clue(survey_files, target):
     plan = plan_for(pdf_package(), survey_files)
     call = plan.calls()[0]
     reply = ScriptedModel().propose(plan.packet(call))
@@ -110,6 +110,22 @@ def test_a_file_without_text_is_refused_without_a_matching_clue(survey_files, ta
     entry = next(f for f in reply["files"] if f["file"] == pdf_short)
     entry.update(state="included", links=[{"lines": [], "assemblies": [target or "A1"], "role": "assembly_drawing",
                                            "sharing": "not_shared", "rationale": "Guess.", "cite": []}])
-    with pytest.raises(_CallFailure) as caught:
-        check_reply(plan, call, reply)
-    assert caught.value.code == "REPLY_LINK_FILE_NOT_QUOTABLE"
+    # Nick 2026-10-12: the link is dropped and the file left for a person; the rest of the answer stands.
+    answer = check_reply(plan, call, reply)
+    assert answer["files"][pdf_id(plan)]["state"] == "unresolved" and answer["files"][pdf_id(plan)]["links"] == []
+    assert any(a["state"] == "included" for a in answer["files"].values())
+
+
+def test_an_unresolved_file_carries_its_survey_reading_for_the_review():
+    class LeavesPdfOpen(ScriptedModel):
+        def propose(self, packet):
+            reply = super().propose(packet)
+            for view, entry in zip(packet["files"], reply["files"]):
+                if view["path"].endswith(".pdf"):
+                    entry.update(state="unresolved", links=[], rationale="Cannot tell from what is shown.")
+            return reply
+    result = produce(pdf_package(), model=LeavesPdfOpen(), survey_files=survey(assembly_index=2, link="confirmed"))
+    open_files = [d for d in result["proposal"]["dispositions"] if d["state"] == "unresolved"]
+    assert len(open_files) == 1
+    assert open_files[0]["citations"] == [{"evidenceId": open_files[0]["evidenceId"], "locator": "package survey",
+                                           "observation": "The package survey linked this file to ASM-100300 (confirmed)."}]

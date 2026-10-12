@@ -45,7 +45,7 @@ def assessment_artifact(graph, classification, sources, hints):
 
     def code_open(item):
         return (open_allowed and item["determination"] == "unknown" and item["citations"] == []
-                and "EVIDENCE_CALL_FAILED" in item["conflicts"])
+                and ("EVIDENCE_CALL_FAILED" in item["conflicts"] or "EVIDENCE_QUOTE_UNVERIFIED" in item["conflicts"]))
 
     def citations(values, minimum=1):
         # The model supplies evidenceId, page and the exact quoted text. Code locates the text
