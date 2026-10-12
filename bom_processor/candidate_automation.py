@@ -383,7 +383,9 @@ class CandidateAutomationService:
         Only identifiers travel in the job environment; the author job reloads the hash-pinned
         failure event and prior code from storage.
         """
-        if (not isinstance(failure_event, dict) or not isinstance(failure_event.get("row_accounting"), dict)
+        from .row_refinement import parser_crash_message
+        if (not isinstance(failure_event, dict)
+                or not (isinstance(failure_event.get("row_accounting"), dict) or parser_crash_message(failure_event))
                 or not isinstance(candidate_id, str) or not isinstance(failure_event.get("validation_id"), str)):
             return {}
         return {"AUTHOR_REFINE_CANDIDATE": candidate_id,

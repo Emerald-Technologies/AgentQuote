@@ -63,12 +63,22 @@ class Starter:
         return f"execution-{len(self.calls)}"
 
 
-def lineage(storage, request_id, chain):
-    """Write refinement markers: chain[i+1] was refined from chain[i]."""
+def lineage(storage, request_id, chain, failures=None):
+    """Write refinement markers: chain[i+1] was refined from chain[i]; each parent's validation failure is
+    recorded as failures[parent] ("row" by default, or "crash")."""
     root = f"candidate-automation/{request_id}/author-refinement/{AUTHORING_VERSION}"
     for attempt, (parent, child) in enumerate(zip(chain, chain[1:]), 1):
         storage.registry[f"{root}/attempt-{attempt}.started.json"] = _json_bytes({"refinement_of": parent})
         storage.registry[f"{root}/attempt-{attempt}.completed.json"] = _json_bytes({"candidate_id": child})
+        kind = (failures or {}).get(parent, "row")
+        storage.candidates[f"candidates/events/{request_id}/{parent}/validation-failed-v1.json"] = _json_bytes(
+            event(parent) if kind == "row" else crash_event(parent))
+
+
+def crash_event(candidate_id, validation_id="v1"):
+    return {"event": "candidate.validation_failed", "error_code": "WORKER_PARSER_FAILED", "failure": "RuntimeError",
+            "candidate_id": candidate_id, "validation_id": validation_id, "repairable": True,
+            "failure_message": "parser failed | ValueError: source row was not accounted for"}
 
 
 def test_rounds_follow_the_refinement_lineage():
@@ -76,6 +86,24 @@ def test_rounds_follow_the_refinement_lineage():
     lineage(storage, "req", ["c0", "c1", "c2"])
     paths = lambda prefix: storage.list_registry_paths(prefix, 100)
     assert [row_accounting_rounds(storage, "req", c, AUTHORING_VERSION, paths) for c in ("c0", "c1", "c2")] == [0, 1, 2]
+
+
+def test_crashed_ancestors_do_not_count_as_row_accounting_rounds():
+    # Round 9 (A041): three crashes must not turn the first row-accounting failure into a hold.
+    storage, starter = InMemoryStorage(), Starter()
+    lineage(storage, "req", ["c0", "c1", "c2", "c3"], failures={"c0": "crash", "c1": "crash", "c2": "crash"})
+    paths = lambda prefix: storage.list_registry_paths(prefix, 100)
+    assert row_accounting_rounds(storage, "req", "c3", AUTHORING_VERSION, paths) == 0
+    automation = CandidateAutomationService(storage, author_starter=starter)
+    # Not held for a person (this unbudgeted double has its own attempt-marker limit; live requests use the budget).
+    assert automation.start_author_refinement("req", "c3", event("c3")) != HOLD_REASON
+
+
+def test_a_crash_refinement_carries_the_prior_candidate():
+    storage, starter = InMemoryStorage(), Starter()
+    automation = CandidateAutomationService(storage, author_starter=starter)
+    assert automation.start_author_refinement("req", "c0", crash_event("c0")) == "started"
+    assert (starter.calls[0]["AUTHOR_REFINE_CANDIDATE"], starter.calls[0]["AUTHOR_REFINE_VALIDATION"]) == ("c0", "v1")
 
 
 def event(candidate_id, validation_id="v1"):
@@ -102,7 +130,7 @@ def test_after_two_failed_rounds_the_request_is_held_for_a_person():
 
 def test_other_failures_keep_the_existing_refinement_without_prior_code():
     storage, starter = InMemoryStorage(), Starter()
-    lineage(storage, "req", ["c0", "c1", "c2"])
+    lineage(storage, "req", ["c0", "c1", "c2"], failures={"c0": "crash", "c1": "crash"})
     automation = CandidateAutomationService(storage, author_starter=starter)
     plain = {"event": "candidate.validation_failed", "failure": "KeyError", "failure_message": "missing column"}
     automation.start_author_refinement("req", "c2", plain)
@@ -192,3 +220,21 @@ def test_row_feedback_names_cited_cells_and_the_rule_explains_derived_values():
     assert "BOM!5 bom_notes<-col17" in text
     assert "Source category: Capacitor" in ROW_MAP_RULE and "several values separated by delimiters" in ROW_MAP_RULE
     assert "cited by no field goes in ignored_columns" in ROW_MAP_RULE
+
+
+def test_a_crashed_parser_is_corrected_from_its_own_code_with_the_error():
+    storage, request = authored_failure()
+    storage.candidates[f"candidates/events/{request.request_id}/c0/validation-failed-v1.json"] = _json_bytes(crash_event("c0"))
+    model = Model()
+    CandidateAuthoringService(request.request_id, storage, model, refine=("c0", "v1")).author()
+    prompt = model.prompts[0]
+    assert prompt.structural_profile["previous_parser_code"] == PRIOR
+    crash = [rule for rule in prompt.rules if rule.startswith("PARSER CRASH REFINEMENT")]
+    assert len(crash) == 1 and "source row was not accounted for" in crash[0] and "write your best reading" in crash[0]
+
+
+def test_authoring_rules_say_write_the_best_reading_instead_of_stopping():
+    from bom_processor.candidate_authoring import CANONICAL_OUTPUT_RULES, ROW_MAP_RULE
+    rules = " ".join(CANONICAL_OUTPUT_RULES)
+    assert "never stop on a row or value you are unsure about" in rules
+    assert "do not check row accounting yourself or stop over it" in ROW_MAP_RULE

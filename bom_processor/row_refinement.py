@@ -5,7 +5,10 @@
 - row_accounting_rounds: how many refinement rounds have already failed row accounting for this
   candidate's lineage (walks author-refinement markers, refinement_of links).
 - After MAX_ROW_ACCOUNTING_ROUNDS failed rounds the request is held for a person
-  (row_accounting_review_required) with the row locations listed; no override exists.
+  (row_accounting_review_required) with the row locations listed; no override exists. Only refinements
+  of a row-accounting failure count as rounds; a parser crash does not (round 9, A041).
+- parser_crash_message / crash_refinement_instructions: a crashed parser is corrected from its own
+  code with the bounded error message (round 9).
 Run: python -m pytest tests/test_row_refinement.py
 """
 from __future__ import annotations
@@ -84,9 +87,52 @@ def refinement_instructions(excerpt: dict[str, Any], round_number: int, rounds: 
             + json.dumps(excerpt, ensure_ascii=False, separators=(",", ":")))
 
 
+def parser_crash_message(event: dict[str, Any]) -> str | None:
+    """The bounded error message of a validation failure that was a parser crash, else None."""
+    fixtures = event.get("fixtures") if isinstance(event.get("fixtures"), list) else []
+    crashed = event.get("error_code") == "WORKER_PARSER_FAILED" or any(
+        isinstance(item, dict) and item.get("code") == "WORKER_PARSER_FAILED" for item in fixtures)
+    if not crashed:
+        return None
+    message = event.get("failure_message")
+    return message[:500] if isinstance(message, str) and message.strip() else "parser failed without a message"
+
+
+def crash_refinement_instructions(message: str) -> str:
+    return ("PARSER CRASH REFINEMENT. The previous parser (supplied as previous_parser_code) stopped with this "
+            "error when it ran on the source: " + json.dumps(message, ensure_ascii=False) + ". Find the cause in "
+            "previous_parser_code, correct it and return the complete replacement, keeping everything that "
+            "already works. Do not stop on rows or values you are unsure about: write your best reading of every "
+            "row with the row map, and validation will name the exact rows to correct. Never drop or invent a "
+            "row to get past the error.")
+
+
+def _row_failure_recorded(storage: Any, request_id: str, candidate_id: str) -> bool:
+    """True when a validation failure of this candidate was a row-accounting failure."""
+    root = f"candidates/events/{request_id}/{candidate_id}/"
+    try:
+        paths = storage.list_candidate_paths(root, 100)
+    except Exception:
+        return False
+    for path in paths:
+        if not (path.startswith(root) and "/validation-failed-" in path and path.endswith(".json")):
+            continue
+        try:
+            event = json.loads(storage.download_candidate(path, 1_000_000).decode("utf-8"))
+        except Exception:
+            continue
+        if isinstance(event, dict) and isinstance(event.get("row_accounting"), dict):
+            return True
+    return False
+
+
 def row_accounting_rounds(storage: Any, request_id: str, candidate_id: str, authoring_version: str,
                           list_paths: Any) -> int:
-    """Failed row-accounting rounds already spent on this candidate's lineage (including itself)."""
+    """Row-accounting refinement rounds already spent on this candidate's lineage.
+
+    Each ancestor whose own validation failed row accounting counts once; an ancestor that crashed or
+    failed for another reason does not (round 9: three crashes made the first row failure a hold).
+    """
     # attempt-N.started.json names refinement_of (written by the dispatcher); attempt-N.completed.json
     # names the candidate the author job produced. Together they link a candidate to its parent.
     root = f"candidate-automation/{request_id}/author-refinement/{authoring_version}/"
@@ -110,5 +156,6 @@ def row_accounting_rounds(storage: Any, request_id: str, candidate_id: str, auth
     while current in parents and current not in seen:
         seen.add(current)
         current = parents[current]
-        rounds += 1
+        if _row_failure_recorded(storage, request_id, current):
+            rounds += 1
     return rounds

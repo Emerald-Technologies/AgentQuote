@@ -43,7 +43,8 @@ ROW_MAP_RULE = (
     "title, blank, total, note, section, signature, other_sheet, other, \"rationale\"}. ignored_columns lists "
     "every source column holding data in BOM lines that feeds no output field: {\"sheet\", \"column\", \"reason\"}. "
     "Build the row map from the same reading that writes the output; validation checks it against every "
-    "row of the source and fails on any unaccounted, double-counted or mis-cited row"
+    "row of the source and reports each unaccounted, double-counted or mis-cited row by location, so do not "
+    "check row accounting yourself or stop over it"
 )
 EXCEPTION_POLICY_RULE = (
     "never use bare except, except Exception or except BaseException; catch specific exceptions such as ValueError or KeyError, or let errors propagate; a broad handler may contain only a raise statement, never pass, print, return, a fallback value or sys.exit"
@@ -76,6 +77,10 @@ CANONICAL_OUTPUT_RULES = (
     # Header words are clues, not rules (Nick 2026-10-11).
     "decide each source column's role the way a person would, from its header and its data together; header words are clues, not rules (a 'Manufacturers Part Number' column holds the MPN even though its header contains 'manufacturer'); write the roles you decided into the parser for this layout, for example by the exact header labels you read, never as generic keyword rules that could drop a column you can see",
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
+    # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not
+    # accounted for", "Missing item name"); a crash gives the next attempt only an error line, while
+    # written output lets validation name the exact rows to fix.
+    "never stop on a row or value you are unsure about, such as a row you cannot place, a missing name or an unexpected column: write your best reading of every row with the row map, because validation then names the exact rows to correct; a row that only adds to the line above (an alternate manufacturer, a continued description) belongs to that line's rows; raise only when the input cannot be opened or holds no BOM table",
     "reopen the XLSX before exit and fail unless its ordered columns and row count are correct",
     "read only --input and write only --output and, when given, --row-map; do not access network",
     # Enforced by _validate_code (broad_exception_handler); live authors kept breaking it unseen.
@@ -251,11 +256,16 @@ class CandidateAuthoringService:
         except Exception:
             raise AuthoringError("REFINEMENT_UNAVAILABLE") from None
         failure = event.get("row_accounting") if isinstance(event, dict) else None
+        from .row_refinement import crash_refinement_instructions, parser_crash_message
+        crash = parser_crash_message(event) if isinstance(event, dict) and failure is None else None
         if (not isinstance(manifest, dict) or manifest.get("candidate_id") != candidate_id
                 or manifest.get("code_sha256") != hashlib.sha256(code).hexdigest()
                 or event.get("candidate_id") != candidate_id or event.get("validation_id") != validation_id
-                or not isinstance(failure, dict)):
+                or not (isinstance(failure, dict) or crash is not None)):
             raise AuthoringError("REFINEMENT_INTEGRITY")
+        if crash is not None:
+            # Round 9: fix the crash in the prior code instead of rewriting from the error line alone.
+            return {"previous_parser_code": code.decode("utf-8"), "instructions": crash_refinement_instructions(crash)}
         source = next((item for item in fixtures if item["sha256"].lower() == failure.get("source_sha256")), None)
         if source is None:
             raise AuthoringError("REFINEMENT_INTEGRITY")
@@ -296,6 +306,7 @@ class CandidateAuthoringService:
             rules += HTML_XLS_RULES
         row_refinement = self._row_refinement(fixtures)
         if row_refinement is not None:
+            # Row-accounting failure, or (round 9) a parser crash: fixed from the prior code.
             rules = rules + (row_refinement["instructions"],)
         elif self.feedback:
             # Refinement context: tell the model what the previous attempt got wrong.
