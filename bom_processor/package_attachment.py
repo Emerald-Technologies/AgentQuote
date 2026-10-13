@@ -91,23 +91,21 @@ def attach_files(service: Any, plan: dict[str, Any], groups: list[dict[str, Any]
                          for index, row in enumerate(views[child]["rows"]) if index != own]
             comparisons[(parent, position, child)] = bom_attachment.compare(listed, file_rows)
 
-    def entries(key: int, trail: tuple[int, ...]) -> list[dict[str, Any]]:
-        result = []
+    def entries(key: int, trail: tuple[int, ...], under: int | None, result: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """One flat list, depth first; "under" is the index of the entry whose BOM holds the line (None: the group's)."""
         actions = [(position, child, "attached") for position, child in decided["attach"].get(key, [])]
         actions += [(position, child, "compared") for position, child in decided["compare"].get(key, [])]
         for position, child, action in sorted(actions):
             if child in trail:
                 continue
-            evidence = dict(ready[child]["evidence"])
-            nested = entries(child, trail + (child,))
-            if nested:
-                evidence["subassembly_files"] = nested
-            entry = {"position": position + 1, "item_number": nodes[key].lines[position][0], "action": action,
-                     "assembly_identity": ready[child]["evidence"]["assembly_identity"],
-                     "document_ids": ready[child]["document_ids"], "evidence": evidence}
+            entry = {"under": under, "position": position + 1, "item_number": nodes[key].lines[position][0],
+                     "action": action, "assembly_identity": ready[child]["evidence"]["assembly_identity"],
+                     "document_ids": ready[child]["document_ids"], "evidence": ready[child]["evidence"]}
             if action == "compared":
                 entry["comparison"] = comparisons[(key, position, child)]
             result.append(entry)
+            if action == "attached":
+                entries(child, trail + (child,), len(result) - 1, result)
         return result
 
     def all_children(key: int, trail: tuple[int, ...] = ()) -> set[int]:
@@ -129,7 +127,7 @@ def attach_files(service: Any, plan: dict[str, Any], groups: list[dict[str, Any]
                         "reason": UNCLEAR_REASON, "roles": ["bom"], "assemblies": [identity["name"]],
                         "mapping_keys": group.get("mapping_keys", []), "disposition_keys": group.get("disposition_keys", [])})
             continue
-        found = entries(key, (key,))
+        found = entries(key, (key,), None, [])
         if not found:
             out.append(group)
             continue
@@ -156,15 +154,20 @@ def attach_files(service: Any, plan: dict[str, Any], groups: list[dict[str, Any]
     return out, findings
 
 
-def expanded(service: Any, plan: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
-    """One BOM with its attached files: rows in published order, (row, parent row) in source order."""
+def expanded(service: Any, plan: dict[str, Any], evidence: dict[str, Any], entries: list[dict[str, Any]],
+             under: int | None = None) -> dict[str, Any]:
+    """One BOM with its attached files: rows in published order, (row, parent row) in source order.
+
+    entries is the group's flat sub-assembly file list; this BOM's own are those whose "under" is ``under``.
+    """
     view = service._reconciled(plan, evidence)
     ref, parents, proven = service._published_parents(plan, {"evidence": evidence}, view)
     rows = view["rows"]
-    attached: dict[int, list[dict[str, Any]]] = {}
-    for entry in evidence.get("subassembly_files", []):
+    mine = [(number, entry) for number, entry in enumerate(entries) if entry["under"] == under]
+    attached: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    for number, entry in mine:
         if entry["action"] == "attached":
-            attached.setdefault(entry["position"] - 1, []).append(entry)
+            attached.setdefault(entry["position"] - 1, []).append((number, entry))
     out_rows: list[dict[str, Any]] = []
     index: dict[int, int] = {}
     children: dict[int, list[tuple[int, int | None]]] = {}
@@ -172,8 +175,8 @@ def expanded(service: Any, plan: dict[str, Any], evidence: dict[str, Any]) -> di
     for position, row in enumerate(rows):
         index[position] = len(out_rows)
         out_rows.append(row)
-        for entry in attached.get(position, []):
-            child = expanded(service, plan, entry["evidence"])
+        for number, entry in attached.get(position, []):
+            child = expanded(service, plan, entry["evidence"], entries, number)
             name = entry["assembly_identity"]["name"]
             own = next((r for r, p in child["order"] if p is None
                         and bom_attachment.names(_text(child["rows"][r].get("item_number")), name)), None)
@@ -191,7 +194,7 @@ def expanded(service: Any, plan: dict[str, Any], evidence: dict[str, Any]) -> di
                           "document_ids": entry["document_ids"]})
             files += [{**item, "line": moved[item["line"]] if item["line"] in moved else here}
                       for item in child["files"]]
-    for entry in evidence.get("subassembly_files", []):
+    for _, entry in mine:
         if entry["action"] == "compared":
             files.append({"line": index[entry["position"] - 1], "action": "compared",
                           "assembly_identity": entry["assembly_identity"], "document_ids": entry["document_ids"],
@@ -207,7 +210,7 @@ def expanded(service: Any, plan: dict[str, Any], evidence: dict[str, Any]) -> di
 def structure(service: Any, plan: dict[str, Any], group: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """(published rows, structure) for a group with attached files."""
     from .package_resolution import STRUCTURE_VERSION, PackageResolutionError, _cell, _cell_text
-    built = expanded(service, plan, group["evidence"])
+    built = expanded(service, plan, group["evidence"], group["evidence"]["subassembly_files"])
     rows = built["rows"]
     lines = [bom_structure.Line(r + 2, _cell_text(rows[r].get("item_number")), _cell_text(rows[r].get("item_name")),
                                 _cell_text(rows[r].get("item_category")), _cell(rows[r].get("quantity")),

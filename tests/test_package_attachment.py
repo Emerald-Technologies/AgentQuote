@@ -72,6 +72,11 @@ def test_a_file_named_twice_is_used_for_each_and_files_nest():
     _, packages, plan_id, approval_id, resolved, review = run([
         top(["CBL-9", "CABLE ASSY FAN", 2, "A", 1], ["KIT-5", "SUBASSEMBLY 7", 1, "A", 1], SCREW), CABLE, kit])
     assert codes(review) == ["SUBASSEMBLY_FILE_ATTACHED", "SUBASSEMBLY_FILE_SHARED"]
+    # One flat list (bounded nesting for QuickQuote): each entry names the entry whose BOM holds its line.
+    files = review["groups"][0]["evidence"]["subassembly_files"]
+    assert [(item["under"], item["item_number"], item["assembly_identity"]["name"]) for item in files] == [
+        (None, "CBL-9", "cbl-9"), (None, "KIT-5", "kit-5"), (1, "CBL-9", "cbl-9")]
+    assert not any("subassembly_files" in item["evidence"] for item in files)
     (result,) = resolved["results"]
     assert result["subassembly_document_ids"] == ["doc-2", "doc-3"]
     lines = by_key(structure_of(packages, plan_id, approval_id, result))
