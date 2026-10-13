@@ -216,6 +216,9 @@ class ParentPackageService:
             groups.append(projected)
         groups = self._reconcile_review_groups(groups, dispositions, primaries)
         linked = choice_result is not None and "requested_assemblies" in choice_result
+        from .package_attachment import attach_files
+        groups, subassembly_findings = attach_files(self, plan, groups,
+                                                    choice_result["requested_assemblies"] if linked else None)
         if linked:
             groups = requested_links(groups, choice_result)
         complete &= all(group.get("status") in ("ready", "excluded") for group in groups)
@@ -235,6 +238,8 @@ class ParentPackageService:
                 "status": "awaiting_approval" if ready else "pending",
                 "source_count": len(plan["sources"]), "groups": groups,
                 "assembly_mappings": mappings, "conflict_dispositions": dispositions}
+        if subassembly_findings:
+            body["subassembly_findings"] = subassembly_findings
         if choice_result is not None:
             failures = [item for item in choice_result["findings"]
                         if item["code"] in PACKAGE_CHOICE_FINDING_CODES and item.get("raised_by") == "code"]
@@ -317,43 +322,29 @@ class ParentPackageService:
         existing = self.storage.download_output(manifest_path, self.max_output_bytes)
         if existing is not None:
             return self._validate_resolved(existing, plan, approval, prefix)
-        processed_prefix = self._processed_prefix(plan)
         results = []
         for group in review["groups"]:
             if group.get("status") == "excluded":
                 continue
             evidence = group["evidence"]
-            fixtures = evidence["fixtures"]
-            fixture_bytes = [self._candidate_bytes(item["output"], item["prefix"])
-                             if item["storage"] == "candidate"
-                             else self._output_bytes(item["output"], processed_prefix)
-                             for item in fixtures]
-            row_sets = [self._rows(data) for data in fixture_bytes]
-            assembly = evidence["assembly_identity"]
-            reconciliation = reconcile_boms(row_sets, assembly=AssemblyIdentity(
-                assembly["name"], assembly.get("revision", "")))
-            disposition = evidence.get("conflict_disposition")
-            if reconciliation.relation == "conflict":
-                if disposition not in {item["fixture_key"] for item in fixtures}:
-                    raise PackageResolutionError("PACKAGE_MATERIAL_CONFLICT")
-                index = next(i for i, item in enumerate(fixtures) if item["fixture_key"] == disposition)
-                rows = list(row_sets[index])
-                relation = "human_selected_conflict"
-                origins = list(range(len(rows)))
+            view = self._reconciled(plan, evidence)
+            rows, relation = view["rows"], view["relation"]
+            if any(entry["action"] == "attached" for entry in evidence.get("subassembly_files", [])):
+                # Unit 6: attached sub-assembly files go under their lines; one structure for all.
+                from .package_attachment import structure as attached_structure
+                rows, structure = attached_structure(self, plan, group)
             else:
-                index = 0
-                rows, relation = list(reconciliation.rows), reconciliation.relation
-                origins = list(reconciliation.origins)
-                if evidence.get("reconciliation") == "primary_selected" and relation == "equivalent":
-                    relation = "primary_selected"
-            structure = self._group_structure(plan, group, fixtures[index], fixture_bytes[index], row_sets[index],
-                                              origins)
+                index = view["index"]
+                structure = self._group_structure(plan, group, view["fixtures"][index], view["fixture_bytes"][index],
+                                                  view["row_sets"][index], view["origins"])
             output = self._workbook(rows)
             digest = hashlib.sha256(output).hexdigest()
             output_path = f"{prefix}/objects/{digest}.xlsx"
             self.storage.upload_output_immutable(output_path, output, OUTPUT_CONTENT_TYPE)
             result = {"group_id": group["group_id"],
                       "document_ids": group["document_ids"],
+                      **({"subassembly_document_ids": group["subassembly_document_ids"]}
+                         if "subassembly_document_ids" in group else {}),
                       "assembly_identity": evidence["assembly_identity"],
                       "reconciliation": relation,
                       "evidence_sha256": _hash(evidence),
@@ -926,16 +917,76 @@ class ParentPackageService:
                            "disposition_keys": []})
         return result
 
-    def _group_structure(self, plan: dict[str, Any], group: dict[str, Any], fixture: dict[str, Any],
-                         data: bytes, rows: list[dict[str, Any]], origins: list[int]) -> dict[str, Any] | None:
-        """Unit 3b: the sub-assembly structure of the BOM whose rows are published; None when flat.
+    def _reconciled(self, plan: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+        """The rows one group publishes: reconciled, or a person's pick in a conflict; with the fixtures.
 
-        The row map is read again and re-checked against the source here (a recorded verdict is
-        never trusted); parents are used only when that check passes, otherwise the structure is
-        published as not proven. Lines are given by published line number (origins map the
-        re-sorted rows back to this BOM's rows).
+        origins map each published row to the chosen BOM's row; source_order lists published positions in
+        that BOM's own order (parents before children), or None when the rows are not one BOM's rows.
         """
-        from . import bom_structure
+        processed_prefix = self._processed_prefix(plan)
+        fixtures = evidence["fixtures"]
+        fixture_bytes = [self._candidate_bytes(item["output"], item["prefix"])
+                         if item["storage"] == "candidate"
+                         else self._output_bytes(item["output"], processed_prefix)
+                         for item in fixtures]
+        row_sets = [self._rows(data) for data in fixture_bytes]
+        assembly = evidence["assembly_identity"]
+        reconciliation = reconcile_boms(row_sets, assembly=AssemblyIdentity(
+            assembly["name"], assembly.get("revision", "")))
+        disposition = evidence.get("conflict_disposition")
+        if reconciliation.relation == "conflict":
+            if disposition not in {item["fixture_key"] for item in fixtures}:
+                raise PackageResolutionError("PACKAGE_MATERIAL_CONFLICT")
+            index = next(i for i, item in enumerate(fixtures) if item["fixture_key"] == disposition)
+            rows = list(row_sets[index])
+            relation = "human_selected_conflict"
+            origins = list(range(len(rows)))
+        else:
+            index = 0
+            rows, relation = list(reconciliation.rows), reconciliation.relation
+            origins = list(reconciliation.origins)
+            if evidence.get("reconciliation") == "primary_selected" and relation == "equivalent":
+                relation = "primary_selected"
+        published = {source_index: position for position, source_index in enumerate(origins)}
+        source_order = ([published[q] for q in range(len(row_sets[index]))]
+                        if sorted(published) == list(range(len(row_sets[index]))) else None)
+        return {"rows": rows, "relation": relation, "index": index, "fixtures": fixtures,
+                "fixture_bytes": fixture_bytes, "row_sets": row_sets, "origins": origins,
+                "source_order": source_order}
+
+    def _published_parents(self, plan: dict[str, Any], group: dict[str, Any],
+                           view: dict[str, Any] | None) -> tuple[dict[str, Any] | None, dict[int, int | None], bool]:
+        """(row map ref, published position -> parent position, proven) of a group's chosen BOM (unit 6).
+
+        A flat BOM has no parents and nothing to prove; claims that fail the re-check give no parents.
+        """
+        if view is None:
+            return None, {}, True
+        index = view["index"]
+        claimed = self._fixture_claims(plan, group, view["fixtures"][index], view["fixture_bytes"][index])
+        if claimed is None:
+            ref = (self._fixture_row_accounting(group, view["fixtures"][index]) or {}).get("row_map")
+            return (ref if isinstance(ref, dict) else None), {}, True
+        ref, claims, proven = claimed
+        if view["source_order"] is None:
+            raise PackageResolutionError("PACKAGE_STRUCTURE_INVALID")
+        if not proven:
+            return ref, {}, False
+        position = view["source_order"]
+        parents: dict[int, int | None] = {}
+        for row, parent in claims.items():
+            if (type(row) is not int or not 2 <= row < len(position) + 2
+                    or (parent is not None and (type(parent) is not int or not 2 <= parent < len(position) + 2))):
+                raise PackageResolutionError("PACKAGE_STRUCTURE_INVALID")
+            parents[position[row - 2]] = None if parent is None else position[parent - 2]
+        return ref, parents, True
+
+    def _fixture_claims(self, plan: dict[str, Any], group: dict[str, Any], fixture: dict[str, Any],
+                        data: bytes) -> tuple[dict[str, Any], dict[int, int | None], bool] | None:
+        """(row map ref, output row -> claimed parent row, proven), or None when the BOM claims no parents.
+
+        The row map is read again and re-checked against the source (a recorded verdict is never trusted).
+        """
         from .row_accounting import MAX_ROW_MAP_BYTES, verify_row_map
         accounting = self._fixture_row_accounting(group, fixture)
         ref = accounting.get("row_map") if isinstance(accounting, dict) else None
@@ -960,6 +1011,22 @@ class ParentPackageService:
         except Exception:
             verified = {"valid": False}
         proven = verified.get("valid") is True and (verified.get("structure") or {}).get("by") is not None
+        return ref, claims, proven
+
+    def _group_structure(self, plan: dict[str, Any], group: dict[str, Any], fixture: dict[str, Any],
+                         data: bytes, rows: list[dict[str, Any]], origins: list[int]) -> dict[str, Any] | None:
+        """Unit 3b: the sub-assembly structure of the BOM whose rows are published; None when flat.
+
+        The row map is read again and re-checked against the source here (a recorded verdict is
+        never trusted); parents are used only when that check passes, otherwise the structure is
+        published as not proven. Lines are given by published line number (origins map the
+        re-sorted rows back to this BOM's rows).
+        """
+        from . import bom_structure
+        claimed = self._fixture_claims(plan, group, fixture, data)
+        if claimed is None:
+            return None
+        ref, claims, proven = claimed
         lines = [bom_structure.Line(index + 2, _cell_text(row.get("item_number")), _cell_text(row.get("item_name")),
                                     _cell_text(row.get("item_category")), _cell(row.get("quantity")),
                                     any(_cell(value) is not None for key, value in row.items()
@@ -1199,11 +1266,12 @@ class ParentPackageService:
         review_groups = {item["group_id"]: item for item in approval.get("review", {}).get("groups", [])
                  if isinstance(item, dict) and isinstance(item.get("group_id"), str)}
         covered: list[str] = []
+        attached: set[str] = set()
         paths: dict[str, dict[str, Any]] = {}
         seen_groups: set[str] = set()
         for result in results:
             if (not isinstance(result, dict)
-                or set(result) not in (_RESULT_KEYS, _RESULT_KEYS | {"structure"})
+                or not _RESULT_KEYS <= set(result) <= _RESULT_KEYS | {"structure", "subassembly_document_ids"}
                 or ("structure" in result and manifest["version"] != MANIFEST_V2)
                 or not isinstance(result.get("document_ids"), list)
                     or not result["document_ids"]
@@ -1217,6 +1285,7 @@ class ParentPackageService:
             seen_groups.add(result["group_id"])
             evidence = group.get("evidence", {})
             if (result["document_ids"] != group.get("document_ids")
+                    or result.get("subassembly_document_ids") != group.get("subassembly_document_ids")
                     or result["assembly_identity"] != evidence.get("assembly_identity")
                     or result["evidence_sha256"] != _hash(evidence)
                     or result["provenance"] != self._result_provenance(evidence)):
@@ -1227,6 +1296,7 @@ class ParentPackageService:
             if result["reconciliation"] != expected_relation:
                 raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
             covered.extend(result["document_ids"])
+            attached.update(result.get("subassembly_document_ids", []))
             output = result.get("output")
             path = output.get("blob_path") if isinstance(output, dict) else None
             if (not isinstance(output, dict)
@@ -1246,7 +1316,15 @@ class ParentPackageService:
                 raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT") from exc
         excluded = {doc for item in plan["assignments"] if item["kind"] == "excluded"
                     for doc in item["document_ids"]}
-        expected = [item["document_id"] for item in plan["sources"] if item["document_id"] not in excluded]
+        # Unit 6: files set aside at review, and files used under a line of another BOM (a shared file
+        # may be used under several), are covered without a result of their own.
+        excluded |= {doc for item in approval.get("review", {}).get("groups", [])
+                     if isinstance(item, dict) and item.get("status") == "excluded"
+                     for doc in item.get("document_ids", [])}
+        if attached & (excluded | set(covered)):
+            raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
+        expected = [item["document_id"] for item in plan["sources"]
+                    if item["document_id"] not in excluded and item["document_id"] not in attached]
         if (manifest["version"] == MANIFEST_V2) != any("structure" in item for item in results):
             raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
         if (results != sorted(results, key=lambda item: item["document_ids"])

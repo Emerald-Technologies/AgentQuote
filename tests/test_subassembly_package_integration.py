@@ -95,16 +95,19 @@ for sheet in source:
             current["_map"]["fields"]["manufacturer_" + str(slot)] = at("Maker", coded)
             current["_map"]["fields"]["manufacturer_item_number_" + str(slot)] = at("MPN")
         elif item is not None and quantity is not None:
-            heading = next(key for key in KINDS if key in headers)
+            heading = next((key for key in KINDS if key in headers), None)
             record = dict.fromkeys(columns)
             record.update(item_number=str(item), item_name=str(get("Desc")), item_category="Part", quantity=quantity)
             fields = {"item_number": at("Part"), "item_name": at("Desc"), "quantity": at("Qty")}
+            if get("Rev") is not None:
+                record["revision"] = str(get("Rev"))
+                fields["revision"] = at("Rev")
             if maker is not None and mpn is not None:
                 name, coded = maker_value(str(maker))
                 record.update(manufacturer_1=name, manufacturer_item_number_1=str(mpn))
                 fields.update(manufacturer_1=at("Maker", coded), manufacturer_item_number_1=at("MPN"))
             record["_map"] = {"sheet": sheet.title, "rows": [number], "fields": fields}
-            record["_structure"] = (KINDS[heading], get(heading), at(heading))
+            record["_structure"] = (KINDS[heading], get(heading), at(heading)) if heading else None
             records.append(record)
             current = record
         else:
@@ -112,6 +115,8 @@ for sheet in source:
 source.close()
 # Parent of each line (output row), from the structure column; quantities stay as printed.
 for index, record in enumerate(records):
+    if record["_structure"] is None:
+        continue  # a flat BOM states no parents
     kind, value, cell = record["_structure"]
     earlier = list(reversed(list(enumerate(records[:index]))))
     if kind == "level":
@@ -160,18 +165,35 @@ def workbook(form):
     return stream.getvalue()
 
 
-def execute(parser=PARSER, through="resolve"):
+def book(assembly, revision, header, rows):
+    """A workbook in the fixture layout: assembly and revision above a header row at row 3."""
+    data = Workbook()
+    sheet = data.active
+    sheet.title = "Customer"
+    sheet.append(["Assembly", assembly])
+    sheet.append(["Revision", revision])
+    sheet.append(header)
+    for row in rows:
+        sheet.append(row)
+    stream = io.BytesIO()
+    data.save(stream)
+    data.close()
+    return stream.getvalue()
+
+
+def execute(parser=PARSER, through="resolve", books=None):
+    """books: [(assembly, revision, workbook bytes)]; the three forms by default."""
     store = InMemoryStorage()
     sources, associations, roles = [], {}, {}
-    for index, form in enumerate(FORMS, 1):
-        source = workbook(form)
+    books = books or [(FORMS[form][0], "A", workbook(form)) for form in FORMS]
+    for index, (assembly, revision, source) in enumerate(books, 1):
         digest = hashlib.sha256(source).hexdigest()
         path = f"customer/rfq-{RFQ}/package-1/original-boms/attachment-{index}.xlsx"
         store.sources[path] = source
         sources.append({"document_id": f"doc-{index}", "blob_path": path, "sha256": digest, "size_bytes": len(source)})
         associations[digest] = {"version": ASSOCIATION_VERSION, "source_sha256": digest,
-            "name": {"value": FORMS[form][0], "cell": {"sheet": "Customer", "row": 1, "column": 2}},
-            "revision": {"value": "A", "cell": {"sheet": "Customer", "row": 2, "column": 2}},
+            "name": {"value": assembly, "cell": {"sheet": "Customer", "row": 1, "column": 2}},
+            "revision": {"value": revision, "cell": {"sheet": "Customer", "row": 2, "column": 2}},
             "rationale": "Synthetic: assembly and revision declared above the BOM.", "findings": []}
         roles[digest] = {"version": ROLE_VERSION, "source_sha256": digest, "role": "bom",
             "rationale": "Synthetic: one row per part with quantity and a structure column.",

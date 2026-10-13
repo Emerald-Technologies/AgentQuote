@@ -142,7 +142,10 @@ class SystemPackageService(ParentPackageService):
         # Independently rebuild full review without mappings/conflict choices.
         self._verify_plan_sources(plan_id)
         review = self.review(plan_id)
+        # Unit 6: an attached, shared or matching sub-assembly file is information; any other
+        # sub-assembly file finding (differs, unclear, set aside) needs a person.
         if (review.get("package_choice_findings")
+                or any(item.get("severity") != "information" for item in review.get("subassembly_findings", []))
                 or not review["approval_ready"] or not review["complete"]
                 or review["manifest_sha256"] != review_manifest_sha256
                 or review["assembly_mappings"] or review["conflict_dispositions"]):
@@ -151,6 +154,7 @@ class SystemPackageService(ParentPackageService):
             raise PackageResolutionError("SYSTEM_REVIEW_NOT_QUALIFIED")
         actual = []
         covered = []
+        attached: set[str] = set()
         ready = []
         for group in review["groups"]:
             if group.get("status") == "excluded" and group.get("kind") == "excluded":
@@ -171,6 +175,7 @@ class SystemPackageService(ParentPackageService):
                 raise PackageResolutionError("SYSTEM_REVIEW_REQUIRES_EXCEPTION")
             actual.append(evidence["assembly_identity"])
             covered.extend(group["document_ids"])
+            attached.update(group.get("subassembly_document_ids", []))
             ready.append(group)
         actual.sort(key=lambda item: (item["name"], item["revision"]))
         plan = self._plan(plan_id)
@@ -183,7 +188,8 @@ class SystemPackageService(ParentPackageService):
                     _guard.reject(exc)
                 raise
         if ((bindings is None and actual != identities) or len(covered) != len(set(covered))
-                or sorted(covered) != sorted(item["document_id"] for item in plan["sources"])):
+                or attached & set(covered)
+                or sorted(covered + sorted(attached)) != sorted(item["document_id"] for item in plan["sources"])):
             if _guard is not None:
                 _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
