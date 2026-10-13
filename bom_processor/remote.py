@@ -23,6 +23,8 @@ from .master_registry import RegistryError
 from .master_registry import profile_bytes
 from .candidates import (AggregateCandidateRequiredError, CandidateRequiredError,
                          persist_candidate)
+from .row_accounting import (MAX_ROW_MAP_BYTES, RESULT_VERSION as ROW_ACCOUNTING_RESULT_VERSION,
+                             ROW_MAP_NAME, RowMapError, verify_row_map)
 
 
 class RemoteBomProcessor:
@@ -219,11 +221,14 @@ class RemoteBomProcessor:
             worker_job_id = f"{request.job_id}-{document.document_id}"
             selected = selections.get(document.document_id)
             worker_prefix = f"{prefix}/worker/{worker_job_id}"
+            # Sub-assembly plan R3: a variant whose provenance shows it was validated with a row map
+            # is asked for one on reuse, and its output is row-checked like a candidate's.
+            row_checked = selected is not None and selected.row_map
             item = WorkItem(worker_job_id, "boms", "parsers", "boms", document.blob_path,
                             selected.variant.code_path if selected else f"{request.parser_key}/parse.py", document.sha256.lower(), document.size_bytes,
                             _sha256(selected.code) if selected else _sha256(legacy_parser), len(selected.code) if selected else len(legacy_parser), worker_prefix,
                             f"input{PurePosixPath(document.blob_path).suffix.lower()}",
-                            "output.xlsx", "result.json")
+                            "output.xlsx", "result.json", row_map_name=ROW_MAP_NAME if row_checked else None)
             try:
                 started = self.orchestrator.start(item)
                 raw = self._poll(item, started.execution_name)
@@ -231,11 +236,13 @@ class RemoteBomProcessor:
                 raise
             except Exception as exc:
                 raise ProcessingError("job failed") from exc
-            output = self._worker_result(raw, item)
+            output, mapped = self._worker_result(raw, item)
             worker_bytes = self.storage.download_output(item.output_blob, self.max_output_bytes)
             if worker_bytes is None:
                 raise ProcessingError("worker output missing")
             _validate_xlsx_bytes(worker_bytes, self.max_rows)
+            accounting = _reuse_row_accounting(source, PurePosixPath(document.blob_path).suffix.lower(),
+                                               worker_bytes, item, mapped) if selected is not None else None
             final_path = f"{prefix}/{document.document_id}-parsed.xlsx"
             self.storage.upload_output_immutable(final_path, worker_bytes, OUTPUT_CONTENT_TYPE)
             result = {"source": {"document_id": document.document_id, "blob_path": document.blob_path,
@@ -244,6 +251,8 @@ class RemoteBomProcessor:
                                     "sha256": _sha256(worker_bytes), "content_type": OUTPUT_CONTENT_TYPE}}
             if selected is not None:
                 result["parser"] = self._result_parser_provenance(request.parser_key, selected)
+                # Beside, never inside, "parser": package_resolution checks those keys exactly.
+                result["row_accounting"] = accounting
             results.append(result)
         manifest = {"version": CONTRACT_VERSION, "status": "completed", "job_id": request.job_id,
                     "request_fingerprint": fingerprint, "customer_key": request.customer_key,
@@ -346,10 +355,12 @@ class RemoteBomProcessor:
             self.sleep(self.poll_interval_seconds)
         raise ProcessingError("job timed out")
 
-    def _worker_result(self, raw: bytes, item: WorkItem) -> bytes:
+    def _worker_result(self, raw: bytes, item: WorkItem) -> tuple[bytes, bytes | None]:
+        """The verified output bytes and, when one was asked for, the verified row map bytes."""
         try: value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise ProcessingError("worker result schema invalid") from exc
-        if (not isinstance(value, dict) or value.get("contract_version") != "remote-worker.v1"
+        contract = "remote-worker.v3" if item.row_map_name else "remote-worker.v1"
+        if (not isinstance(value, dict) or value.get("contract_version") != contract
                 or value.get("job") != item.job_id or value.get("status") != "completed"):
             raise ProcessingError("worker result schema invalid")
         for section, expected_hash, expected_size in (("input", item.input_sha256, item.input_size), ("parser", item.parser_sha256, item.parser_size)):
@@ -365,7 +376,19 @@ class RemoteBomProcessor:
         worker_bytes = self.storage.download_output(item.output_blob, self.max_output_bytes)
         if worker_bytes is None or len(worker_bytes) != output["size"] or _sha256(worker_bytes).lower() != output["sha256"].lower():
             raise ProcessingError("worker output hash mismatch")
-        return worker_bytes
+        if not item.row_map_name:
+            return worker_bytes, None
+        # The row map's integrity is a hard check (as in candidate validation); only the row
+        # check's verdict is a warning on reuse (Nick 2026-10-12).
+        row_map = value.get("row_map")
+        if (not isinstance(row_map, dict) or row_map.get("content_type") != "application/json"
+                or type(row_map.get("size")) is not int or not 0 < row_map["size"] <= MAX_ROW_MAP_BYTES
+                or not isinstance(row_map.get("sha256"), str)):
+            raise ProcessingError("worker row map schema invalid")
+        mapped = self.storage.download_output(item.row_map_blob, MAX_ROW_MAP_BYTES)
+        if mapped is None or len(mapped) != row_map["size"] or _sha256(mapped).lower() != row_map["sha256"].lower():
+            raise ProcessingError("worker row map hash mismatch")
+        return worker_bytes, mapped
 
     def _validate_manifest(self, raw: bytes, request: ProcessingRequest, fingerprint: str) -> dict[str, Any]:
         try: value = json.loads(raw)
@@ -373,6 +396,31 @@ class RemoteBomProcessor:
         if not isinstance(value, dict) or value.get("request_fingerprint") != fingerprint or value.get("status") != "completed":
             raise BlobConflictError("job id already used by a different request")
         return value
+
+
+def _reuse_row_accounting(source: bytes, suffix: str, output: bytes, item: WorkItem,
+                          mapped: bytes | None) -> dict[str, Any]:
+    """Row check of a reused approved parser's output (sub-assembly plan R3, Nick 2026-10-12).
+
+    A failed check is a warning carried with the result, never a stop. Counts and codes only; the
+    row map stays in the output store (its path and hash are recorded) for the structure step.
+    A variant approved before provenance existed is reused unchecked, and says so.
+    """
+    if mapped is None:
+        return {"checked": False, "reason": "PARSER_APPROVED_WITHOUT_ROW_MAP"}
+    try:
+        verified = verify_row_map(source, suffix, output, mapped)
+    except RowMapError as exc:
+        verified = {"version": ROW_ACCOUNTING_RESULT_VERSION, "valid": False, "error": str(exc)}
+    except Exception:
+        verified = {"version": ROW_ACCOUNTING_RESULT_VERSION, "valid": False, "error": "ROW_MAP_UNVERIFIABLE"}
+    summary = {key: verified[key] for key in (
+        "version", "valid", "error", "source_rows", "line_rows", "skipped_rows", "output_lines",
+        "failed_row_count", "failure_codes", "maker_code_prefix_kept", "structure") if key in verified}
+    summary["unmapped_column_count"] = len(verified.get("unmapped_columns", []))
+    summary["pattern_finding_count"] = len(verified.get("pattern_findings", []))
+    return {"checked": True, **summary,
+            "row_map": {"blob_path": item.row_map_blob, "sha256": _sha256(mapped), "size": len(mapped)}}
 
 
 def _validate_xlsx_bytes(data: bytes, max_rows: int) -> None:

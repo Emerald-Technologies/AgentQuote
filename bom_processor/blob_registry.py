@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from . import variant_provenance
 from .master_registry import (ApprovalRecord, ApprovedVariant, RegistryError,
                               VariantSignature, _hash, profile_bytes)
 
@@ -15,6 +16,9 @@ class RegistrySelection:
     code: bytes
     generation: int
     selection_mode: str = "registry"
+    # Sub-assembly plan R3: the variant's provenance says it was validated with a row map, so reuse
+    # asks for one and checks it. False for variants approved before provenance existed.
+    row_map: bool = False
 
 
 class BlobRegistryReader:
@@ -52,6 +56,7 @@ class BlobRegistryReader:
         if type(generation) is not int or generation < 0 or not isinstance(variants, list):
             raise RegistryError("REGISTRY_CORRUPT")
         found: list[tuple[ApprovedVariant, VariantSignature]] = []
+        approvals: dict[tuple[str, str], ApprovalRecord] = {}
         try:
             for item in variants:
                 if not isinstance(item, dict): raise ValueError()
@@ -78,6 +83,7 @@ class BlobRegistryReader:
                         or approval.signature_hash != variant.signature_hash or approval.rule_hash != variant.rule_hash
                         or approval.code_sha256 != variant.code_sha256): raise ValueError()
                 found.append((variant, signature))
+                approvals[(variant.variant_id, variant.version)] = approval
         except RegistryError:
             raise
         except Exception as exc:
@@ -90,4 +96,14 @@ class BlobRegistryReader:
         code = self.read(variant.code_path, self.max_bytes)
         if _hash(code) != variant.code_sha256:
             raise RegistryError("REGISTRY_CORRUPT")
-        return RegistrySelection(variant, code, generation)
+        provenance_path = f"approved/{parser_key}/{variant.variant_id}/{variant.version}/{variant_provenance.NAME}"
+        try:
+            record = self._json(provenance_path)
+        except FileNotFoundError:
+            row_map = False  # approved before provenance was recorded
+        else:
+            try:
+                row_map = variant_provenance.row_map_supported(record, approvals[(variant.variant_id, variant.version)])
+            except (KeyError, ValueError) as exc:
+                raise RegistryError("REGISTRY_CORRUPT") from exc
+        return RegistrySelection(variant, code, generation, row_map=row_map)

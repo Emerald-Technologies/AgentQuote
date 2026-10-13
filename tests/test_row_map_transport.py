@@ -111,7 +111,11 @@ def test_candidates_from_older_authoring_versions_are_validated_without_a_row_ma
     assert ROW_MAP_AUTHORING_VERSIONS == {"candidate-authoring.v9", "candidate-authoring.v10"}
 
 
-def test_production_processing_never_requests_a_row_map():
+def test_production_processing_requests_a_row_map_only_when_provenance_shows_one():
+    # Sub-assembly plan R3 (Nick 2026-10-12) replaced "never": legacy variants still run without
+    # one, because --row-map would fail a parser that does not accept it (test_reuse_row_check.py).
     import inspect
     from bom_processor import remote
-    assert "row_map_name" not in inspect.getsource(remote)
+    source = inspect.getsource(remote)
+    assert "row_checked = selected is not None and selected.row_map" in source
+    assert "row_map_name=ROW_MAP_NAME if row_checked else None" in source

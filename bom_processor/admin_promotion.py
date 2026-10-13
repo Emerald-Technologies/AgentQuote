@@ -10,6 +10,7 @@ from .core import BlobConflictError, OUTPUT_CONTENT_TYPE, _json_bytes
 from .master_registry import ApprovalRecord, ApprovedVariant, RegistryError, VariantSignature, _hash
 from .remote import _validate_xlsx_bytes
 from .candidate_review import CandidateReviewError, CandidateReviewService
+from . import variant_provenance
 
 MAX_METADATA_BYTES = 1_000_000
 MAX_REASON_CHARS = 2_000
@@ -188,7 +189,13 @@ class AdminDecisionService:
                       evidence_manifest_hash, approver["object_id"], timestamp)
         parser_key = request["parser_key"]
         prefix = f"approved/{parser_key}/{variant_id}/{version}"
-        for path, data in ((f"{prefix}/parse.py", code), (f"{prefix}/signature.json", _json_bytes(signature.to_dict())), (f"{prefix}/approval.json", _json_bytes(approval.to_dict()))):
+        # Sub-assembly plan R3: whether reuse may ask this parser for a row map (deterministic, so
+        # a replayed promotion writes identical bytes).
+        provenance = variant_provenance.build(manifest, evidence, approval_id=approval_id, request_id=request_id,
+                                              candidate_id=candidate_id, validation_id=validation_id,
+                                              candidate_manifest_sha256=approval.candidate_hash)
+        for path, data in ((f"{prefix}/parse.py", code), (f"{prefix}/signature.json", _json_bytes(signature.to_dict())), (f"{prefix}/approval.json", _json_bytes(approval.to_dict())),
+                           (f"{prefix}/{variant_provenance.NAME}", _json_bytes(provenance))):
             self.storage.upload_registry_immutable(path, data, "text/x-python" if path.endswith(".py") else "application/json")
         variant = ApprovedVariant(parser_key, variant_id, version, f"{prefix}/parse.py", _sha(code), signature.signature_hash, signature.rule_hash, approval_id)
         generation = self._publish(parser_key, variant, signature, record)
