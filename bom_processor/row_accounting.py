@@ -20,6 +20,10 @@ locations only, never customer values. Code checks, on every row of the real fil
   code works out every parent from the cited cells and fails a different claim. All lines or none,
   one kind and one column. Quantities stay as printed (per parent); roll-down happens after this
   check, never in the parser. v1 maps (no parents) are still accepted;
+- a value kept on another sheet keyed by part number (unit 2b, AMAT shape: MPNs on an MFG sheet) is
+  cited as {"lookup": [sheet, row, column], "key": key column}: the key cell must equal the line's part
+  number, the cell must hold the value, every row on that sheet holding a maker or MPN for the part
+  must be carried by the line (LOOKUP_ROW_NOT_CARRIED), and looked-up rows count as accounted for;
 - every source column with data in BOM lines feeds a field or is declared ignored;
 - the manufacturer/MPN pattern holds on every line row (plan 8.12, step 4d): a column is never a
   manufacturer in one pair and an MPN in another, a manufacturer column always pairs with the same
@@ -261,6 +265,12 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
     part_links: Counter[tuple[str, int, int]] = Counter()
     pair_rows: list[tuple[str, int, int, int, bool]] = []
     maker_codes_kept = 0
+    # Unit 2b: rows on other sheets cited by lookup, the (sheet, key column) pairs used, and each
+    # line's looked-up rows. A looked-up row may serve several lines (a part used in several places).
+    looked_up: dict[tuple[str, int], set[int]] = {}
+    lookup_keys: set[tuple[str, int]] = set()
+    line_lookups: dict[int, set[tuple[str, int]]] = {}
+    item_column = columns.index("item_number") + 1
     allowed_fields = set(columns) - _FIXED
     claims: list[tuple[int, str, int, dict[str, Any]]] = []
     for line in lines:
@@ -303,6 +313,41 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
         contributed: set[int] = set()
         for field, link in fields.items():
             target = parsed.cells.get((out_sheet, out, columns.index(field) + 1))
+            if isinstance(link, dict) and "lookup" in link:
+                # Unit 2b (AMAT shape, Nick 2026-10-12): a value kept on another sheet, keyed by
+                # the line's part number (for example MPNs on an MFG sheet).
+                _keys(link, {"lookup", "key"}, "ROW_MAP_LINK_INVALID")
+                cited, key_column = link["lookup"], link["key"]
+                _require(isinstance(cited, list) and len(cited) == 3 and _name(cited[0])
+                         and cited[0] in original.sheets and cited[0] != sheet
+                         and all(type(item) is int and item >= 1 for item in cited[1:])
+                         and type(key_column) is int and key_column >= 1, "ROW_MAP_LINK_INVALID")
+                if field in {"item_number", "quantity"}:
+                    fail(first, "LOOKUP_NOT_ALLOWED")
+                    continue
+                look_sheet, look_row, look_column = cited
+                key_value = original.cells.get((look_sheet, look_row, key_column))
+                item = parsed.cells.get((out_sheet, out, item_column))
+                if key_value is None or item is None or not _text(item) or _text(key_value) != _text(item):
+                    fail(first, "LOOKUP_KEY_MISMATCH")
+                    continue
+                value = original.cells.get((look_sheet, look_row, look_column))
+                if value is None or target is None or not _same(value, target, False):
+                    fail((look_sheet, look_row), "FIELD_VALUE_MISMATCH")
+                    if len(mismatches) < MAX_RECORDED_MISMATCHES:
+                        mismatches.append({"sheet": look_sheet, "row": look_row, "field": field,
+                                           "column": look_column, "part": False})
+                    continue
+                looked_up.setdefault((look_sheet, look_row), set()).add(out)
+                lookup_keys.add((look_sheet, key_column))
+                line_lookups.setdefault(out, set()).add((look_sheet, look_row))
+                used_columns.update({(look_sheet, look_column), (look_sheet, key_column)})
+                cited_cells.add((look_sheet, look_row, look_column))
+                if field.startswith("manufacturer_"):
+                    role = "mpn" if field.startswith("manufacturer_item_number_") else "manufacturer"
+                    column_roles.setdefault((look_sheet, look_column), set()).add(role)
+                    pair_cells.add((look_sheet, look_row, look_column))
+                continue
             if isinstance(link, dict):
                 _keys(link, {"derived"}, "ROW_MAP_LINK_INVALID")
                 _require(_reason(link["derived"]), "ROW_MAP_LINK_INVALID")
@@ -355,6 +400,9 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
         for index in range(1, pairs + 1):
             manufacturer = fields.get(f"manufacturer_{index}")
             mpn = fields.get(f"manufacturer_item_number_{index}")
+            looked = [link["lookup"][:2] for link in (manufacturer, mpn) if isinstance(link, dict) and "lookup" in link]
+            if len(looked) == 2 and looked[0] != looked[1]:
+                fail(tuple(looked[1]), "PAIR_ROWS_DIFFER")
             if isinstance(manufacturer, list) and isinstance(mpn, list) and manufacturer[0] != mpn[0]:
                 fail((sheet, mpn[0]), "PAIR_ROWS_DIFFER")
             elif isinstance(manufacturer, list) and isinstance(mpn, list):
@@ -362,6 +410,20 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 pair_rows.append((sheet, manufacturer[0], manufacturer[1], mpn[1],
                                   manufacturer[2:] == ["part"] and mpn[2:] == ["part"]))
     _require(mapped_output == output_rows, "ROW_MAP_OUTPUT_COVERAGE_INVALID")
+
+    # Unit 2b: every row on a lookup sheet that holds a maker or MPN for a line's part number is
+    # carried by that line, so an alternate kept on another sheet cannot be left out silently.
+    if lookup_keys:
+        items = {out: _text(parsed.cells.get((out_sheet, out, item_column)) or "") for out in mapped_output}
+        for look_sheet, key_column in sorted(lookup_keys):
+            pair_columns_here = {column for (s, column) in column_roles if s == look_sheet}
+            by_key: dict[str, set[tuple[str, int]]] = {}
+            for (s, row), cols in source_rows.items():
+                if s == look_sheet and cols & pair_columns_here and (s, row, key_column) in original.cells:
+                    by_key.setdefault(_text(original.cells[(s, row, key_column)]), set()).add((s, row))
+            for out, item in sorted(items.items()):
+                for key in sorted(by_key.get(item, set()) - line_lookups.get(out, set())):
+                    fail(key, "LOOKUP_ROW_NOT_CARRIED")
 
     # Sub-assembly structure (unit 2): code works out each line's parent from the cited cells and
     # compares it with the parser's claim. All lines or none, one kind, one column, one sheet.
@@ -378,7 +440,6 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 fail((sheet, row), "STRUCTURE_INCONSISTENT")
         else:
             kind = next(iter(kinds))
-            item_column = columns.index("item_number") + 1
             ordered = []
             for out, sheet, row, claim in sorted(claims, key=lambda item: item[2]):
                 cell_row, cell_column = claim["from"]
@@ -456,14 +517,14 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 key = (entry["sheet"], row)
                 if key not in source_rows:
                     continue  # Ranges may cover blank rows.
-                if key in owner:
+                if key in owner or key in looked_up:
                     fail(key, "ROW_IN_LINE_AND_SKIPPED")
                 elif key in skipped_rows:
                     fail(key, "ROW_SKIPPED_TWICE")
                 else:
                     skipped_rows[key] = entry["reason"]
     for key in source_rows:
-        if key not in owner and key not in skipped_rows:
+        if key not in owner and key not in skipped_rows and key not in looked_up:
             fail(key, "ROW_UNACCOUNTED")
     for key, reason in skipped_rows.items():
         if reason == "header":
@@ -533,4 +594,5 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
         "maker_code_prefix_kept": maker_codes_kept,
         # Sub-assembly structure proven from the cited cells (counts only; the claims stay in the map).
         "structure": structure,
+        "lookup_rows": len(looked_up),
     }

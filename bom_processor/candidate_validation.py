@@ -210,7 +210,7 @@ _ROW_MAP_SHAPES = {
     "ROW_MAP_SHEET_INVALID": "sheet is the exact name of a worksheet in --input",
     "ROW_MAP_ROWS_INVALID": "rows is a flat list of distinct integer row numbers on that line's sheet, for example [6] or [6, 7]; never [sheet, row] pairs",
     "ROW_MAP_FIELDS_INVALID": "fields uses only output column names other than line_number and item_category",
-    "ROW_MAP_LINK_INVALID": "each field link is [row, column], [row, column, \"part\"], [row, column, \"code\"] (a manufacturer written without the customer's code in front of it) with integers from 1, or {\"derived\": reason}",
+    "ROW_MAP_LINK_INVALID": "each field link is [row, column], [row, column, \"part\"], [row, column, \"code\"] (a manufacturer written without the customer's code in front of it) with integers from 1, {\"lookup\": [another sheet, row, column], \"key\": key column}, or {\"derived\": reason}",
     "ROW_MAP_OUTPUT_COVERAGE_INVALID": "every output data row appears in exactly one line",
     "ROW_MAP_SKIP_INVALID": "each skipped entry has sheet, rows as [[first, last], ...] integer ranges, reason and rationale",
     "ROW_MAP_IGNORED_INVALID": "each ignored_columns entry has sheet, an integer column from 1 and a reason, each column once",
