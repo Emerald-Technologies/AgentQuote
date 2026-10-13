@@ -900,7 +900,10 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             output_match = PACKAGE_OUTPUT_ROUTE.fullmatch(self.path)
             if output_match and package_api is not None:
                 status, payload = package_api.handle_output(self.headers, *output_match.groups())
-                self._write_binary(status, payload) if isinstance(payload, bytes) else self._write(status, payload)
+                if isinstance(payload, bytes):
+                    self._write_binary(status, payload, output_match.group(4))
+                else:
+                    self._write(status, payload)
                 return
             resolution_match = PACKAGE_RESOLUTION_ROUTE.fullmatch(self.path)
             if resolution_match and resolution_match.group(3) in {"status", "manifest"} and package_api is not None:
@@ -953,10 +956,14 @@ def make_handler(api: ProcessingApi, decision_api: DecisionApi | None = None,
             self.end_headers()
             self.wfile.write(data)
 
-        def _write_binary(self, status: int, data: bytes) -> None:
+        def _write_binary(self, status: int, data: bytes, kind: str = "output") -> None:
             self.send_response(status)
-            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            self.send_header("Content-Disposition", 'attachment; filename="parsed-bom.xlsx"')
+            if kind == "structure":  # sub-assembly plan unit 3b: the stored structure JSON bytes
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Disposition", 'attachment; filename="bom-structure.json"')
+            else:
+                self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                self.send_header("Content-Disposition", 'attachment; filename="parsed-bom.xlsx"')
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")

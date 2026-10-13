@@ -115,7 +115,7 @@ def test_package_approval_and_exact_output_routes_dispatch_with_binary_headers()
         def handle_output(self, _headers, plan_id, approval_id, group_id, kind="output"):
             assert (plan_id, approval_id, group_id) == ("plan-1", "a" * 64, "group-1")
             # Sub-assembly plan unit 3b: the same route serves the group's structure file as JSON.
-            return (200, {"version": "resolved-bom-structure.v1"}) if kind == "structure" else (200, b"resolved-xlsx")
+            return (200, b'{"version":"resolved-bom-structure.v1"}') if kind == "structure" else (200, b"resolved-xlsx")
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
         ProcessingApi(config, Processor), package_api=PackageApi()))
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
@@ -129,6 +129,9 @@ def test_package_approval_and_exact_output_routes_dispatch_with_binary_headers()
             assert response.headers["Content-Length"] == str(len(b"resolved-xlsx"))
             assert response.headers["Cache-Control"] == "no-store"
             assert response.headers["X-Content-Type-Options"] == "nosniff"
+        with urlopen(root + "/approvals/" + "a" * 64 + "/groups/group-1/structure", timeout=2) as response:
+            assert response.read() == b'{"version":"resolved-bom-structure.v1"}'
+            assert response.headers.get_content_type() == "application/json"
         for malformed in (root + "/approvals/bad/group/group-1/output",
                           root + "/approvals/" + "a" * 64 + "/groups/bad/id/output"):
             with pytest.raises(HTTPError) as failure:

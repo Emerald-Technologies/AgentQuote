@@ -413,8 +413,11 @@ class ParentPackageService:
             raise PackageResolutionError("PACKAGE_APPROVAL_LOOKUP_INVALID")
         return self._bound_approval(plan_id, match.group(1))
 
-    def resolved_structure(self, plan_id: str, approval_id: str, group_id: str) -> dict[str, Any]:
-        """Return one byte-verified published structure file (unit 3b) without writing state."""
+    def resolved_structure(self, plan_id: str, approval_id: str, group_id: str) -> bytes:
+        """Return one byte-verified published structure file (unit 3b) without writing state.
+
+        The stored bytes are returned unchanged so a caller can check them against the manifest hash.
+        """
         _ids(plan_id, approval_id, group_id)
         manifest = self.manifest(plan_id, approval_id)
         matches = [item for item in manifest["results"]
@@ -424,7 +427,7 @@ class ParentPackageService:
         if "structure" not in matches[0]:
             raise PackageResolutionError("RESOLVED_STRUCTURE_ABSENT")
         prefix = f"{self._resolved_prefix(plan_id, approval_id)}/objects/"
-        return json.loads(self._structure_bytes(matches[0]["structure"], prefix).decode("utf-8"))
+        return self._structure_bytes(matches[0]["structure"], prefix)
 
     def _structure_bytes(self, ref: Any, prefix: str) -> bytes:
         if (not isinstance(ref, dict) or set(ref) != {"blob_path", "sha256", "size_bytes", "content_type"}

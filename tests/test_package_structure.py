@@ -124,7 +124,7 @@ def test_a_structured_bom_publishes_a_structure_file_that_follows_the_resorted_r
     _, service, plan_id, approval_id, manifest = resolved(row_map())
     assert manifest["version"] == "resolved-output-manifest.v2"
     group_id = manifest["results"][0]["group_id"]
-    structure = service.resolved_structure(plan_id, approval_id, group_id)
+    structure = json.loads(service.resolved_structure(plan_id, approval_id, group_id))
     workbook = pd.read_excel(io.BytesIO(service.resolved_workbook(plan_id, approval_id, group_id)))
     published = {int(row.line_number): row.item_number for row in workbook.itertuples()}
     by_key = {line["line_key"]: line for line in structure["lines"]}
@@ -153,7 +153,7 @@ def test_a_flat_bom_is_published_as_before():
 def test_wrong_parent_claims_publish_an_unproven_structure_that_blocks_final_pricing():
     wrong = list(PARENTS); wrong[4] = 3  # CON-1 claimed under PCA-1
     _, service, plan_id, approval_id, manifest = resolved(row_map(wrong))
-    structure = service.resolved_structure(plan_id, approval_id, manifest["results"][0]["group_id"])
+    structure = json.loads(service.resolved_structure(plan_id, approval_id, manifest["results"][0]["group_id"]))
     assert structure["proven"] is False
     assert [f["code"] for f in structure["findings"]] == ["STRUCTURE_NOT_PROVEN"]
     assert all(line["parent_line_number"] is None for line in structure["lines"])
