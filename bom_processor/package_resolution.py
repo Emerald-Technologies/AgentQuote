@@ -19,6 +19,13 @@ _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_METADATA = 1_000_000
 _RECONCILIATIONS = frozenset({"equivalent", "merged", "human_selected_conflict", "primary_selected"})
 _ZIP_EPOCH = (2000, 1, 1, 0, 0, 0)
+# Sub-assembly plan unit 3b: v2 adds a structure file to groups whose BOM states parents; a package
+# with no such group is still published as v1, byte for byte as before.
+MANIFEST_V1, MANIFEST_V2 = "resolved-output-manifest.v1", "resolved-output-manifest.v2"
+STRUCTURE_VERSION = "resolved-bom-structure.v1"
+STRUCTURE_CONTENT_TYPE = "application/json"
+_RESULT_KEYS = frozenset({"group_id", "document_ids", "assembly_identity", "reconciliation",
+                          "evidence_sha256", "provenance", "output"})
 _WORKBOOK_EPOCH = datetime(2000, 1, 1)
 
 
@@ -317,10 +324,11 @@ class ParentPackageService:
                 continue
             evidence = group["evidence"]
             fixtures = evidence["fixtures"]
-            row_sets = [self._rows(self._candidate_bytes(item["output"], item["prefix"])
-                                   if item["storage"] == "candidate"
-                                   else self._output_bytes(item["output"], processed_prefix))
-                        for item in fixtures]
+            fixture_bytes = [self._candidate_bytes(item["output"], item["prefix"])
+                             if item["storage"] == "candidate"
+                             else self._output_bytes(item["output"], processed_prefix)
+                             for item in fixtures]
+            row_sets = [self._rows(data) for data in fixture_bytes]
             assembly = evidence["assembly_identity"]
             reconciliation = reconcile_boms(row_sets, assembly=AssemblyIdentity(
                 assembly["name"], assembly.get("revision", "")))
@@ -328,29 +336,41 @@ class ParentPackageService:
             if reconciliation.relation == "conflict":
                 if disposition not in {item["fixture_key"] for item in fixtures}:
                     raise PackageResolutionError("PACKAGE_MATERIAL_CONFLICT")
-                selected = next(item for item in fixtures if item["fixture_key"] == disposition)
-                rows = self._rows(self._candidate_bytes(selected["output"], selected["prefix"])
-                                  if selected["storage"] == "candidate"
-                                  else self._output_bytes(selected["output"], processed_prefix))
+                index = next(i for i, item in enumerate(fixtures) if item["fixture_key"] == disposition)
+                rows = list(row_sets[index])
                 relation = "human_selected_conflict"
+                origins = list(range(len(rows)))
             else:
+                index = 0
                 rows, relation = list(reconciliation.rows), reconciliation.relation
+                origins = list(reconciliation.origins)
                 if evidence.get("reconciliation") == "primary_selected" and relation == "equivalent":
                     relation = "primary_selected"
+            structure = self._group_structure(plan, group, fixtures[index], fixture_bytes[index], row_sets[index],
+                                              origins)
             output = self._workbook(rows)
             digest = hashlib.sha256(output).hexdigest()
             output_path = f"{prefix}/objects/{digest}.xlsx"
             self.storage.upload_output_immutable(output_path, output, OUTPUT_CONTENT_TYPE)
-            results.append({"group_id": group["group_id"],
-                            "document_ids": group["document_ids"],
-                            "assembly_identity": evidence["assembly_identity"],
-                            "reconciliation": relation,
-                            "evidence_sha256": _hash(evidence),
-                            "provenance": self._result_provenance(evidence),
-                            "output": {"blob_path": output_path, "sha256": digest,
-                                       "size_bytes": len(output), "content_type": OUTPUT_CONTENT_TYPE}})
+            result = {"group_id": group["group_id"],
+                      "document_ids": group["document_ids"],
+                      "assembly_identity": evidence["assembly_identity"],
+                      "reconciliation": relation,
+                      "evidence_sha256": _hash(evidence),
+                      "provenance": self._result_provenance(evidence),
+                      "output": {"blob_path": output_path, "sha256": digest,
+                                 "size_bytes": len(output), "content_type": OUTPUT_CONTENT_TYPE}}
+            if structure is not None:
+                data = _json_bytes(structure)
+                structure_digest = hashlib.sha256(data).hexdigest()
+                structure_path = f"{prefix}/objects/{structure_digest}.json"
+                self.storage.upload_output_immutable(structure_path, data, STRUCTURE_CONTENT_TYPE)
+                result["structure"] = {"blob_path": structure_path, "sha256": structure_digest,
+                                       "size_bytes": len(data), "content_type": STRUCTURE_CONTENT_TYPE}
+            results.append(result)
         results.sort(key=lambda item: item["document_ids"])
-        manifest_identity = {"version": "resolved-output-manifest.v1", "status": "completed",
+        version = MANIFEST_V2 if any("structure" in item for item in results) else MANIFEST_V1
+        manifest_identity = {"version": version, "status": "completed",
             "plan_id": plan_id, "approval_id": approval_id, "plan_sha256": review["plan_sha256"],
             "review_manifest_sha256": review["manifest_sha256"], "results": results}
         manifest = {**manifest_identity, "manifest_sha256": _hash(manifest_identity)}
@@ -392,6 +412,31 @@ class ParentPackageService:
         if match is None:
             raise PackageResolutionError("PACKAGE_APPROVAL_LOOKUP_INVALID")
         return self._bound_approval(plan_id, match.group(1))
+
+    def resolved_structure(self, plan_id: str, approval_id: str, group_id: str) -> dict[str, Any]:
+        """Return one byte-verified published structure file (unit 3b) without writing state."""
+        _ids(plan_id, approval_id, group_id)
+        manifest = self.manifest(plan_id, approval_id)
+        matches = [item for item in manifest["results"]
+                   if isinstance(item, dict) and item.get("group_id") == group_id]
+        if len(matches) != 1:
+            raise PackageResolutionError("RESOLVED_OUTPUT_GROUP_INVALID")
+        if "structure" not in matches[0]:
+            raise PackageResolutionError("RESOLVED_STRUCTURE_ABSENT")
+        prefix = f"{self._resolved_prefix(plan_id, approval_id)}/objects/"
+        return json.loads(self._structure_bytes(matches[0]["structure"], prefix).decode("utf-8"))
+
+    def _structure_bytes(self, ref: Any, prefix: str) -> bytes:
+        if (not isinstance(ref, dict) or set(ref) != {"blob_path", "sha256", "size_bytes", "content_type"}
+                or ref.get("content_type") != STRUCTURE_CONTENT_TYPE
+                or not _HASH.fullmatch(str(ref.get("sha256", "")))
+                or ref.get("blob_path") != prefix + str(ref.get("sha256")) + ".json"
+                or type(ref.get("size_bytes")) is not int or not 0 < ref["size_bytes"] <= self.max_output_bytes):
+            raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
+        data = self.storage.download_output(ref["blob_path"], self.max_output_bytes)
+        if data is None or len(data) != ref["size_bytes"] or hashlib.sha256(data).hexdigest() != ref["sha256"]:
+            raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
+        return data
 
     def resolved_workbook(self, plan_id: str, approval_id: str, group_id: str) -> bytes:
         """Return one byte-verified published workbook without writing state."""
@@ -878,6 +923,104 @@ class ParentPackageService:
                            "disposition_keys": []})
         return result
 
+    def _group_structure(self, plan: dict[str, Any], group: dict[str, Any], fixture: dict[str, Any],
+                         data: bytes, rows: list[dict[str, Any]], origins: list[int]) -> dict[str, Any] | None:
+        """Unit 3b: the sub-assembly structure of the BOM whose rows are published; None when flat.
+
+        The row map is read again and re-checked against the source here (a recorded verdict is
+        never trusted); parents are used only when that check passes, otherwise the structure is
+        published as not proven. Lines are given by published line number (origins map the
+        re-sorted rows back to this BOM's rows).
+        """
+        from . import bom_structure
+        from .row_accounting import MAX_ROW_MAP_BYTES, verify_row_map
+        accounting = self._fixture_row_accounting(group, fixture)
+        ref = accounting.get("row_map") if isinstance(accounting, dict) else None
+        if not isinstance(ref, dict):
+            return None
+        reader = self.storage.download_candidate if fixture["storage"] == "candidate" else self.storage.download_output
+        try:
+            mapped = reader(ref["blob_path"], MAX_ROW_MAP_BYTES)
+            if (mapped is None or len(mapped) != ref["size"]
+                    or hashlib.sha256(mapped).hexdigest() != ref["sha256"]):
+                raise ValueError("row map binding")
+            proposal = json.loads(mapped.decode("utf-8"))
+        except Exception as exc:
+            raise PackageResolutionError("PACKAGE_ROW_MAP_INVALID") from exc
+        claims = {line["output_row"]: line["parent"].get("line") for line in proposal.get("lines", [])
+                  if isinstance(line, dict) and isinstance(line.get("parent"), dict)}
+        if not claims:
+            return None
+        source, suffix = self._fixture_source(plan, fixture)
+        try:
+            verified = verify_row_map(source, suffix, data, mapped)
+        except Exception:
+            verified = {"valid": False}
+        proven = verified.get("valid") is True and (verified.get("structure") or {}).get("by") is not None
+        lines = [bom_structure.Line(index + 2, _cell_text(row.get("item_number")), _cell_text(row.get("item_name")),
+                                    _cell_text(row.get("item_category")), _cell(row.get("quantity")),
+                                    any(_cell(value) is not None for key, value in row.items()
+                                        if str(key).startswith("manufacturer_item_number_")))
+                 for index, row in enumerate(rows)]
+        parents = {line.output_row: claims.get(line.output_row) for line in lines}
+        try:
+            resolved = bom_structure.resolve(lines, parents, proven=proven,
+                                             assembly=group["evidence"]["assembly_identity"].get("name"))
+        except ValueError as exc:
+            raise PackageResolutionError("PACKAGE_STRUCTURE_INVALID") from exc
+        published = {source_index: position + 1 for position, source_index in enumerate(origins)}
+        if sorted(published) != list(range(len(rows))):
+            raise PackageResolutionError("PACKAGE_STRUCTURE_INVALID")
+        out = []
+        for line in resolved["lines"]:
+            parent = line["parent_line"]
+            item = {key: value for key, value in line.items() if key not in ("output_row", "parent_line")}
+            item["line_number"] = published[line["output_row"] - 2]
+            item["parent_line_number"] = None if parent is None else published[parent - 2]
+            out.append(item)
+        out.sort(key=lambda item: item["line_number"])
+        return {"version": STRUCTURE_VERSION, "group_id": group["group_id"],
+                "assembly_identity": group["evidence"]["assembly_identity"],
+                "row_map_sha256": ref["sha256"], "proven": proven, "lines": out,
+                "findings": resolved["findings"], "summary": resolved["summary"]}
+
+    def _fixture_row_accounting(self, group: dict[str, Any], fixture: dict[str, Any]) -> dict[str, Any] | None:
+        """The recorded row-accounting summary (with its row-map reference) for one fixture."""
+        try:
+            if fixture["storage"] == "candidate":
+                evidence = _json(self.storage, f"{fixture['prefix']}evidence.json", candidate=True)
+                records = evidence.get("fixtures")
+                if isinstance(records, list) and any(isinstance(r, dict) and "fixture_sha256" in r for r in records):
+                    record = next((r for r in records if isinstance(r, dict)
+                                   and r.get("fixture_sha256") == fixture["fixture_key"]), None)
+                else:
+                    record = evidence
+                semantic = record.get("semantic") if isinstance(record, dict) else None
+                return semantic.get("row_accounting") if isinstance(semantic, dict) else None
+            for child in group["evidence"].get("children", []):
+                path = child.get("manifest_path")
+                raw = self.storage.download_output(path, self.max_output_bytes) if isinstance(path, str) else None
+                manifest = json.loads(raw.decode("utf-8")) if raw is not None else {}
+                for result in manifest.get("results", []):
+                    if (result.get("source", {}).get("document_id") in fixture["document_ids"]
+                            and result.get("output") == fixture["output"]):
+                        return result.get("row_accounting")
+        except (BlobNotFoundError, PackageResolutionError, ValueError, KeyError, AttributeError):
+            return None
+        return None
+
+    def _fixture_source(self, plan: dict[str, Any], fixture: dict[str, Any]) -> tuple[bytes, str]:
+        """The verified source bytes and extension the fixture was parsed from (the plan's sources)."""
+        from pathlib import PurePosixPath
+        matches = [item for item in plan["sources"] if item.get("document_id") in fixture.get("document_ids", [])]
+        source = matches[0] if len(matches) == 1 else None
+        if not isinstance(source, dict):
+            raise PackageResolutionError("PACKAGE_SOURCE_INVALID")
+        data = self.storage.download_source(source["blob_path"], self.max_source_bytes)
+        if len(data) != source["size_bytes"] or hashlib.sha256(data).hexdigest() != str(source["sha256"]).lower():
+            raise PackageResolutionError("PACKAGE_SOURCE_INVALID")
+        return data, PurePosixPath(source["blob_path"]).suffix.lower()
+
     def _verified_candidate_code(self, request_id: str, candidate_id: str,
                                   ref: Any) -> dict[str, Any]:
         """Verify candidate parse.py bytes against the review's candidate hash/path."""
@@ -1041,7 +1184,7 @@ class ParentPackageService:
             raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
         identity = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
         results = manifest.get("results")
-        if (manifest.get("version") != "resolved-output-manifest.v1"
+        if (manifest.get("version") not in (MANIFEST_V1, MANIFEST_V2)
                 or manifest.get("status") != "completed"
                 or manifest.get("plan_id") != plan.get("plan_id")
                 or manifest.get("approval_id") != approval.get("approval_id")
@@ -1057,8 +1200,8 @@ class ParentPackageService:
         seen_groups: set[str] = set()
         for result in results:
             if (not isinstance(result, dict)
-                or set(result) != {"group_id", "document_ids", "assembly_identity",
-                          "reconciliation", "evidence_sha256", "provenance", "output"}
+                or set(result) not in (_RESULT_KEYS, _RESULT_KEYS | {"structure"})
+                or ("structure" in result and manifest["version"] != MANIFEST_V2)
                 or not isinstance(result.get("document_ids"), list)
                     or not result["document_ids"]
                     or any(not isinstance(item, str) for item in result["document_ids"])
@@ -1094,11 +1237,15 @@ class ParentPackageService:
             paths[path] = output
             try:
                 self._output_bytes(output, f"{prefix}/objects/")
+                if "structure" in result:
+                    self._structure_bytes(result["structure"], f"{prefix}/objects/")
             except PackageResolutionError as exc:
                 raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT") from exc
         excluded = {doc for item in plan["assignments"] if item["kind"] == "excluded"
                     for doc in item["document_ids"]}
         expected = [item["document_id"] for item in plan["sources"] if item["document_id"] not in excluded]
+        if (manifest["version"] == MANIFEST_V2) != any("structure" in item for item in results):
+            raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
         if (results != sorted(results, key=lambda item: item["document_ids"])
                 or sorted(covered) != sorted(expected) or len(covered) != len(set(covered))
             or seen_groups != set(review_groups)):
@@ -1116,6 +1263,16 @@ class ParentPackageService:
     @staticmethod
     def _resolved_prefix(plan_id: str, approval_id: str) -> str:
         return f"packages/{plan_id}/resolved/{approval_id}"
+
+
+def _cell(value: Any) -> Any:
+    """A parsed-workbook cell, with pandas' empty-cell NaN read as None."""
+    return None if value is None or (isinstance(value, float) and value != value) else value
+
+
+def _cell_text(value: Any) -> str:
+    value = _cell(value)
+    return "" if value is None else str(value).strip()
 
 
 # Package-choice warnings shown to the person; any of them stops automatic acceptance.

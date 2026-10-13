@@ -70,7 +70,7 @@ PACKAGE_RESOLUTION_ROUTE = re.compile(
 PACKAGE_OUTPUT_ROUTE = re.compile(
     r"^/api/v1/bom-packages/([A-Za-z0-9][A-Za-z0-9._-]{0,127})/approvals/"
     r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/groups/"
-    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/output$")
+    r"([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(output|structure)$")
 EVIDENCE_ROUTE = re.compile(r"^/api/v1/package-evidence/([0-9a-f]{64})/(submit|start|status)$")
 
 
@@ -428,11 +428,14 @@ class PackageApi:
             return 500, _error("internal_error", "An internal error occurred.", response_id)
 
     def handle_output(self, headers: Any, plan_id: str, approval_id: str,
-                      group_id: str) -> tuple[int, bytes | dict[str, Any]]:
+                      group_id: str, kind: str = "output") -> tuple[int, bytes | dict[str, Any]]:
         response_id = uuid.uuid4().hex
         try:
             authorize(headers, self.config)
-            return 200, self.service_factory().resolved_workbook(plan_id, approval_id, group_id)
+            service = self.service_factory()
+            if kind == "structure":  # sub-assembly plan unit 3b: the group's structure file (JSON)
+                return 200, service.resolved_structure(plan_id, approval_id, group_id)
+            return 200, service.resolved_workbook(plan_id, approval_id, group_id)
         except PermissionError:
             return 401, _error("unauthenticated", "Authentication is required.", response_id)
         except LookupError:

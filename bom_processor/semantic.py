@@ -120,6 +120,9 @@ class BomReconciliation:
     relation: str
     rows: tuple[dict[str, Any], ...]
     evidence: tuple[dict[str, Any], ...]
+    # Sub-assembly plan unit 3b: for each resolved row, the index of the first input BOM's row it
+    # stands for, so structure read from that BOM follows its rows through the re-sort.
+    origins: tuple[int, ...] = ()
 
 
 def semantic_summary(rows: Iterable[Mapping[str, Any]], *, assembly: AssemblyIdentity | None = None) -> dict[str, Any]:
@@ -294,18 +297,20 @@ def reconcile_boms(row_sets: Iterable[Iterable[Mapping[str, Any]]], *,
     grouped_rows: list[dict[tuple[tuple[str, str], tuple[tuple[str, Any], ...]], list[tuple[Component, dict[str, Any]]]]] = []
     for rows in sets:
         grouped: dict[tuple[tuple[str, str], tuple[tuple[str, Any], ...]], list[tuple[Component, dict[str, Any]]]] = {}
-        for row in rows:
+        for index, row in enumerate(rows):
             component = _component(row)
-            grouped.setdefault((component.identity, component.material), []).append((component, row))
+            grouped.setdefault((component.identity, component.material), []).append((component, row, index))
         for values in grouped.values():
-            values.sort(key=lambda item: json.dumps(item[0].canonical(), sort_keys=True))
+            values.sort(key=lambda item: (json.dumps(item[0].canonical(), sort_keys=True), item[2]))
         grouped_rows.append(grouped)
     resolved: list[dict[str, Any]] = []
+    origins: list[int] = []
     for key in sorted(grouped_rows[0]):
         count = len(grouped_rows[0][key])
         for occurrence in range(count):
             entries = [group[key][occurrence] for group in grouped_rows]
             components = [entry[0] for entry in entries]
+            origins.append(entries[0][2])
             pair_sets = [set(dict(component.optional).get("manufacturer_mpn", ()))
                          for component in components]
             pairs = sorted(set().union(*pair_sets))
@@ -329,4 +334,4 @@ def reconcile_boms(row_sets: Iterable[Iterable[Mapping[str, Any]]], *,
                 row[f"manufacturer_{index}"] = manufacturer
                 row[f"manufacturer_item_number_{index}"] = mpn
             resolved.append(row)
-    return BomReconciliation(relation, tuple(resolved), tuple(evidence))
+    return BomReconciliation(relation, tuple(resolved), tuple(evidence), tuple(origins))
