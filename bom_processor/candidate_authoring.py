@@ -24,13 +24,18 @@ ASSOCIATION_AUTHORING_VERSION = "candidate-authoring.v10"
 ROW_MAP_AUTHORING_VERSIONS = frozenset({AUTHORING_VERSION, ASSOCIATION_AUTHORING_VERSION})
 ROW_MAP_RULE = (
     "also accept an optional --row-map PATH argument (never required: approved parsers run without it); "
-    "whenever it is given, write it as UTF-8 JSON: {\"version\": \"bom-row-map.v1\", \"lines\": [...], "
+    "whenever it is given, write it as UTF-8 JSON: {\"version\": \"bom-row-map.v2\", \"lines\": [...], "
     "\"skipped\": [...], \"ignored_columns\": [...]}. Sheet names, rows and columns refer to the --input "
     "workbook (1-based, the row numbers a spreadsheet shows; for HTML tables the n-th table row). "
     "lines has one entry per output data row: {\"output_row\": the output worksheet row number (first data "
     "row is 2), \"sheet\", \"rows\": a flat list of the integer row numbers on that sheet that make this "
     "line, including alternate-manufacturer rows (for example [6] or [6, 7]; the sheet name goes only in "
     "\"sheet\", never [sheet, row] pairs), \"fields\": {output column name: [source row, source column] of the cell the value came from}}. "
+    "When the BOM shows sub-assemblies (a level column, item numbers such as 1, 1.1, 1.1.1, indented text, or a "
+    "column naming each row's parent part number), give every line \"parent\": {\"line\": the output_row of its "
+    "parent line, or null for a line directly under the quoted assembly, \"from\": [source row, source column] of "
+    "the cell that shows it, \"by\": one of level, number, parent, indent}, using one kind and one column for "
+    "every line; validation works out each parent from those cells. "
     "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
     "when the value is one separated part of a combined cell; use [row, column, \"code\"] for a manufacturer "
     "name written without the customer's short code that stands in front of it in the cell (the cell "
@@ -90,6 +95,8 @@ CANONICAL_OUTPUT_RULES = (
     "one manufacturer with several part numbers in one cell gives one pair per part number, each with that manufacturer; separators such as commas are clues, not rules: a comma inside a company name (', Inc.') or inside a part number ('BAS21,235') does not split it",
     "decide each source column's role the way a person would, from its header and its data together; header words are clues, not rules (a 'Manufacturers Part Number' column holds the MPN even though its header contains 'manufacturer'); write the roles you decided into the parser for this layout, for example by the exact header labels you read, never as generic keyword rules that could drop a column you can see",
     # PLM readiness D1 (Nick 2026-10-12): some customers put their own maker code in front of the name.
+    # Sub-assembly plan unit 2 (Nick 2026-10-12): sub-assemblies are common across customers.
+    "a BOM may contain sub-assemblies, shown by a level column, dotted item numbers, indentation or a parent part number column; these are clues read from the data, not rules: keep every line including each sub-assembly's own line, write each quantity exactly as printed (per its parent), never multiply quantities through parents (code does that after validation), and give each line's parent in the row map",
     "a short number and a space in front of a manufacturer name (for example '63 ACME INC.') is usually the customer's own code for that maker, not part of its name, especially when the same number comes with the same name on many rows: write the name without the code and cite it with the \"code\" link; a name that really begins with digits, such as 3M, stays as it is; this is a clue, not a rule",
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not

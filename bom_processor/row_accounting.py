@@ -1,7 +1,7 @@
 """Row accounting for one parsed BOM (plan 8.8 step 4a, Nick 2026-10-09).
 
 Inputs: pinned source bytes and extension, the parser's canonical XLSX output, and the row map the
-parser wrote with --row-map (version bom-row-map.v1). Output: counts and failing source-row
+parser wrote with --row-map (bom-row-map.v1 or v2). Output: counts and failing source-row
 locations only, never customer values. Code checks, on every row of the real file:
 - every non-empty source row belongs to exactly one output line or is skipped with a reason;
 - every output line is mapped, and every populated output cell (except line_number and
@@ -15,6 +15,11 @@ locations only, never customer values. Code checks, on every row of the real fil
 - a skipped row shaped like an alternate (a value in a manufacturer or MPN column and nothing in any
   other mapped column) is a failure: dropped as a note it loses a pair (PLM readiness D3, Nick
   2026-10-12);
+- row map v2 (sub-assembly plan unit 2, Nick 2026-10-12): a line may state its parent line, the cell
+  that shows it and how (a level column, dotted numbers, a parent part number column or indentation);
+  code works out every parent from the cited cells and fails a different claim. All lines or none,
+  one kind and one column. Quantities stay as printed (per parent); roll-down happens after this
+  check, never in the parser. v1 maps (no parents) are still accepted;
 - every source column with data in BOM lines feeds a field or is declared ignored;
 - the manufacturer/MPN pattern holds on every line row (plan 8.12, step 4d): a column is never a
   manufacturer in one pair and an MPN in another, a manufacturer column always pairs with the same
@@ -36,7 +41,10 @@ from typing import Any
 from .canonical_format import canonical_columns, canonical_pair_count
 from .interpretation_inventory import MAX_BYTES, MAX_CELLS, MAX_COLUMNS, MAX_ROWS, SourceInventory, extract_inventory
 
-VERSION = "bom-row-map.v1"
+VERSION_V1 = "bom-row-map.v1"
+# v2 (sub-assembly plan unit 2, Nick 2026-10-12): a line may state its parent line.
+VERSION = "bom-row-map.v2"
+VERSIONS = frozenset({VERSION_V1, VERSION})
 RESULT_VERSION = "bom-row-accounting.v1"
 ROW_MAP_NAME = "row-map.json"
 MAX_ROW_MAP_BYTES = 8 * 1024 * 1024
@@ -119,6 +127,46 @@ def _is_maker(field: str) -> bool:
     return field.startswith("manufacturer_") and not field.startswith("manufacturer_item_number_")
 
 
+# How a BOM shows sub-assemblies; the parser names one per file and the cell it read it from.
+STRUCTURE_KINDS = frozenset({"level", "number", "parent", "indent"})
+_DOTTED = re.compile(r"\d+(?:\.\d+)*")
+
+
+def _structure_key(kind: str, value: Any) -> Any:
+    """The comparable structure value of a cited cell, or None when the cell cannot show it."""
+    if kind == "level":
+        number = _number(value) if value is not None else None
+        return int(number) if number is not None and number == number.to_integral_value() and number >= 0 else None
+    if kind == "number":
+        text = _text(value) if value is not None else ""
+        return tuple(int(part) for part in text.split(".")) if _DOTTED.fullmatch(text) else None
+    if kind == "indent":
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return len(value) - len(value.lstrip(" \t 　"))
+    return _text(value).casefold() if value is not None and _text(value) else ""  # parent: "" is top
+
+
+def _expected_parents(kind: str, ordered: list[tuple[int, Any, Any]]) -> dict[int, int | None]:
+    """Parent output row of each line, from (output_row, key, item_number) in source order.
+
+    level / indent: the nearest earlier line with a smaller value. number: the nearest earlier line
+    whose number is this one without its last part. parent: the nearest earlier line whose part
+    number is the cited parent; none (the quoted assembly itself, or no parent) is top level.
+    """
+    result: dict[int, int | None] = {}
+    for index, (out, key, _) in enumerate(ordered):
+        earlier = reversed(ordered[:index])
+        if kind in {"level", "indent"}:
+            found = next((o for o, k, _ in earlier if k < key), None)
+        elif kind == "number":
+            found = next((o for o, k, _ in earlier if k == key[:-1]), None) if len(key) > 1 else None
+        else:
+            found = next((o for o, _, item in earlier if key and item == key), None)
+        result[out] = found
+    return result
+
+
 def _name(value: Any) -> bool:
     return isinstance(value, str) and 0 < len(value) <= 128
 
@@ -159,7 +207,7 @@ def _load(row_map: bytes) -> dict[str, Any]:
     except (UnicodeError, ValueError, RecursionError):
         raise RowMapError("ROW_MAP_JSON_INVALID") from None
     _keys(proposal, {"version", "lines", "skipped", "ignored_columns"}, "ROW_MAP_KEYS_INVALID")
-    _require(proposal["version"] == VERSION, "ROW_MAP_VERSION_INVALID")
+    _require(proposal["version"] in VERSIONS, "ROW_MAP_VERSION_INVALID")
     return proposal
 
 
@@ -214,8 +262,11 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
     pair_rows: list[tuple[str, int, int, int, bool]] = []
     maker_codes_kept = 0
     allowed_fields = set(columns) - _FIXED
+    claims: list[tuple[int, str, int, dict[str, Any]]] = []
     for line in lines:
-        _keys(line, {"output_row", "sheet", "rows", "fields"}, "ROW_MAP_LINE_INVALID")
+        base = {"output_row", "sheet", "rows", "fields"}
+        _keys(line, base | ({"parent"} if proposal["version"] == VERSION and "parent" in line else set()),
+              "ROW_MAP_LINE_INVALID")
         out, sheet, rows, fields = line["output_row"], line["sheet"], line["rows"], line["fields"]
         _require(type(out) is int and out in output_rows and out not in mapped_output, "ROW_MAP_OUTPUT_ROW_INVALID")
         _require(_name(sheet) and sheet in original.sheets, "ROW_MAP_SHEET_INVALID")
@@ -224,6 +275,17 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
         _require(isinstance(fields, dict) and set(fields) <= allowed_fields, "ROW_MAP_FIELDS_INVALID")
         mapped_output.add(out)
         first = (sheet, min(rows))
+        if "parent" in line:
+            claim = line["parent"]
+            _keys(claim, {"line", "from", "by"}, "ROW_MAP_PARENT_INVALID")
+            _require(claim["by"] in STRUCTURE_KINDS
+                     and (claim["line"] is None or (type(claim["line"]) is int and claim["line"] >= 2))
+                     and isinstance(claim["from"], list) and len(claim["from"]) == 2
+                     and all(type(item) is int and item >= 1 for item in claim["from"]), "ROW_MAP_PARENT_INVALID")
+            claims.append((out, sheet, min(rows), claim))
+            if claim["from"][0] in rows and (sheet, claim["from"][0], claim["from"][1]) in original.cells:
+                used_columns.add((sheet, claim["from"][1]))
+                cited_cells.add((sheet, claim["from"][0], claim["from"][1]))
         for row in rows:
             key = (sheet, row)
             if key not in source_rows:
@@ -300,6 +362,46 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 pair_rows.append((sheet, manufacturer[0], manufacturer[1], mpn[1],
                                   manufacturer[2:] == ["part"] and mpn[2:] == ["part"]))
     _require(mapped_output == output_rows, "ROW_MAP_OUTPUT_COVERAGE_INVALID")
+
+    # Sub-assembly structure (unit 2): code works out each line's parent from the cited cells and
+    # compares it with the parser's claim. All lines or none, one kind, one column, one sheet.
+    structure: dict[str, Any] = {"by": None, "lines_with_parent": 0, "depth": 0}
+    first_rows = {line["output_row"]: (line["sheet"], min(line["rows"])) for line in lines}
+    if claims:
+        kinds = {claim["by"] for *_, claim in claims}
+        sources = {(sheet, claim["from"][1]) for _, sheet, _, claim in claims}
+        if len(claims) != len(lines):
+            for out in sorted(mapped_output - {out for out, *_ in claims}):
+                fail(first_rows[out], "STRUCTURE_INCOMPLETE")
+        elif len(kinds) != 1 or len(sources) != 1:
+            for out, sheet, row, _ in claims:
+                fail((sheet, row), "STRUCTURE_INCONSISTENT")
+        else:
+            kind = next(iter(kinds))
+            item_column = columns.index("item_number") + 1
+            ordered = []
+            for out, sheet, row, claim in sorted(claims, key=lambda item: item[2]):
+                cell_row, cell_column = claim["from"]
+                line_rows = next(line["rows"] for line in lines if line["output_row"] == out)
+                key = (_structure_key(kind, original.cells.get((sheet, cell_row, cell_column)))
+                       if cell_row in line_rows else None)
+                if key is None:
+                    fail((sheet, row), "STRUCTURE_VALUE_INVALID")
+                    continue
+                item = parsed.cells.get((out_sheet, out, item_column))
+                ordered.append((out, key, _text(item).casefold() if item is not None else ""))
+            if len(ordered) == len(claims):
+                expected = _expected_parents(kind, ordered)
+                claimed = {out: claim["line"] for out, _, _, claim in claims}
+                for out, parent in expected.items():
+                    if claimed[out] != parent:
+                        fail(first_rows[out], "STRUCTURE_PARENT_MISMATCH")
+                depth: dict[int, int] = {}
+                for out, _, _ in ordered:
+                    parent = expected[out]
+                    depth[out] = 0 if parent is None else depth[parent] + 1
+                structure = {"by": kind, "lines_with_parent": sum(1 for p in expected.values() if p is not None),
+                             "depth": max(depth.values(), default=0)}
 
     # Manufacturer/MPN pattern on every line row (plan 8.12): a broken pattern is a finding.
     pattern: dict[tuple[str, int], str] = {}
@@ -429,4 +531,6 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                              for (sheet, column), code in sorted(pattern.items())[:MAX_RECORDED_COLUMNS]],
         # Information only: maker names written with a leading customer code (count, no values).
         "maker_code_prefix_kept": maker_codes_kept,
+        # Sub-assembly structure proven from the cited cells (counts only; the claims stay in the map).
+        "structure": structure,
     }

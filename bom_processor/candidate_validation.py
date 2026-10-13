@@ -203,7 +203,9 @@ def _row_fields(semantic: dict[str, Any]) -> list[dict[str, Any]]:
 _ROW_MAP_SHAPES = {
     "ROW_MAP_KEYS_INVALID": "the top level has exactly version, lines, skipped and ignored_columns",
     "ROW_MAP_LINES_INVALID": "lines is a non-empty list with one entry per output data row",
-    "ROW_MAP_LINE_INVALID": "each line has exactly output_row, sheet, rows and fields",
+    "ROW_MAP_LINE_INVALID": "each line has exactly output_row, sheet, rows and fields, plus parent only in a bom-row-map.v2 map",
+    "ROW_MAP_PARENT_INVALID": "parent is {\"line\": an output_row from 2 or null, \"from\": [row, column] integers from 1, \"by\": level, number, parent or indent}",
+    "ROW_MAP_VERSION_INVALID": "version is bom-row-map.v2 (bom-row-map.v1 is still accepted without parents)",
     "ROW_MAP_OUTPUT_ROW_INVALID": "output_row is the output worksheet row number (first data row is 2), each used once",
     "ROW_MAP_SHEET_INVALID": "sheet is the exact name of a worksheet in --input",
     "ROW_MAP_ROWS_INVALID": "rows is a flat list of distinct integer row numbers on that line's sheet, for example [6] or [6, 7]; never [sheet, row] pairs",
@@ -220,7 +222,7 @@ def _row_feedback(accounting: dict[str, Any]) -> str:
     if "error" in accounting:
         shape = _ROW_MAP_SHAPES.get(accounting["error"])
         return (f"row_map_invalid:{accounting['error']}; " + (f"{shape}; " if shape else "")
-                + "write --row-map as the bom-row-map.v1 rule describes")
+                + "write --row-map as the bom-row-map.v2 rule describes")
     rows = "; ".join(f"{item['sheet']}!{item['row']}:{item['code']}" for item in accounting.get("failed_rows", [])[:20])
     cited = ", ".join(f"{item['sheet']}!{item['row']} {item['field']}<-col{item['column']}{' part' if item['part'] else ''}"
                       for item in accounting.get("field_mismatches", [])[:10])
