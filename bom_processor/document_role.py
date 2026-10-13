@@ -63,7 +63,10 @@ BOM_READING_GUIDANCE = (
     "from headers, and keep the same pairing on every row. For a combined column split on the separator the "
     "data shows and keep pair order; a different number of names and MPNs in one cell is a finding. Carry "
     "every pair; validation checks every row for a pair left out, a pair with one half missing, names and "
-    "MPNs swapped in some pairs, and a manufacturer or MPN column left unmapped. When a "
+    "MPNs swapped in some pairs, and a manufacturer or MPN column left unmapped. A short number in front of "
+    "a maker name ('63 ACME INC.') is often the customer's own code for that maker rather than part of the "
+    "name, especially when the same number comes with the same name on many rows; a name that really starts "
+    "with digits, such as 3M, has no such code. When a "
     "choice is uncertain, make the most reasonable one and add a warning finding that explains it; never "
     "guess silently and never invent values."
 )

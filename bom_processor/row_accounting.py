@@ -7,8 +7,14 @@ locations only, never customer values. Code checks, on every row of the real fil
 - every output line is mapped, and every populated output cell (except line_number and
   item_category) cites a source cell in its own line holding the same value, or one separated part
   of it, or a stated derivation for unit_of_measure / bom_notes only;
+- a manufacturer may cite [row, column, "code"]: the source cell is a short customer code, a space and
+  exactly the written name ("63 ACME INC." -> "ACME INC."); the raw cell stays cited (PLM readiness
+  D1, Nick 2026-10-12). Names written with such a code still in front are counted, never failed;
 - every row in a line contributes at least one cited value; both halves of a pair cite one row;
 - a skipped row holding a part number and a positive quantity in mapped columns is a failure;
+- a skipped row shaped like an alternate (a value in a manufacturer or MPN column and nothing in any
+  other mapped column) is a failure: dropped as a note it loses a pair (PLM readiness D3, Nick
+  2026-10-12);
 - every source column with data in BOM lines feeds a field or is declared ignored;
 - the manufacturer/MPN pattern holds on every line row (plan 8.12, step 4d): a column is never a
   manufacturer in one pair and an MPN in another, a manufacturer column always pairs with the same
@@ -47,6 +53,9 @@ CSV_SHEET = "CSV"
 HTML_SHEET = "HTML_TABLE_1"
 # Separators a combined cell may use; " / " only with spaces so part numbers with "/" stay whole.
 _PARTS = re.compile(r"\s*(?:[;,|\n]|\s/\s)\s*")
+# A customer's own maker code in front of the name: 1-3 digits and a space ("3M" has no space).
+_MAKER_CODE = re.compile(r"\d{1,3}\s+(\S.*)", re.DOTALL)
+LINK_KINDS = frozenset({"part", "code"})
 
 
 class RowMapError(ValueError):
@@ -98,6 +107,16 @@ def _same(source: Any, target: Any, numeric: bool) -> bool:
 def _part(source: Any, target: Any) -> bool:
     wanted = _text(target)
     return bool(wanted) and wanted in {part for part in _PARTS.split(_text(source)) if part}
+
+
+def _code(source: Any, target: Any) -> bool:
+    """The source is a maker code, a space and exactly the written name."""
+    match = _MAKER_CODE.fullmatch(_text(source))
+    return match is not None and match.group(1).strip() == _text(target)
+
+
+def _is_maker(field: str) -> bool:
+    return field.startswith("manufacturer_") and not field.startswith("manufacturer_item_number_")
 
 
 def _name(value: Any) -> bool:
@@ -193,6 +212,7 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
     pair_cells: set[tuple[str, int, int]] = set()
     part_links: Counter[tuple[str, int, int]] = Counter()
     pair_rows: list[tuple[str, int, int, int, bool]] = []
+    maker_codes_kept = 0
     allowed_fields = set(columns) - _FIXED
     for line in lines:
         _keys(line, {"output_row", "sheet", "rows", "fields"}, "ROW_MAP_LINE_INVALID")
@@ -229,20 +249,31 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 continue
             _require(isinstance(link, list) and len(link) in (2, 3)
                      and all(type(item) is int and item >= 1 for item in link[:2])
-                     and (len(link) == 2 or link[2] == "part"), "ROW_MAP_LINK_INVALID")
+                     and (len(link) == 2 or link[2] in LINK_KINDS), "ROW_MAP_LINK_INVALID")
             row, column = link[0], link[1]
+            kind = link[2] if len(link) == 3 else None
+            if kind == "code" and not _is_maker(field):
+                fail(first, "CODE_LINK_NOT_ALLOWED")
+                continue
             if row not in rows:
                 fail(first, "FIELD_OUTSIDE_LINE")
                 continue
             value = original.cells.get((sheet, row, column))
-            matches = (value is not None and target is not None
-                       and (_part(value, target) if len(link) == 3 else _same(value, target, field == "quantity")))
+            if kind == "part":
+                matches = _part(value, target)
+            elif kind == "code":
+                matches = _code(value, target)
+            else:
+                matches = _same(value, target, field == "quantity")
+            matches = value is not None and target is not None and matches
             if not matches:
                 fail((sheet, row), "FIELD_VALUE_MISMATCH")
                 if len(mismatches) < MAX_RECORDED_MISMATCHES:
                     mismatches.append({"sheet": sheet, "row": row, "field": field, "column": column,
-                                       "part": len(link) == 3})
+                                       "part": kind == "part"})
                 continue
+            if kind is None and _is_maker(field) and _MAKER_CODE.fullmatch(_text(target)):
+                maker_codes_kept += 1
             contributed.add(row)
             used_columns.add((sheet, column))
             cited_cells.add((sheet, row, column))
@@ -254,7 +285,7 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                 role = "mpn" if field.startswith("manufacturer_item_number_") else "manufacturer"
                 column_roles.setdefault((sheet, column), set()).add(role)
                 pair_cells.add((sheet, row, column))
-                if len(link) == 3:
+                if kind == "part":
                     part_links[(sheet, row, column)] += 1
         for row in rows:
             if (sheet, row) in source_rows and row not in contributed:
@@ -267,7 +298,7 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
             elif isinstance(manufacturer, list) and isinstance(mpn, list):
                 pair_columns.setdefault((sheet, manufacturer[1]), set()).add(mpn[1])
                 pair_rows.append((sheet, manufacturer[0], manufacturer[1], mpn[1],
-                                  len(manufacturer) == 3 and len(mpn) == 3))
+                                  manufacturer[2:] == ["part"] and mpn[2:] == ["part"]))
     _require(mapped_output == output_rows, "ROW_MAP_OUTPUT_COVERAGE_INVALID")
 
     # Manufacturer/MPN pattern on every line row (plan 8.12): a broken pattern is a finding.
@@ -342,6 +373,13 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                            for column in source_rows[key])
         if has_identity and has_quantity:
             fail(key, "SKIPPED_ROW_LOOKS_LIKE_LINE")
+        elif (any((sheet, column) in column_roles for column in source_rows[key])
+              and not any((sheet, column) in used_columns and (sheet, column) not in column_roles
+                          for column in source_rows[key])):
+            # Shaped like an alternate: a maker or MPN and nothing in any other mapped column (a
+            # rank or other unused column may be filled). Heading and document rows also fill
+            # description, quantity or part-number columns, so they stay skippable.
+            fail(key, "SKIPPED_ROW_HOLDS_PAIR")
 
     ignored = proposal["ignored_columns"]
     _require(isinstance(ignored, list) and len(ignored) <= 5_000, "ROW_MAP_IGNORED_INVALID")
@@ -389,4 +427,6 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
                                      for sheet, column in contradicted[:MAX_RECORDED_COLUMNS]],
         "pattern_findings": [{"sheet": sheet, "column": column, "code": code}
                              for (sheet, column), code in sorted(pattern.items())[:MAX_RECORDED_COLUMNS]],
+        # Information only: maker names written with a leading customer code (count, no values).
+        "maker_code_prefix_kept": maker_codes_kept,
     }

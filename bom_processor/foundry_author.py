@@ -337,22 +337,28 @@ class FoundryModelAuthor:
 
 
 def create_foundry_author() -> FoundryModelAuthor:
-    """Construct the Gov client lazily so importing this module stays offline."""
-    from agent_framework_foundry import FoundryChatClient
-    from azure.identity import ManagedIdentityCredential
+    """Construct the Gov client lazily so importing this module stays offline.
+
+    Serves parser authoring, package choice and the package survey. The endpoint must be an Azure
+    Government host, checked before any client import (PLM readiness D5, Nick 2026-10-12).
+    """
     import os
-    credential: Any = ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None)
-    endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
+    from .gov_endpoint import is_gov_endpoint
+    endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+    if not is_gov_endpoint(endpoint):
+        raise ValueError("MODEL_ENDPOINT_INVALID")
     association_policy = os.environ.get("BOM_SOURCE_ASSOCIATIONS", "false")
     if association_policy not in {"true", "false"}:
         raise ValueError("invalid association policy")
-    if ".azure.us" in endpoint:
-        class GovScopeCredential:
-            def __init__(self, inner): self.inner = inner
-            def get_token(self, *scopes, **kwargs):
-                translated = tuple(scope.replace("https://ai.azure.com/.default", "https://ai.azure.us/.default") for scope in scopes)
-                return self.inner.get_token(*translated, **kwargs)
-        credential = GovScopeCredential(credential)
+    from agent_framework_foundry import FoundryChatClient
+    from azure.identity import ManagedIdentityCredential
+
+    class GovScopeCredential:
+        def __init__(self, inner): self.inner = inner
+        def get_token(self, *scopes, **kwargs):
+            translated = tuple(scope.replace("https://ai.azure.com/.default", "https://ai.azure.us/.default") for scope in scopes)
+            return self.inner.get_token(*translated, **kwargs)
+    credential: Any = GovScopeCredential(ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None))
     client_options: dict[str, Any] = {"project_endpoint": endpoint, "credential": credential}
     if association_policy == "true":
         from azure.ai.projects.aio import AIProjectClient

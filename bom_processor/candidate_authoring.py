@@ -32,7 +32,9 @@ ROW_MAP_RULE = (
     "line, including alternate-manufacturer rows (for example [6] or [6, 7]; the sheet name goes only in "
     "\"sheet\", never [sheet, row] pairs), \"fields\": {output column name: [source row, source column] of the cell the value came from}}. "
     "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
-    "when the value is one separated part of a combined cell; use {\"derived\": reason} only for "
+    "when the value is one separated part of a combined cell; use [row, column, \"code\"] for a manufacturer "
+    "name written without the customer's short code that stands in front of it in the cell (the cell "
+    "'63 ACME INC.' written as 'ACME INC.'); use {\"derived\": reason} only for "
     "unit_of_measure or bom_notes values not copied from one cell. Every listed row must supply at least "
     "one linked value, and both halves of a manufacturer/MPN pair come from the same source row. A linked "
     "cell must hold exactly the written value (ignoring outer spaces): a value with added words, such as "
@@ -87,6 +89,8 @@ CANONICAL_OUTPUT_RULES = (
     # Round 11 (A043): one maker with several part numbers in one cell, and commas inside names.
     "one manufacturer with several part numbers in one cell gives one pair per part number, each with that manufacturer; separators such as commas are clues, not rules: a comma inside a company name (', Inc.') or inside a part number ('BAS21,235') does not split it",
     "decide each source column's role the way a person would, from its header and its data together; header words are clues, not rules (a 'Manufacturers Part Number' column holds the MPN even though its header contains 'manufacturer'); write the roles you decided into the parser for this layout, for example by the exact header labels you read, never as generic keyword rules that could drop a column you can see",
+    # PLM readiness D1 (Nick 2026-10-12): some customers put their own maker code in front of the name.
+    "a short number and a space in front of a manufacturer name (for example '63 ACME INC.') is usually the customer's own code for that maker, not part of its name, especially when the same number comes with the same name on many rows: write the name without the code and cite it with the \"code\" link; a name that really begins with digits, such as 3M, stays as it is; this is a clue, not a rule",
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not
     # accounted for", "Missing item name"); a crash gives the next attempt only an error line, while

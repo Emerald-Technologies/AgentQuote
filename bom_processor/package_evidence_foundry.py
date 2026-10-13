@@ -10,8 +10,8 @@ import asyncio
 import json
 import os
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
+from .gov_endpoint import is_gov_endpoint
 from .package_evidence_contracts import PackageEvidenceError, digest, json_bytes, require, text
 from .package_evidence_proposal import produce_proposal
 
@@ -298,14 +298,7 @@ def create_foundry_evidence_model() -> FoundryEvidenceProposalModel:
     """No fallback deployment, commercial endpoint or implicit live enablement."""
     require(os.environ.get("PACKAGE_EVIDENCE_MODEL_ENABLED") == "true", "MODEL_DISABLED")
     endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
-    try:
-        url = urlsplit(endpoint)
-        require(url.scheme == "https" and url.hostname is not None
-                and url.hostname.endswith(".azure.us") and url.port in {None, 443}
-                and url.username is None and url.password is None and not url.query
-                and not url.fragment and not any(char.isspace() for char in endpoint), "MODEL_ENDPOINT_INVALID")
-    except ValueError:
-        raise PackageEvidenceError("MODEL_ENDPOINT_INVALID") from None
+    require(is_gov_endpoint(endpoint), "MODEL_ENDPOINT_INVALID")
     deployment = text(os.environ.get("PACKAGE_EVIDENCE_MODEL_DEPLOYMENT", ""))
     from agent_framework_foundry import FoundryChatClient
     from azure.identity import ManagedIdentityCredential
