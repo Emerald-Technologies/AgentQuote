@@ -155,6 +155,11 @@ def resolve(lines: Sequence[Line], parents: Mapping[int, int | None], *, proven:
             procurement, basis = "build", {"kind": "quoted_assembly"}
         elif ancestor in ("buy", "reference") and above and above["is_subassembly"]:
             procurement, basis = "reference", {"kind": "inside_bought_subassembly", "parent": above["line_key"]}
+            if row in children:
+                # A sub-assembly nested in a bought one still gets its own proposal, used if a
+                # person later decides to build the outer one (QuickQuote re-derives the tree).
+                nested, reasons = propose(line, children[row], children)
+                basis.update(proposal=nested, reasons=reasons)
         elif row in children:
             proposal, reasons = propose(line, children[row], children)
             chosen = choices.get(record["line_key"])

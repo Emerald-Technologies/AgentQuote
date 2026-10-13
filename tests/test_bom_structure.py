@@ -117,6 +117,16 @@ def test_a_board_document_is_not_a_bare_board_clue():
     assert by_part(result)["K-1"]["procurement_basis"] == {"kind": "needs_decision", "reasons": ["NO_CLUE"]}
 
 
+def test_a_subassembly_nested_in_a_bought_one_still_carries_its_own_proposal():
+    lines, parents = tree([("CBL-1", "CABLE ASSY", 1, None), ("PCA-9", "PCB ASSY, SENSOR", 1, 0),
+                           ("FAB-9", "PCB FABRICATION", 1, 1)])
+    # A cable holding a board gives conflicting clues; a person decides it is bought complete.
+    nested = by_part(resolve(lines, parents, proven=True, choices={"CBL-1": "buy"}))["CBL-1/PCA-9"]
+    assert nested["procurement"] == "reference"
+    assert nested["procurement_basis"]["proposal"] == "build"
+    assert "CONTAINS_BARE_BOARD" in nested["procurement_basis"]["reasons"]
+
+
 def test_the_same_part_twice_under_one_parent_keeps_two_distinct_lines():
     lines, parents = tree([("S-1", "PCB ASSY", 1, None), ("C-1", "CAP", 3, 0), ("C-1", "CAP", 2, 0)])
     keys = [l["line_key"] for l in resolve(lines, parents, proven=True)["lines"]]
