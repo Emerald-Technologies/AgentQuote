@@ -9,6 +9,10 @@ import json
 import re
 from typing import Any
 
+# Most assemblies one package may carry (Nick, 2026-10-13). QuickQuote uses the same value
+# (MAX_QUOTE_ASSEMBLIES in lib/quotes/assembly-limit.ts); both repos must agree.
+MAX_ASSEMBLIES = 250
+
 
 class PackageEvidenceError(ValueError):
     """Stable, non-source-bearing validation error."""
@@ -139,7 +143,7 @@ def bom_metadata(value: Any) -> dict:
 
 
 def assemblies_metadata(values: Any) -> list[dict]:
-    require(type(values) is list and 1 <= len(values) <= 50, "INVALID_ASSEMBLIES")
+    require(type(values) is list and 1 <= len(values) <= MAX_ASSEMBLIES, "INVALID_ASSEMBLIES")
     ids = set()
     locations = {}
     for value in values:

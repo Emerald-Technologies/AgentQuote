@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .core import BlobConflictError, _json_bytes
+from .package_evidence_contracts import MAX_ASSEMBLIES
 from .package_resolution import ParentPackageService, PackageResolutionError, _hash, _json
 
 POLICY = "conflict-free-bom-resolution.v1"
@@ -120,7 +121,7 @@ class SystemPackageService(ParentPackageService):
                 _guard.reject(PackageResolutionError("SYSTEM_CALLER_INVALID"))
             raise PackageResolutionError("SYSTEM_CALLER_INVALID")
         if (not isinstance(assembly_identities, list) or not assembly_identities
-                or len(assembly_identities) > 50):
+                or len(assembly_identities) > MAX_ASSEMBLIES):
             if _guard is not None:
                 _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")

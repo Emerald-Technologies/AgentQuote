@@ -10,6 +10,7 @@ import json
 import pytest
 
 from bom_processor import ProcessingError, ProcessingRequest
+from bom_processor.core import MAX_REQUESTED_ASSEMBLIES
 from bom_processor.bom_candidate_choice import REPLY_VERSION as CHOICE_VERSION
 from bom_processor.bom_package_choice import (REQUEST_VERSION, REQUEST_VERSION_V2, RESULT_VERSION_V2,
                                               PackageChoiceService, apply_reopen, choice_request,
@@ -177,13 +178,22 @@ def test_requested_assemblies_fingerprint_golden_vector():
     lambda v: v["requested_assemblies"][0].update(revision="x" * 51),
     lambda v: v.update(requested_assemblies=[
         {"assembly_id": f"{index:08x}-1111-4111-8111-111111111111", "part_number": f"P{index}", "revision": None}
-        for index in range(51)]),
+        for index in range(MAX_REQUESTED_ASSEMBLIES + 1)]),
 ])
 def test_requested_assemblies_are_strictly_validated(change):
     value = request_dict()
     change(value)
     with pytest.raises(ProcessingError):
         ProcessingRequest.from_dict(value)
+
+
+def test_requested_assemblies_accept_the_ceiling():
+    value = request_dict()
+    value["requested_assemblies"] = [
+        {"assembly_id": f"{index:08x}-1111-4111-8111-111111111111", "part_number": f"P{index}", "revision": None}
+        for index in range(MAX_REQUESTED_ASSEMBLIES)]
+    assert MAX_REQUESTED_ASSEMBLIES == 250
+    assert len(ProcessingRequest.from_dict(value).requested_assemblies) == 250
 
 
 # --- survey and choice -------------------------------------------------------------------------

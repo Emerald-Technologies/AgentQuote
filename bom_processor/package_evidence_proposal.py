@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from .package_evidence_contracts import (
+    MAX_ASSEMBLIES,
     PackageEvidenceError, assemblies_metadata, association_id, detached, hash_value,
     integer, json_bytes, object_hash, require, strict, text, utf16_units, uuid_value,
 )
@@ -117,7 +118,7 @@ def _hints(value: dict, inventory: list, occurrences: list, assemblies: list) ->
         require(type(identity) is str and identity in evidence, "FOREIGN_ASSOCIATION")
         require(dispositions[identity]["state"] == "included", "ASSOCIATION_NOT_INCLUDED")
         occurrence_ids = _set(item["occurrenceIds"], set(occurrence_map), 100_000)
-        uuids = _set(item["assemblyUuids"], assembly_ids, 50, minimum=1)
+        uuids = _set(item["assemblyUuids"], assembly_ids, MAX_ASSEMBLIES, minimum=1)
         derived = {occurrence_map[key]["assemblyUuid"] for key in occurrence_ids}
         require(not occurrence_ids or derived == set(uuids), "ASSOCIATION_ASSEMBLY_MISMATCH")
         scope = "shared" if len(uuids) > 1 else "assembly_specific"

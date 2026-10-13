@@ -23,6 +23,7 @@ from typing import Any, Protocol
 import pandas as pd
 
 from .blob_registry import BlobRegistryReader, RegistrySelection
+from .package_evidence_contracts import MAX_ASSEMBLIES
 from .master_registry import RegistryError
 from .candidates import CandidateRequiredError, persist_candidate
 
@@ -47,7 +48,7 @@ _PACKAGE_FILE_NAME = re.compile(r"^[^\\/:\x00-\x1f\x7f]{1,256}$")
 MAX_PACKAGE_FILES = 100
 MAX_PACKAGE_FILE_BYTES = 100_000_000
 MAX_PACKAGE_FILES_BYTES = 500_000_000
-MAX_REQUESTED_ASSEMBLIES = 50
+MAX_REQUESTED_ASSEMBLIES = MAX_ASSEMBLIES
 
 
 class ProcessingError(ValueError):

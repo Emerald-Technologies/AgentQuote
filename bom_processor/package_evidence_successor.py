@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .package_evidence_contracts import detached, hash_value, integer, require, strict, text, uuid_value
+from .package_evidence_contracts import MAX_ASSEMBLIES, detached, hash_value, integer, require, strict, text, uuid_value
 
 MAX_ATTEMPT = 5
 MAX_FINDINGS = 200
@@ -40,7 +40,7 @@ def _finding(value: Any) -> dict:
         strict(association, {"evidenceId", "assemblyUuids", "scope"}, "INVALID_SUCCESSOR_FEEDBACK")
         hash_value(association["evidenceId"])
         assemblies = association["assemblyUuids"]
-        require(type(assemblies) is list and 1 <= len(assemblies) <= 50 and len(set(assemblies)) == len(assemblies),
+        require(type(assemblies) is list and 1 <= len(assemblies) <= MAX_ASSEMBLIES and len(set(assemblies)) == len(assemblies),
                 "INVALID_SUCCESSOR_FEEDBACK")
         for item in assemblies:
             uuid_value(item)
