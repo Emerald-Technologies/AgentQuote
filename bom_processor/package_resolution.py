@@ -1471,6 +1471,10 @@ def requested_identity(result: dict[str, Any], document_ids: list[str], rows: li
     named = {assembly_id for assembly_id, item in requested.items()
              if parsed is not None and find_assembly(item["part_number"], parsed.name) is not None}
     confirmed = len(links) == 1 and all(item is not None and item.get("requested_assembly_ids") for item in sources)
+    # Unit 6: a sub-assembly file in the parent's folder keeps its own identity, so review can put it
+    # under the line that names it instead of merging it with the parent's BOM.
+    if any(item is not None and item.get("reason") == "subassembly_of" for item in sources):
+        return None
     if confirmed and not named:
         item = requested[next(iter(links))]
         # A clearly different parsed revision is a contradiction a person resolves.

@@ -12,7 +12,10 @@ assembly agreed with the column-read cross-check (plan 8.2-8). Anything else is 
 before, so a doubtful choice reaches the existing human review instead of dropping a file.
 With requested assemblies (v2, round 2), BOMs are grouped by their code-confirmed link to a
 requested assembly, and a BOM linked to none is set aside as not_mapped, reopenable by a
-person (Nick, D2, 2026-10-10).
+person (Nick, D2, 2026-10-10). A BOM of an assembly that is not requested but is named by a
+part-number cell of a BOM being processed is a sub-assembly file: it is processed (reason
+subassembly_of) and kept out of the primary choice, so review can put it under that line
+(sub-assembly plan unit 6, Nick 2026-10-13).
 Run python -m pytest tests/test_bom_package_choice.py.
 """
 from __future__ import annotations
@@ -113,8 +116,11 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     blocked = any(item["severity"] == "blocking" for item in failures)
     if blocked:
         raise PackageChoiceError("PACKAGE_SURVEY_INCOMPLETE", survey)
+    records = {record["file_id"]: record for record in survey["files"]}
+    subassembly = _subassembly_files(view, records, request["requested_assemblies"]) if linked else {}
     for group in (survey["requested_assemblies"] if linked else survey["assemblies"]):
-        boms = group["files"]["bom"]
+        # A sub-assembly file is never a candidate for its parent's main BOM (unit 6).
+        boms = [file_id for file_id in group["files"]["bom"] if file_id not in subassembly]
         if len(boms) < 2:
             continue
         name = group["part_number"] if linked else group["name"]
@@ -148,7 +154,6 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                                  "file_ids": list(boms), "assembly": name})
         choices.append({"assembly": name, **owner, "view_sha256": candidate_view.sha256,
                         "choice": choice, "set_aside_digests": set_aside_digests(choice, candidate_view)})
-    records = {record["file_id"]: record for record in survey["files"]}
     by_hash: dict[str, list[str]] = {}
     for file_id, item in view.files.items():
         by_hash.setdefault(item.sha256, []).append(file_id)
@@ -175,6 +180,8 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
             reason = "survey_blocking"
         elif failed_files.intersection(file_ids):
             reason = "choice_failed"
+        elif subassembly.keys() & set(file_ids):
+            reason = "subassembly_of"
         elif "bom" not in roles:
             decision, reason = "excluded", roles[0] if len(roles) == 1 else "not_bom"
         elif linked and not links:
@@ -203,7 +210,11 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
         documents.append({"document_id": document["document_id"], "sha256": document["sha256"],
                           "decision": decision, "reason": reason, "disposition": disposition,
                           "survey_file_ids": file_ids, "roles": roles, "assemblies": assemblies,
-                          **({"requested_assembly_ids": links} if linked else {})})
+                          **({"requested_assembly_ids": links} if linked else {}),
+                          **({"named_by_file_ids": sorted({parent for file_id in file_ids
+                                                           for parent in subassembly.get(file_id, [])},
+                                                          key=lambda value: int(value[1:]))}
+                             if reason == "subassembly_of" else {})})
     processed = [item["document_id"] for item in documents if item["decision"] == "process"]
     if not processed:
         raise PackageChoiceError("PACKAGE_NO_REQUESTED_BOM" if any(item["reason"] == "not_mapped" for item in documents)
@@ -234,6 +245,59 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     if linked:
         result["requested_assemblies"] = request["requested_assemblies"]
     return result
+
+
+def _subassembly_files(view: Any, records: dict[str, dict[str, Any]],
+                       requested: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Sub-assembly files (unit 6): file id -> ids of the BOM files with a part-number cell naming it.
+
+    A candidate is a BOM file whose own code-checked assembly is not a requested one. It is a
+    sub-assembly file when a whole cell of a BOM processed for a requested assembly (or of another
+    sub-assembly file) names that assembly both ways under the core-number rule. Code only, no model.
+    """
+    from .bom_attachment import names
+    from .bom_candidate_view import CANDIDATE_CELL_LIMIT
+    from .package_survey import _Unreadable, cell_text, read_top_rows
+    boms = {file_id: record for file_id, record in records.items() if record["role"] == "bom"}
+
+    def requested_own(record: dict[str, Any]) -> bool:
+        own = record.get("assembly")
+        return own is not None and any(names(item["part_number"], own["name"]) for item in requested)
+
+    candidates = {file_id: record["assembly"]["name"] for file_id, record in boms.items()
+                  if record.get("assembly") is not None and str(record["assembly"]["name"]).strip()
+                  and not requested_own(record)}
+    if not candidates:
+        return {}
+    texts: dict[str, set[str]] = {}
+
+    def cells(file_id: str) -> set[str]:
+        if file_id not in texts:
+            try:
+                sheets, _ = read_top_rows(records[file_id]["kind"], view.files[file_id].data, max_row=None,
+                                          cell_limit=CANDIDATE_CELL_LIMIT)
+            except _Unreadable:
+                sheets = []
+            # Part numbers are short and hold a digit; long text never names a file by itself.
+            texts[file_id] = {text for sheet in sheets for value in sheet.cells.values()
+                              for text in [cell_text(value).strip()]
+                              if 0 < len(text) <= 64 and any(ch.isdigit() for ch in text)}
+        return texts[file_id]
+
+    frontier = sorted(file_id for file_id, record in boms.items() if file_id not in candidates
+                      and ((record.get("requested_assembly") or {}).get("link") == "confirmed" or requested_own(record)))
+    found: dict[str, set[str]] = {}
+    while frontier:
+        reached = []
+        for parent in frontier:
+            values = cells(parent)
+            for file_id, name in sorted(candidates.items()):
+                if file_id != parent and any(names(value, name) for value in values):
+                    if file_id not in found:
+                        reached.append(file_id)
+                    found.setdefault(file_id, set()).add(parent)
+        frontier = reached
+    return {file_id: sorted(parents, key=lambda value: int(value[1:])) for file_id, parents in found.items()}
 
 
 def _link_findings(documents: list[dict[str, Any]], records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
