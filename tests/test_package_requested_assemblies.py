@@ -390,3 +390,29 @@ def test_the_survey_call_sets_no_output_cap():
 
     foundry_caller(agent_factory=Factory)("instructions", "text")
     assert "max_tokens" not in seen and seen["response_format"] == {"type": "json_object"}
+
+
+# --- one BOM holding several requested assemblies (QuickQuote A045, Nick 2026-10-13) ----------
+
+COMBINED = xlsx({"BOM": [["Combined BOM"], ["Parent Part", "Part Number", "Description", "Qty"],
+                         ["ENE010-0810-U2-TK", "ENE010-0810-U2-TK", "PCB ASSY", 1],
+                         ["ENE010-0810-U2-TK", "R-100", "Resistor", 2],
+                         ["SNC006-002022-01-TK", "SNC006-002022-01-TK", "PCB ASSY", 1],
+                         ["SNC006-002022-01-TK", "C-200", "Capacitor", 3]]})
+
+
+def test_a_bom_naming_two_requested_assemblies_is_kept_for_both_not_set_aside():
+    # The survey links a file to one assembly at most; here it links none, as on A045.
+    package = archive({"Boards/COMBINED BOM.xlsx": COMBINED})
+    _, _, done, _ = run(LinkingAgent(), docs={"doc-combined": COMBINED}, package=package)
+    assert done["status"] == "completed"
+    document = done["result"]["documents"][0]
+    assert (document["decision"], document["reason"]) == ("process", "combined_bom")
+    assert document["requested_assembly_ids"] == sorted([ENE_ID, SNC_ID])
+
+
+def test_a_bom_naming_only_one_requested_assembly_is_still_set_aside_when_unlinked():
+    single = xlsx({"BOM": [["One BOM"], ["Parent Part", "Part Number", "Qty"], ["ENE010-0810-U2-TK", "R-100", 2]]})
+    package = archive({"Boards/ONE BOM.xlsx": single})
+    _, _, done, _ = run(LinkingAgent(), docs={"doc-one": single}, package=package)
+    assert done == {"request_id": done["request_id"], "status": "failed", "code": "PACKAGE_NO_REQUESTED_BOM"}

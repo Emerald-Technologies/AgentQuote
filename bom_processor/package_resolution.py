@@ -209,7 +209,7 @@ class ParentPackageService:
                 complete = False
                 projected.update({"status": "pending", "mapping_keys": [], "disposition_keys": []})
             else:
-                candidate_groups = self._candidate_groups(assignment, child["review"], mappings, choice_result)
+                candidate_groups = self._candidate_groups(assignment, child["review"], mappings, choice_result, plan=plan)
                 groups.extend([{**projected, **item} for item in candidate_groups])
                 complete &= all(item["status"] == "ready" for item in candidate_groups)
                 continue
@@ -359,7 +359,7 @@ class ParentPackageService:
                 result["structure"] = {"blob_path": structure_path, "sha256": structure_digest,
                                        "size_bytes": len(data), "content_type": STRUCTURE_CONTENT_TYPE}
             results.append(result)
-        results.sort(key=lambda item: item["document_ids"])
+        results.sort(key=lambda item: (item["document_ids"], item["group_id"]))
         version = MANIFEST_V2 if any("structure" in item for item in results) else MANIFEST_V1
         manifest_identity = {"version": version, "status": "completed",
             "plan_id": plan_id, "approval_id": approval_id, "plan_sha256": review["plan_sha256"],
@@ -531,7 +531,8 @@ class ParentPackageService:
             fixtures = [fixture for member in members for fixture in member["evidence"]["fixtures"]]
             unique: dict[tuple[str, str], dict[str, Any]] = {}
             for fixture in fixtures:
-                key = (fixture["storage"], fixture["output"]["blob_path"])
+                key = (fixture["storage"], fixture["output"]["blob_path"],
+                       (fixture.get("subset") or {}).get("assembly_id"))
                 if key in unique:
                     unique[key]["document_ids"] = sorted(set(unique[key]["document_ids"])
                                                           | set(fixture["document_ids"]))
@@ -546,7 +547,7 @@ class ParentPackageService:
                     path = fixture["output"]["blob_path"]
                     processed_prefix = path.split("processed/", 1)[0] + "processed/"
                     data = self._output_bytes(fixture["output"], processed_prefix)
-                row_sets.append(self._rows(data))
+                row_sets.append(self._fixture_rows(fixture, data))
             reconciliation = reconcile_boms(row_sets, assembly=AssemblyIdentity(*identity))
             group_id = _hash({"assembly_identity": identity})
             disposition = dispositions.get(group_id)
@@ -614,7 +615,7 @@ class ParentPackageService:
         return {"sources": evidence["sources"],
                 "fixtures": [{key: item.get(key) for key in (
                     "fixture_key", "document_ids", "storage", "output_sha256",
-                    "semantic_fingerprint", "model_summary", "source", "parser", "prefix")
+                    "semantic_fingerprint", "model_summary", "source", "parser", "prefix", "subset")
                     if item.get(key) is not None} for item in evidence["fixtures"]]}
 
     @staticmethod
@@ -811,7 +812,8 @@ class ParentPackageService:
 
     def _candidate_groups(self, assignment: dict[str, Any], review: dict[str, Any],
                           mappings: dict[str, dict[str, str]],
-                          choice_result: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                          choice_result: dict[str, Any] | None = None,
+                          plan: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         request_id = assignment["request_id"]
         candidate_id = review.get("candidate_id")
         validation_id = review.get("validation_id")
@@ -857,6 +859,27 @@ class ParentPackageService:
                     facts = self._fixture_semantics(data)
                 claimed = fixture.get("assembly_identity")
                 docs = sorted(str(alias.get("document_id")) for alias in fixture.get("source_aliases", []))
+                entry = {"fixture_key": key, "document_ids": docs, "storage": "candidate", "output": fixture["output"],
+                         "prefix": candidate_prefix, "output_sha256": facts["output_sha256"],
+                         "semantic_fingerprint": facts["semantic_fingerprint"], "model_summary": facts["model_summary"],
+                         **({"assembly_association": association} if association is not None else {})}
+                subsets = (self._combined_subsets(plan, {"evidence": {}}, entry, data, choice_result)
+                           if plan is not None else None)
+                if subsets:
+                    # A045 (Nick 2026-10-13): one BOM holding several requested assemblies. The whole file
+                    # must still match what validation recorded; then each assembly gets only its own lines.
+                    if (fixture.get("fingerprint") != facts["semantic_fingerprint"]
+                            or fixture.get("model_summary") != facts["model_summary"]):
+                        raise PackageResolutionError("PACKAGE_SEMANTIC_BINDING")
+                    if key in mappings:
+                        raise PackageResolutionError("PACKAGE_REVIEW_INPUT_INVALID")
+                    rows = self._rows(data)
+                    for subset in subsets:
+                        head = rows[subset["head_row"] - 2]
+                        grouped.setdefault(AssemblyIdentity(_cell_text(head.get("item_number")),
+                                                            _cell_text(head.get("revision"))).normalized(),
+                                           []).append({**entry, "subset": subset})
+                    continue
                 # Round 5 (Nick 2026-10-11): with requested assemblies, read identity as a person would:
                 # the BOM's own line naming a requested assembly, else the code-confirmed survey link.
                 requested = (requested_identity(choice_result, docs, self._rows(data), facts["assembly"])
@@ -895,13 +918,7 @@ class ParentPackageService:
                 if (fixture.get("fingerprint") != facts["semantic_fingerprint"]
                         or fixture.get("model_summary") != facts["model_summary"]):
                     raise PackageResolutionError("PACKAGE_SEMANTIC_BINDING")
-                grouped.setdefault(identity, []).append({"fixture_key": key, "document_ids": docs,
-                    "storage": "candidate", "output": fixture["output"],
-                        "prefix": candidate_prefix,
-                    "output_sha256": facts["output_sha256"],
-                    "semantic_fingerprint": facts["semantic_fingerprint"],
-                    "model_summary": facts["model_summary"],
-                    **({"assembly_association": association} if association is not None else {})})
+                grouped.setdefault(identity, []).append(entry)
         result = []
         for identity, fixtures in sorted(grouped.items()):
             evidence = {"request_id": request_id, "candidate_id": candidate_id,
@@ -917,6 +934,44 @@ class ParentPackageService:
                            "disposition_keys": []})
         return result
 
+    def _combined_subsets(self, plan: dict[str, Any], group: dict[str, Any], fixture: dict[str, Any], data: bytes,
+                          choice_result: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+        """Subsets of a combined BOM (bom_split.py) from parents proven against the source, or None.
+
+        Needs requested assemblies (a package choice) and a row map whose parent claims pass the
+        re-check; anything else is today's behaviour. A combined BOM that cannot be divided safely
+        stops review with its SPLIT_ code for a person.
+        """
+        from .bom_split import SplitError, split_rows
+        if choice_result is None or not choice_result.get("requested_assemblies"):
+            return None
+        claimed = self._fixture_claims(plan, group, fixture, data)
+        if claimed is None:
+            return None
+        ref, claims, proven = claimed
+        if not proven:
+            return None
+        rows = self._rows(data)
+        numbers = {index + 2: _cell_text(row.get("item_number")) for index, row in enumerate(rows)}
+        if set(claims) != set(numbers):
+            return None
+        try:
+            subsets = split_rows(numbers, {row: claims[row] for row in numbers}, choice_result["requested_assemblies"])
+        except SplitError as exc:
+            raise PackageResolutionError(str(exc)) from None
+        return None if subsets is None else [{**item, "row_map_sha256": ref["sha256"]} for item in subsets]
+
+    def _fixture_rows(self, fixture: dict[str, Any], data: bytes) -> list[dict[str, Any]]:
+        """A fixture's parsed rows; for a combined BOM only its subset's lines, in file order."""
+        rows = self._rows(data)
+        subset = fixture.get("subset")
+        if not isinstance(subset, dict):
+            return rows
+        try:
+            return [rows[row - 2] for row in subset["output_rows"]]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise PackageResolutionError("PACKAGE_SPLIT_INVALID") from exc
+
     def _reconciled(self, plan: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
         """The rows one group publishes: reconciled, or a person's pick in a conflict; with the fixtures.
 
@@ -929,7 +984,7 @@ class ParentPackageService:
                          if item["storage"] == "candidate"
                          else self._output_bytes(item["output"], processed_prefix)
                          for item in fixtures]
-        row_sets = [self._rows(data) for data in fixture_bytes]
+        row_sets = [self._fixture_rows(item, data) for item, data in zip(fixtures, fixture_bytes)]
         assembly = evidence["assembly_identity"]
         reconciliation = reconcile_boms(row_sets, assembly=AssemblyIdentity(
             assembly["name"], assembly.get("revision", "")))
@@ -973,12 +1028,17 @@ class ParentPackageService:
         if not proven:
             return ref, {}, False
         position = view["source_order"]
+        subset = view["fixtures"][index].get("subset")
+        original = subset["output_rows"] if isinstance(subset, dict) else list(range(2, len(position) + 2))
+        index_of = {row: offset for offset, row in enumerate(original)}
         parents: dict[int, int | None] = {}
         for row, parent in claims.items():
-            if (type(row) is not int or not 2 <= row < len(position) + 2
-                    or (parent is not None and (type(parent) is not int or not 2 <= parent < len(position) + 2))):
+            if isinstance(subset, dict) and row not in index_of:
+                continue  # another assembly's line in the same combined BOM
+            if (type(row) is not int or row not in index_of or len(original) != len(position)
+                    or (parent is not None and (type(parent) is not int or parent not in index_of))):
                 raise PackageResolutionError("PACKAGE_STRUCTURE_INVALID")
-            parents[position[row - 2]] = None if parent is None else position[parent - 2]
+            parents[position[index_of[row]]] = None if parent is None else position[index_of[parent]]
         return ref, parents, True
 
     def _fixture_claims(self, plan: dict[str, Any], group: dict[str, Any], fixture: dict[str, Any],
@@ -1027,7 +1087,11 @@ class ParentPackageService:
         if claimed is None:
             return None
         ref, claims, proven = claimed
-        lines = [bom_structure.Line(index + 2, _cell_text(row.get("item_number")), _cell_text(row.get("item_name")),
+        # A combined BOM's subset keeps the file's own output rows, which its parent claims name.
+        original = (fixture["subset"]["output_rows"] if isinstance(fixture.get("subset"), dict)
+                    else list(range(2, len(rows) + 2)))
+        index_of = {row: index for index, row in enumerate(original)}
+        lines = [bom_structure.Line(original[index], _cell_text(row.get("item_number")), _cell_text(row.get("item_name")),
                                     _cell_text(row.get("item_category")), _cell(row.get("quantity")),
                                     any(_cell(value) is not None for key, value in row.items()
                                         if str(key).startswith("manufacturer_item_number_")))
@@ -1045,8 +1109,8 @@ class ParentPackageService:
         for line in resolved["lines"]:
             parent = line["parent_line"]
             item = {key: value for key, value in line.items() if key not in ("output_row", "parent_line")}
-            item["line_number"] = published[line["output_row"] - 2]
-            item["parent_line_number"] = None if parent is None else published[parent - 2]
+            item["line_number"] = published[index_of[line["output_row"]]]
+            item["parent_line_number"] = None if parent is None else published[index_of[parent]]
             out.append(item)
         out.sort(key=lambda item: item["line_number"])
         return {"version": STRUCTURE_VERSION, "group_id": group["group_id"],
@@ -1327,8 +1391,15 @@ class ParentPackageService:
                     if item["document_id"] not in excluded and item["document_id"] not in attached]
         if (manifest["version"] == MANIFEST_V2) != any("structure" in item for item in results):
             raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
-        if (results != sorted(results, key=lambda item: item["document_ids"])
-                or sorted(covered) != sorted(expected) or len(covered) != len(set(covered))
+        # A045: a combined BOM may feed several results, each through its own proven subset.
+        from .bom_split import split_documents
+        shared = split_documents([review_groups[item["group_id"]] for item in results])
+        if shared is None:
+            raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
+        unique = sorted(set(covered))
+        if (results != sorted(results, key=lambda item: (item["document_ids"], item["group_id"]))
+                or unique != sorted(expected)
+                or len(covered) - len(unique) != sum(covered.count(doc) - 1 for doc in shared)
             or seen_groups != set(review_groups)):
             raise PackageResolutionError("RESOLVED_OUTPUT_CONFLICT")
         return manifest
@@ -1407,6 +1478,16 @@ def requested_links(groups: list[dict[str, Any]], result: dict[str, Any]) -> lis
     proposed: dict[int, dict[str, Any]] = {}
     for index, group in enumerate(groups):
         if group.get("status") != "ready":
+            continue
+        # A045: a group built from one requested assembly's own lines of a combined BOM names it.
+        subset_ids = {(item.get("subset") or {}).get("assembly_id") for item in group["evidence"].get("fixtures", [])}
+        if any(item is not None for item in subset_ids):
+            if len(subset_ids) == 1 and next(iter(subset_ids)) in requested:
+                assembly_id = next(iter(subset_ids))
+                identity = group["evidence"]["assembly_identity"]
+                if not revision_contradicts(requested[assembly_id]["revision"], identity.get("revision")):
+                    proposed[index] = {"assembly_id": assembly_id, "matched_text": identity["name"],
+                                       "reason": f"{identity['name']} heads its own lines in a combined BOM"}
             continue
         sources = [documents.get(document_id) for document_id in group["document_ids"]]
         if not sources or any(item is None or not item.get("requested_assembly_ids") for item in sources):

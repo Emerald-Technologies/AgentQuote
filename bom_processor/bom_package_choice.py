@@ -118,6 +118,7 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
         raise PackageChoiceError("PACKAGE_SURVEY_INCOMPLETE", survey)
     records = {record["file_id"]: record for record in survey["files"]}
     subassembly = _subassembly_files(view, records, request["requested_assemblies"]) if linked else {}
+    combined = _combined_bom_links(view, records, request["requested_assemblies"]) if linked else {}
     for group in (survey["requested_assemblies"] if linked else survey["assemblies"]):
         # A sub-assembly file is never a candidate for its parent's main BOM (unit 6).
         boms = [file_id for file_id in group["files"]["bom"] if file_id not in subassembly]
@@ -184,6 +185,11 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
             reason = "subassembly_of"
         elif "bom" not in roles:
             decision, reason = "excluded", roles[0] if len(roles) == 1 else "not_bom"
+        elif linked and not links and len({a for f in file_ids for a in combined.get(f, [])}) >= 2:
+            # A045 (Nick 2026-10-13): one BOM holding several requested assemblies is kept for parsing;
+            # review splits it only when its proven parent tree gives each assembly its own lines.
+            reason = "combined_bom"
+            links = sorted({a for f in file_ids for a in combined.get(f, [])})
         elif linked and not links:
             # D2: a BOM of no requested assembly is set aside, never parsed; a person can reopen it.
             decision, reason = "excluded", "not_mapped"
@@ -256,8 +262,6 @@ def _subassembly_files(view: Any, records: dict[str, dict[str, Any]],
     sub-assembly file) names that assembly both ways under the core-number rule. Code only, no model.
     """
     from .bom_attachment import names
-    from .bom_candidate_view import CANDIDATE_CELL_LIMIT
-    from .package_survey import _Unreadable, cell_text, read_top_rows
     boms = {file_id: record for file_id, record in records.items() if record["role"] == "bom"}
 
     def requested_own(record: dict[str, Any]) -> bool:
@@ -273,15 +277,7 @@ def _subassembly_files(view: Any, records: dict[str, dict[str, Any]],
 
     def cells(file_id: str) -> set[str]:
         if file_id not in texts:
-            try:
-                sheets, _ = read_top_rows(records[file_id]["kind"], view.files[file_id].data, max_row=None,
-                                          cell_limit=CANDIDATE_CELL_LIMIT)
-            except _Unreadable:
-                sheets = []
-            # Part numbers are short and hold a digit; long text never names a file by itself.
-            texts[file_id] = {text for sheet in sheets for value in sheet.cells.values()
-                              for text in [cell_text(value).strip()]
-                              if 0 < len(text) <= 64 and any(ch.isdigit() for ch in text)}
+            texts[file_id] = _part_number_cells(view, records, file_id)
         return texts[file_id]
 
     frontier = sorted(file_id for file_id, record in boms.items() if file_id not in candidates
@@ -525,3 +521,39 @@ def create_choice_caller() -> Caller:
     from .foundry_author import create_foundry_author
     from .package_survey_run import foundry_caller
     return foundry_caller(create_foundry_author().client)
+
+
+def _part_number_cells(view: Any, records: dict[str, dict[str, Any]], file_id: str) -> set[str]:
+    """Whole-cell texts of a BOM file that could be part numbers (short, holding a digit)."""
+    from .bom_candidate_view import CANDIDATE_CELL_LIMIT
+    from .package_survey import _Unreadable, cell_text, read_top_rows
+    try:
+        sheets, _ = read_top_rows(records[file_id]["kind"], view.files[file_id].data, max_row=None,
+                                  cell_limit=CANDIDATE_CELL_LIMIT)
+    except _Unreadable:
+        sheets = []
+    # Part numbers are short and hold a digit; long text never names a file by itself.
+    return {text for sheet in sheets for value in sheet.cells.values()
+            for text in [cell_text(value).strip()]
+            if 0 < len(text) <= 64 and any(ch.isdigit() for ch in text)}
+
+
+def _combined_bom_links(view: Any, records: dict[str, dict[str, Any]],
+                        requested: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """BOM files the survey linked to no requested assembly whose whole cells name two or more of them.
+
+    A045 (Nick 2026-10-13): one sheet listing several quoted boards, each with its own lines. The
+    survey links a file to one assembly at most, so such a file was set aside. Code only, no model;
+    whether it is really split is decided at review from its proven parent tree (bom_split.py).
+    """
+    from .bom_attachment import names
+    found: dict[str, list[str]] = {}
+    for file_id, record in records.items():
+        if record["role"] != "bom" or (record.get("requested_assembly") or {}).get("link") == "confirmed":
+            continue
+        values = _part_number_cells(view, records, file_id)
+        hits = sorted({item["assembly_id"] for item in requested
+                       if any(names(value, item["part_number"]) for value in values)})
+        if len(hits) >= 2:
+            found[file_id] = hits
+    return found

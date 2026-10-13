@@ -187,9 +187,14 @@ class SystemPackageService(ParentPackageService):
                 if _guard is not None:
                     _guard.reject(exc)
                 raise
-        if ((bindings is None and actual != identities) or len(covered) != len(set(covered))
+        # A045: a combined BOM may feed several groups, each through its own proven subset.
+        from .bom_split import split_documents
+        shared = split_documents(ready)
+        unique = sorted(set(covered))
+        if ((bindings is None and actual != identities) or shared is None
+                or len(covered) - len(unique) != sum(covered.count(doc) - 1 for doc in shared)
                 or attached & set(covered)
-                or sorted(covered + sorted(attached)) != sorted(item["document_id"] for item in plan["sources"])):
+                or sorted(unique + sorted(attached)) != sorted(item["document_id"] for item in plan["sources"])):
             if _guard is not None:
                 _guard.reject(PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID"))
             raise PackageResolutionError("SYSTEM_ASSEMBLY_COVERAGE_INVALID")
