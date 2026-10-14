@@ -172,6 +172,22 @@ def test_refinement_prompt_has_prior_code_and_failed_rows_but_never_stores_them(
     assert b"Beta" not in stored and b"previous_parser_code" not in stored
 
 
+def test_refinement_names_every_check_the_previous_run_failed():
+    # A046 (Nick 2026-10-14): a malformed row map lists no rows, and another check can fail with it.
+    storage, request = authored_failure()
+    message = ("semantic_output_invalid coverage_basis=quantity output_row=3: a Part needs a finite quantity | "
+               "row_map_invalid:ROW_MAP_PARENT_INVALID; parent is {...}")
+    storage.candidates[f"candidates/events/{request.request_id}/c0/validation-failed-v1.json"] = _json_bytes(
+        {**event("c0"), "failure_message": message})
+    model = Model()
+    CandidateAuthoringService(request.request_id, storage, model, refine=("c0", "v1")).author()
+    rules = model.prompts[0].rules
+    refinement = next(rule for rule in rules if rule.startswith("ROW ACCOUNTING REFINEMENT"))
+    assert refinement.endswith("Every check the previous run failed, each with its rule: " + message)
+    # An .xlsx source never gets the legacy .xls rule.
+    assert not any(rule.startswith("the input is a legacy binary Excel workbook") for rule in rules)
+
+
 @pytest.mark.parametrize("tamper", ["code", "event_candidate", "missing_event"])
 def test_refinement_refuses_unbound_prior_code_or_failure(tamper):
     storage, request = authored_failure()

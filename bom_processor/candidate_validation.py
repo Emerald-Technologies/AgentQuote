@@ -17,7 +17,7 @@ from .remote import _validate_xlsx_bytes
 from .master_registry import html_table_rows
 from .candidates import unique_fixtures
 from .arena_policy import is_arena_source, validate as validate_arena
-from .semantic_facts import SemanticFactsError, facts_from_rows
+from .semantic_facts import facts_from_rows
 from .document_roles import POLICY_VERSION as DOCUMENT_ROLE_POLICY, check_document_roles
 from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION, ROW_MAP_AUTHORING_VERSIONS
 from .row_accounting import MAX_ROW_MAP_BYTES, ROW_MAP_NAME, RowMapError, verify_row_map
@@ -98,11 +98,7 @@ def _semantic_output(output: bytes, source: bytes, subtype: str, *,
         if not document_roles["valid"]:
             return {**base, "coverage_basis": "xlsx_document_roles",
                     "document_roles": document_roles}
-    try:
-        facts = facts_from_rows(parsed_rows, infer_document_assembly=infer_document_assembly)
-    except SemanticFactsError:
-        return {**base, "source_rows": source_rows,
-                "coverage_basis": "assembly_identity_conflict"}
+    facts = facts_from_rows(parsed_rows, infer_document_assembly=infer_document_assembly)
     return {"valid": True, "result": "valid", "source_rows": source_rows, "output_rows": output_rows,
             "coverage_basis": coverage_basis, "fingerprint": facts.fingerprint,
             "assembly_identity": _assembly_dict(facts.assembly),
@@ -156,24 +152,41 @@ def _manufacturer_check(semantic: dict[str, Any], output: bytes) -> tuple[dict[s
              "manufacturer_pairs": {"part_lines": parts, "complete_pair_lines": 0}}, MANUFACTURER_REVIEW_REASON)
 
 
+# One rule per coverage basis, so a rewrite knows how to correct it (A046, Nick 2026-10-14).
+_COVERAGE_RULES = {
+    "quantity": "a Part needs a finite quantity of 0 or more (0 is kept); never leave it blank or text",
+    "identity": "every line needs a non-placeholder item_number and item_name",
+    "empty_output": "write every BOM line of the source; the output had no data rows",
+    "source_header": "the source table's column-heading row could not be found; read the BOM table itself",
+    "source_rows_and_identity": "write one line per source BOM row, at least half of the source rows, with "
+                                "item_number values copied from the source",
+    "semantic_validation_failed": "the output could not be read back; write a real XLSX workbook with exactly the supplied output columns",
+}
+
+
 def _semantic_feedback(semantic: dict[str, Any]) -> str:
+    """Every failed check of one output, each with its rule (A046: a row-map error hid a second failure).
+
+    Short reasons first: the event message is bounded, and the row-accounting part can be long.
+    """
+    messages = []
+    basis = semantic.get("coverage_basis", "unknown")
+    if basis not in {"row_accounting", "xlsx_document_roles", "manufacturer_pairs"}:
+        row = semantic.get("failed_output_row")
+        rule = _COVERAGE_RULES.get(basis)
+        where = f" output_row={row}" if isinstance(row, int) else ""
+        messages.append(f"semantic_output_invalid coverage_basis={basis}{where}" + (f": {rule}" if rule else ""))
     roles = semantic.get("document_roles")
     if isinstance(roles, dict) and roles.get("valid") is False:
-        return (f"xlsx_document_roles:{roles['result']}; preserve each source document ID, revision, "
-                "description and quantity in Document fields, not manufacturer/MPN fields; "
-                "do not drop references or guess ambiguous roles")
+        messages.append(f"xlsx_document_roles:{roles['result']}; preserve each source document ID, revision, "
+                        "description and quantity in Document fields, not manufacturer/MPN fields; "
+                        "do not drop references or guess ambiguous roles")
+    if semantic.get("result") == "manufacturer_data_missing":
+        messages.append("manufacturer_data_missing: part lines but no complete manufacturer/MPN pair; a person reviews this BOM")
     accounting = semantic.get("row_accounting")
     if isinstance(accounting, dict) and accounting.get("valid") is False:
-        return _row_feedback(accounting)
-    if semantic.get("result") == "manufacturer_data_missing":
-        return "manufacturer_data_missing: part lines but no complete manufacturer/MPN pair; a person reviews this BOM"
-    basis = semantic.get('coverage_basis', 'unknown')
-    row = semantic.get("failed_output_row")
-    rule = {"quantity": "a Part needs a finite quantity of 0 or more (0 is kept); never leave it blank or text",
-            "identity": "every line needs a non-placeholder item_number and item_name"}.get(basis)
-    if isinstance(row, int) and rule:
-        return f"semantic_output_invalid coverage_basis={basis} output_row={row}: {rule}"
-    return f"semantic_output_invalid coverage_basis={basis}"
+        messages.append(_row_feedback(accounting))
+    return " | ".join(messages) or f"semantic_output_invalid coverage_basis={basis}"
 
 
 def _row_failure(semantic: dict[str, Any], source_evidence: dict[str, Any]) -> dict[str, Any] | None:

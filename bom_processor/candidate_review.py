@@ -12,7 +12,7 @@ from .core import OUTPUT_CONTENT_TYPE
 from .remote import _validate_xlsx_bytes
 from .arena_policy import verify_evidence
 from .semantic import AssemblyIdentity, compare_boms, normalize_bom
-from .semantic_facts import SemanticFactsError, facts_from_rows
+from .semantic_facts import facts_from_rows
 
 MAX_METADATA_BYTES = 1_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -278,7 +278,7 @@ class CandidateReviewService:
                 rows_by_hash[digest] = _parsed_rows(data)
                 facts = facts_from_rows(rows_by_hash[digest], output_sha256=output["sha256"],
                     infer_document_assembly=evidence.get("version") != "candidate-validation.v4")
-            except (Exception, SemanticFactsError):
+            except Exception:
                 raise CandidateReviewError("REVIEW_OUTPUT_INVALID") from None
             semantic = item.get("semantic")
             claimed_identity = semantic.get("assembly_identity") if isinstance(semantic, dict) else None

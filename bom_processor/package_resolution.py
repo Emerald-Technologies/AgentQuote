@@ -12,7 +12,7 @@ from .candidate_status import CandidateStatusError, CandidateStatusService
 from .core import (CANONICAL_COLUMNS, OUTPUT_CONTENT_TYPE, BlobConflictError,
                    BlobNotFoundError, ProcessingError, ProcessingRequest, _json_bytes)
 from .semantic import AssemblyIdentity, reconcile_boms
-from .semantic_facts import SemanticFactsError, facts_from_xlsx
+from .semantic_facts import facts_from_xlsx
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -1181,10 +1181,7 @@ class ParentPackageService:
 
     def _fixture_semantics(self, data: bytes) -> dict[str, Any]:
         """Derive semantic facts from verified bytes, including the Document-row assembly."""
-        try:
-            facts = facts_from_xlsx(data)
-        except SemanticFactsError as exc:
-            raise PackageResolutionError("PACKAGE_ASSEMBLY_CONFLICT") from exc
+        facts = facts_from_xlsx(data)
         return {"assembly": facts.assembly, "output_sha256": facts.output_sha256,
                 "semantic_fingerprint": facts.fingerprint,
                 "model_summary": facts.model_summary}

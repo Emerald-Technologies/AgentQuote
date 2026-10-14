@@ -11,10 +11,6 @@ from .canonical_format import pair_indexes
 from .semantic import AssemblyIdentity, normalize_bom
 
 
-class SemanticFactsError(ValueError):
-    """Parsed output has ambiguous assembly facts."""
-
-
 @dataclass(frozen=True)
 class SemanticFacts:
     rows: tuple[dict[str, Any], ...]
@@ -41,7 +37,13 @@ def _category(value: Any) -> str:
 
 
 def document_assembly(rows: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> AssemblyIdentity | None:
-    """Return the one unique Document-row identity, or fail on disagreement."""
+    """Return the one unique Document-row identity, or None when there is none or several.
+
+    Several distinct Document rows (A046, Nick 2026-10-14) are drawings or specifications of one
+    board, such as its artwork and fabrication drawing, or of several boards in one combined BOM;
+    none of them is the assembly's identity. The BOM then needs a mapping: from the requested
+    assemblies, the split head lines or a person, never a guess between the rows.
+    """
     identities: set[tuple[str, str]] = set()
     for row in rows:
         if _category(row.get("item_category")) != "DOCUMENT":
@@ -50,9 +52,7 @@ def document_assembly(rows: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -
         revision = "" if _missing(row.get("revision")) else str(row.get("revision")).strip()
         if name:
             identities.add(AssemblyIdentity(name, revision).normalized())
-    if len(identities) > 1:
-        raise SemanticFactsError("ASSEMBLY_IDENTITY_CONFLICT")
-    if not identities:
+    if len(identities) != 1:
         return None
     name, revision = next(iter(identities))
     return AssemblyIdentity(name, revision)

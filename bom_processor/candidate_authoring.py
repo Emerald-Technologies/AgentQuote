@@ -36,6 +36,9 @@ ROW_MAP_RULE = (
     "parent line, or null for a line directly under the quoted assembly, \"from\": [source row, source column] of "
     "the cell that shows it, \"by\": one of level, number, parent, indent}, using one kind and one column for "
     "every line; validation works out each parent from those cells. "
+    "When one BOM lists several assemblies, each with its own lines (for example two boards in one sheet with a "
+    "parent part number column), each assembly's own row has \"line\": null and every line under it points at "
+    "that row; a parent cell naming the row's own part number marks such a top-level row. "
     "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
     "when the value is one separated part of a combined cell; use [row, column, \"code\"] for a manufacturer "
     "name written without the customer's short code that stands in front of it in the cell (the cell "
@@ -68,13 +71,21 @@ BANNED_CALL_RULE = (
 # Round 12 (A044): a rewrite refused by the code policy produced no parser, and the retry is told why.
 POLICY_RETRY_RULE = (
     "IMPORTANT: the previous rewrite of this parser was refused by the code policy before it could run; "
-    "follow every import and call rule exactly: import only standard parsing modules, pandas and openpyxl "
+    "follow every import and call rule exactly: import only standard parsing modules, pandas, openpyxl and, "
+    "for a legacy binary .xls, xlrd "
     "(never socket, requests, urllib, http, ftplib, smtplib, telnetlib, subprocess, os, ctypes, cffi, importlib, "
     "builtins or multiprocessing), never call the built-in eval, exec or compile, and never use a broad except"
 )
 HTML_XLS_WORKBOOK_RULE = (
     "for source_subtype html_table_xls, never call pandas.read_excel or open the file as a workbook; "
     "it is an HTML table, so parse it with html.parser.HTMLParser"
+)
+# A046 (Nick 2026-10-14): authors opened a legacy .xls with openpyxl and learned only from the crash.
+OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+LEGACY_XLS_RULE = (
+    "the input is a legacy binary Excel workbook (OLE2/BIFF .xls), which openpyxl cannot open: read it with "
+    "xlrd.open_workbook(file_contents=...) (or pandas.read_excel with engine='xlrd'); xlrd counts rows and "
+    "columns from 0, while the row map uses the 1-based numbers a spreadsheet shows, so add 1 to each"
 )
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
@@ -309,8 +320,13 @@ class CandidateAuthoringService:
             return self.storage.list_registry_paths(prefix, 100)
         version = ASSOCIATION_AUTHORING_VERSION if self.source_associations else AUTHORING_VERSION
         round_number = row_accounting_rounds(self.storage, self.request_id, candidate_id, version, paths) + 1
-        return {"previous_parser_code": code.decode("utf-8"),
-                "instructions": refinement_instructions(excerpt, round_number, MAX_ROW_ACCOUNTING_ROUNDS)}
+        instructions = refinement_instructions(excerpt, round_number, MAX_ROW_ACCOUNTING_ROUNDS)
+        # Every failed check, not only the rows (A046, Nick 2026-10-14): a malformed row map lists no
+        # rows, and another check of the same run can fail too; the message names each with its rule.
+        message = event.get("failure_message")
+        if isinstance(message, str) and message.strip():
+            instructions += " Every check the previous run failed, each with its rule: " + message.strip()[:1000]
+        return {"previous_parser_code": code.decode("utf-8"), "instructions": instructions}
     def author(self) -> AuthoringResult:
         path = f"candidates/requests/{self.request_id}.json"
         try:
@@ -333,6 +349,8 @@ class CandidateAuthoringService:
         rules = CANONICAL_OUTPUT_RULES
         if request["profile"].get("source_subtype") == "html_table_xls":
             rules += HTML_XLS_RULES
+        elif source.startswith(OLE2_MAGIC):
+            rules += (LEGACY_XLS_RULE,)
         row_refinement = self._row_refinement(fixtures)
         if self.policy_retry:
             rules = rules + (POLICY_RETRY_RULE,)

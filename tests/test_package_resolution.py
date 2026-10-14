@@ -107,13 +107,14 @@ def test_validation_status_and_parent_review_share_exact_semantic_facts(count):
     assert review["groups"][0]["evidence"]["fixtures"][0]["model_summary"]["mpn_count"] == count
 
 
-def test_document_identity_is_order_independent_and_conflicts_are_explicit():
-    from bom_processor.semantic_facts import SemanticFactsError, facts_from_xlsx
+def test_document_identity_is_order_independent_and_several_documents_leave_it_to_a_mapping():
+    from bom_processor.semantic_facts import facts_from_xlsx
     forward = facts_from_xlsx(package_workbook(document_rows=[("Board", "A"), ("Board", "A")]))
     reverse = facts_from_xlsx(package_workbook(document_rows=[("Board", "A"), ("Board", "A")][::-1]))
     assert forward.assembly == reverse.assembly
-    with pytest.raises(SemanticFactsError, match="ASSEMBLY_IDENTITY_CONFLICT"):
-        facts_from_xlsx(package_workbook(document_rows=[("Board", "A"), ("Other", "B")]))
+    # A046 (Nick 2026-10-14): several distinct Document rows (drawings, or two boards in one BOM) are
+    # not the assembly's identity; the BOM needs a mapping instead of failing.
+    assert facts_from_xlsx(package_workbook(document_rows=[("Board", "A"), ("Other", "B")])).assembly is None
 
 
 def request_and_store(outputs=None, identities=None, claimed_identities=None):

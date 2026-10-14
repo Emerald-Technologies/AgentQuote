@@ -471,6 +471,40 @@ def test_the_failure_event_carries_cited_fields_apart_from_the_status_contract(m
     assert "HTML_TABLE_1!3 bom_notes<-col4" in event["failure_message"]
 
 
+def test_several_document_rows_leave_the_identity_to_review_instead_of_failing():
+    # A046 (Nick 2026-10-14): artwork and fabrication drawings (or two boards in one BOM) are Document
+    # rows naming different items; without an association the output still validates, unmapped.
+    from bom_processor.candidate_validation import _semantic_output
+    def workbook(documents):
+        rows = [{**dict.fromkeys(CANONICAL_COLUMNS), "line_number": 1, "item_number": "BRD-1", "item_name": "PCB ASSY",
+                 "item_category": "Part", "quantity": 1, "manufacturer_1": "Acme", "manufacturer_item_number_1": "M-1"}]
+        rows += [{**dict.fromkeys(CANONICAL_COLUMNS), "line_number": index, "item_number": number,
+                  "item_name": "PCB ARTWORK", "item_category": "Document", "quantity": 1}
+                 for index, number in enumerate(documents, 2)]
+        stream = io.BytesIO()
+        pd.DataFrame(rows, columns=CANONICAL_COLUMNS).to_excel(stream, index=False)
+        return stream.getvalue()
+    several = _semantic_output(workbook(["ART-1", "FAB-1"]), b"", "", infer_document_assembly=True)
+    assert several["valid"] is True and several["mapping_required"] is True and several["assembly_identity"] is None
+    one = _semantic_output(workbook(["ART-1"]), b"", "", infer_document_assembly=True)
+    assert one["valid"] is True and one["assembly_identity"]["name"] == "art-1"  # normalized identity
+
+
+def test_every_failed_check_reaches_the_author_with_its_rule():
+    # A046 (Nick 2026-10-14): a row-map error hid a second failed check from the author.
+    from bom_processor.candidate_validation import _semantic_feedback
+    both = {"valid": False, "result": "semantic_output_invalid", "coverage_basis": "quantity", "failed_output_row": 3,
+            "row_accounting": {"valid": False, "error": "ROW_MAP_PARENT_INVALID"}}
+    text = _semantic_feedback(both)
+    assert "coverage_basis=quantity output_row=3: a Part needs a finite quantity" in text
+    assert "row_map_invalid:ROW_MAP_PARENT_INVALID; parent is {" in text
+    assert text.index("coverage_basis=quantity") < text.index("row_map_invalid")  # short reasons first
+    rows_only = {**both, "coverage_basis": "row_accounting"}
+    assert _semantic_feedback(rows_only).startswith("row_map_invalid:ROW_MAP_PARENT_INVALID")
+    sparse = {"valid": False, "result": "semantic_output_invalid", "coverage_basis": "source_rows_and_identity"}
+    assert "write one line per source BOM row" in _semantic_feedback(sparse)
+
+
 def test_a_zero_part_quantity_is_valid_and_a_bad_one_names_its_row():
     # Round 5 (Nick 2026-10-11): quantity 0 is kept (do-not-populate, the assembly's own line).
     from bom_processor.candidate_validation import _semantic_feedback, _semantic_output
