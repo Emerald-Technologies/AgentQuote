@@ -149,6 +149,22 @@ def _contained_link(view: SurveyView, value: Any, assembly: dict[str, Any] | Non
     return link
 
 
+_REVISION_MARKER = re.compile(r"(?i)(?<![a-z])rev(?:ision)?(?![a-z])[\s._:#-]*([a-z0-9]+(?:\.[0-9]+)*)")
+
+
+def cited_revision(part_number: str, text: Any) -> Any:
+    """The revision a cited text gives (QQ A057, Nick 2026-10-14).
+
+    A plain revision ('02') is used as written. A text that also names the part number, such as a
+    file path or a title ('BOM-0100-04201-REV-02.xlsx'), gives only the token after its REV or
+    Revision marker; with no marker its revision is unknown (None), never a contradiction.
+    """
+    if not isinstance(text, str) or find_assembly(part_number, text) is None:
+        return text
+    match = _REVISION_MARKER.search(text)
+    return match.group(1) if match else None
+
+
 def _confirm(requested: dict[str, Any], ref: str, core: str | None, evidence: list[dict[str, Any]],
              assembly: dict[str, Any] | None) -> dict[str, Any]:
     matched = None
@@ -158,7 +174,7 @@ def _confirm(requested: dict[str, Any], ref: str, core: str | None, evidence: li
             matched = {"text": found, **{key: cited[key] for key in ("source", "cell") if key in cited}}
             break
     revision = assembly["revision"][0]["value"] if assembly is not None and assembly["revision"] else None
-    differs = revision_contradicts(requested["revision"], revision)
+    differs = revision_contradicts(requested["revision"], cited_revision(requested["part_number"], revision))
     confirmed = matched is not None and not differs
     return {"assembly_id": requested["assembly_id"], "ref": ref,
             "link": "confirmed" if confirmed else "unconfirmed",
