@@ -53,6 +53,27 @@ def test_stop_reasons_name_each_runtime_limit():
     assert "output workbook" in _stop_reason({"failure": "invalid_output"})
 
 
+def test_a_legacy_xls_parser_error_keeps_its_final_line_and_gets_no_reader_hint():
+    # A047 (Nick 2026-10-14): a parser that read the .xls with xlrd and then failed got the "use xlrd"
+    # hint, and the 500-character bound cut off its real error behind the traceback.
+    ole2 = bytes.fromhex("d0cf11e0a1b11ae1") + b"\0" * 100
+    parser = (b"def dig(n):\n    if n == 0:\n        raise ValueError('Input workbook holds no BOM table')\n"
+              b"    dig(n - 1)\ndig(60)\n")
+
+    class Files(Transport):
+        def get(self, url, *, max_bytes, timeout):
+            return parser if "parser" in url else ole2
+
+    values = {**env(), "INPUT_SHA256": hashlib.sha256(ole2).hexdigest(), "INPUT_SIZE": str(len(ole2)),
+              "PARSER_SHA256": hashlib.sha256(parser).hexdigest(), "PARSER_SIZE": str(len(parser)),
+              "WORKER_INPUT_NAME": "input.xls"}
+    result, code = remote_job(values, transport=Files())
+    assert code != 0 and result["status"] == "failed"
+    message = result["failure_classification"]["error_message"]
+    assert "ValueError: Input workbook holds no BOM table" in message
+    assert "openpyxl cannot read it" not in message
+
+
 def test_rules_cover_speed_and_columns_read_only_for_item_category():
     rules = " ".join(CANONICAL_OUTPUT_RULES)
     assert "the parser must finish within a few seconds" in rules

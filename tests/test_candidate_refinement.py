@@ -87,12 +87,15 @@ def test_failure_classification_includes_detail():
     assert "OLE2/BIFF" in result["error_message"]
 
 
-def test_input_format_hint_detects_ole2_xls():
+def test_input_format_hint_detects_ole2_xls_only_when_the_workbook_failed_to_open():
     from worker.transfer import _input_format_hint
     ole2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 100
-    hint = _input_format_hint(ole2, "input.xls")
+    hint = _input_format_hint(ole2, "input.xls", "zipfile.BadZipFile: File is not a zip file")
     assert "xlrd" in hint
     assert "openpyxl cannot read it" in hint
+    # A047 (Nick 2026-10-14): a parser that read the file with xlrd and failed later gets no such hint.
+    assert _input_format_hint(ole2, "input.xls", "ValueError: Input workbook holds no BOM table") == ""
+    assert _input_format_hint(ole2, "input.xls") == ""
 
 
 def test_input_format_hint_detects_xlsx():

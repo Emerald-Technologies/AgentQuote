@@ -82,14 +82,24 @@ def _stop_reason(run_result: dict) -> str:
             "invalid_output": "the parser exited without writing the output workbook"}.get(str(failure), "")
 
 
-def _input_format_hint(input_bytes: bytes, input_name: str) -> str:
+# A ZIP/openpyxl reader refusing the file: the only failure the legacy .xls hint explains (A047).
+_ZIP_OPEN_FAILURE = re.compile(r"BadZipFile|not a zip file|InvalidFileException|openpyxl does not support")
+# The last exception line of a Python traceback, for example "ValueError: no BOM table".
+_FINAL_ERROR = re.compile(r"^(?:[A-Za-z_][\w.]*\.)?[A-Z]\w*(?:Error|Exception|Exit)\b.*$")
+
+
+def _input_format_hint(input_bytes: bytes, input_name: str, stderr_tail: str = "") -> str:
     """Bounded format hint derived from the input's magic bytes.
 
     Helps the authoring model pick the right reader (e.g. xlrd for legacy
-    binary .xls files, which openpyxl cannot open).
+    binary .xls files, which openpyxl cannot open). The .xls hint is given only
+    when the parser's error shows a ZIP/openpyxl reader refusing the file: on
+    every other failure it hid the real error (A047, Nick 2026-10-14).
     """
     head = input_bytes[:8]
     if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        if not _ZIP_OPEN_FAILURE.search(stderr_tail):
+            return ""
         return ("input is a legacy binary Excel file (OLE2/BIFF .xls); "
                 "openpyxl cannot read it - use xlrd (open_workbook(file_contents=...)) instead")
     if head.startswith(b"PK\x03\x04"):
@@ -97,6 +107,12 @@ def _input_format_hint(input_bytes: bytes, input_name: str) -> str:
     if head.startswith(b"<?xml") or head.lstrip().startswith(b"<"):
         return "input appears to be XML/HTML text, not a binary spreadsheet"
     return ""
+
+
+def _final_error_line(stderr_tail: str) -> str:
+    """The parser's own last exception line, bounded, so the 500-character message keeps it (A047)."""
+    lines = [line.strip() for line in stderr_tail.splitlines() if line.strip()]
+    return next((line for line in reversed(lines) if _FINAL_ERROR.match(line)), "")[:200]
 
 
 class UrllibTransport:
@@ -195,8 +211,10 @@ def remote_job(env: dict[str, str] | None = None, *, transport=None, run: Callab
         run_result.pop("logs", None)
         if code != 0 or output is None:
             stderr_tail = str(run_result.get("stderr_tail") or "")
-            format_hint = _input_format_hint(source, input_name)
-            detail = " ".join(part for part in (_stop_reason(run_result), format_hint, stderr_tail) if part)
+            format_hint = _input_format_hint(source, input_name, stderr_tail)
+            # The final error line goes first: the message is cut at 500 characters (A047).
+            detail = " ".join(part for part in (_stop_reason(run_result), _final_error_line(stderr_tail),
+                                                format_hint, stderr_tail) if part)
             raise RuntimeError(f"parser failed{(' | ' + detail) if detail else ''}")
         sidecar = None
         if interpretation_enabled:
