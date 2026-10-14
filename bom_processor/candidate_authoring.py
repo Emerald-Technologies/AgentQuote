@@ -89,6 +89,36 @@ LEGACY_XLS_RULE = (
     "text is not the cell's value, so headings never match; A047); xlrd counts rows and "
     "columns from 0, while the row map uses the 1-based numbers a spreadsheet shows, so add 1 to each"
 )
+# QQ A052 (Nick 2026-10-14), kind 1: an approved alternate source is listed on its own row with only a
+# maker and MPN under the part it serves; it joins that part's line as another pair, never a new part.
+ALTERNATE_ROW_RULE = (
+    "a row with no item number, no part number and no quantity of its own that gives a manufacturer and a "
+    "manufacturer part number (often repeating the description), directly under a part line, is usually an "
+    "approved alternate source for that part, not a new part: add its maker and MPN as the next "
+    "manufacturer/MPN pair of the line above and list the row in that line's rows; never write it as its own "
+    "Part line and never stop because it has no quantity; these are clues a person reads together, not a "
+    "rule: a row with its own part number and quantity is usually its own line"
+)
+# Kind 2: the rows naming the assembly and its documents are listed but not priced. Only rows that
+# print no quantity are described here; a printed quantity (even 0) is kept as before.
+REFERENCE_ROW_RULE = (
+    "rows near the top of a BOM that name the assembly itself and its documents (for example its artwork, "
+    "schematic, test specification or fabrication drawing), with no designator and no quantity printed, are "
+    "reference lines, not parts to place: write each as its own item_category='Document' line (its ID in "
+    "item_number, its description in item_name, its revision when given) with quantity None, so it stays "
+    "listed but is not priced; never drop such a row and never give it a quantity. The bare board (a PCB "
+    "fabrication or bare board line) is bought even though it reads like a drawing: keep its quantity when "
+    "one is printed; when none is printed, write it as such a Document line with quantity None and say in "
+    "bom_notes that the bare board is bought but the BOM gives no quantity, so a person sees it. Words such "
+    "as artwork, schematic or specification are clues, read together with the row's place at the top of the "
+    "BOM and its empty designator and quantity cells, not a rule"
+)
+# Kind 3 must not change: a real part with a blank quantity still stops validation for a person.
+BLANK_PART_QUANTITY_RULE = (
+    "a part to place (a row among the parts, with designators or a manufacturer part number) stays a Part "
+    "even when its quantity cell is blank: leave its quantity empty so validation stops for a person; never "
+    "count designators or guess to fill it, and never call it a Document to get past the missing quantity"
+)
 CANONICAL_OUTPUT_RULES = (
     "write a real XLSX workbook to --output using pandas or openpyxl, never CSV or JSON",
     "write exactly the supplied canonical columns in the supplied order and at least one data row; when any line has more than 8 manufacturer/MPN pairs, append manufacturer_9, manufacturer_item_number_9, and so on in that order up to the widest line (at most 50 pairs), the same columns for every row, never dropping a pair",
@@ -113,6 +143,13 @@ CANONICAL_OUTPUT_RULES = (
     # Sub-assembly plan unit 2 (Nick 2026-10-12): sub-assemblies are common across customers.
     "a BOM may contain sub-assemblies, shown by a level column, dotted item numbers, indentation or a parent part number column; these are clues read from the data, not rules: keep every line including each sub-assembly's own line, write each quantity exactly as printed (per its parent), never multiply quantities through parents (code does that after validation), and give each line's parent in the row map",
     "a short number and a space in front of a manufacturer name (for example '63 ACME INC.') is usually the customer's own code for that maker, not part of its name, especially when the same number comes with the same name on many rows: write the name without the code and cite it with the \"code\" link; a name that really begins with digits, such as 3M, stays as it is; this is a clue, not a rule",
+    # QQ A052 (Nick 2026-10-14): parsers spent all six attempts on rows without a quantity: an
+    # alternate source row under a part ("missing quantity for Part") and the reference rows at the
+    # top of a BOM. Described as clues a person reads together, never keyword lists; a real part
+    # with a blank quantity still stops (its quantity is never derived from designators).
+    ALTERNATE_ROW_RULE,
+    REFERENCE_ROW_RULE,
+    BLANK_PART_QUANTITY_RULE,
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not
     # accounted for", "Missing item name"); a crash gives the next attempt only an error line, while

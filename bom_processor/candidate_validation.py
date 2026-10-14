@@ -164,6 +164,30 @@ _COVERAGE_RULES = {
 }
 
 
+# QQ A052 (Nick 2026-10-14): a schema failure reached the next attempt only as
+# "canonical_schema_invalid". The fixed reason _validate_xlsx raised now goes with its rule; the
+# check and the evidence's schema result are unchanged. Unknown reasons keep the bare code.
+_SCHEMA_RULES = {
+    "quantity invalid": (
+        "every Part line needs a finite quantity of 0 or more. A row giving only a manufacturer and MPN "
+        "under a part is that part's alternate: its pair goes on the line above, not a new line. A "
+        "reference row at the top of the BOM (the assembly or its documents) with no quantity is a "
+        "Document with quantity None. A real part with a blank quantity stays a Part with its quantity "
+        "left empty; never derive it from designators and never relabel it as a Document"),
+    "required value invalid": "item_number, item_name and item_category must be filled on every line",
+    "item category invalid": "item_category must be exactly Part or Document",
+    "invalid line numbers": "line_number must be the integers 1, 2, 3 and so on in output order",
+    "string value invalid": "text values must be trimmed non-empty strings, or empty cells",
+    "parsed schema invalid": "write exactly the supplied output columns in order and at least one data row",
+    "parsed workbook invalid": "write a real XLSX workbook that openpyxl can read",
+}
+
+
+def _schema_feedback(reason: str | None) -> str:
+    rule = _SCHEMA_RULES.get(reason or "")
+    return f"canonical_schema_invalid: {reason}: {rule}" if rule else "canonical_schema_invalid"
+
+
 def _semantic_feedback(semantic: dict[str, Any]) -> str:
     """Every failed check of one output, each with its rule (A046: a row-map error hid a second failure).
 
@@ -445,11 +469,14 @@ class CandidateValidationService:
 
         schema_valid = True
         schema_code = "valid"
+        schema_reason = None
         try:
             _validate_xlsx_bytes(output, self.max_rows)
-        except Exception:
+        except Exception as exc:
             schema_valid = False
             schema_code = "canonical_schema_invalid"
+            # Only the fixed ProcessingError texts are kept (no cell values); anything else stays bare.
+            schema_reason = str(exc) if type(exc) is ProcessingError else None
 
         semantic = {"valid": False, "result": "semantic_output_invalid",
                     "source_rows": 0, "output_rows": 0,
@@ -533,7 +560,7 @@ class CandidateValidationService:
         if not schema_valid:
             recorded = self._write_validation_failed_event(
                 validation_id, item, "SCHEMA_INVALID",
-                {"error_type": "SchemaError", "error_message": "canonical_schema_invalid"})
+                {"error_type": "SchemaError", "error_message": _schema_feedback(schema_reason)})
             failure = CandidateValidationError("SCHEMA_INVALID")
             failure.feedback_recorded = recorded
             raise failure
