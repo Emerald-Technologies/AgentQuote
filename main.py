@@ -234,6 +234,10 @@ def _schema_summary() -> str:
     for name, typ, req in CANONICAL_SCHEMA_COLUMNS:
         req_mark = " (required)" if req else ""
         lines.append(f"- `{name}`: {typ}{req_mark}")
+    # Mirrors bom_processor/canonical_format.py (not imported: the package __init__ pulls in Azure clients).
+    lines.append("- When any line has more than 8 manufacturer/MPN pairs, append `manufacturer_9`, "
+                 "`manufacturer_item_number_9`, ... up to the widest line (at most 50 pairs), the same "
+                 "columns on every row. Never drop a pair; fail if a line has more than 50.")
     return "\n".join(lines)
 
 
