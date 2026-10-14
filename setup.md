@@ -11,6 +11,87 @@ All commands are PowerShell (`pwsh`). Run them in order.
 
 # Part A — Azure Government Deployment (Container Apps)
 
+> **Quick Quote integration security gate:** The prompt-driven Responses app
+> documented below remains separate from the deterministic BOM processing API.
+> Do not route customer BOM processing through `/responses`. Deploy
+> `deterministic_api.py` as a separate Container App, require Container Apps
+> Authentication, restrict callers to the Quick Quote workload identity, and
+> block any ingress path that can bypass authentication. Do not deploy the
+> deterministic service until parser execution has a reviewed workload sandbox.
+
+## Deterministic API configuration
+
+The separate service listens on port `8088` and exposes only:
+
+```text
+POST /api/v1/bom/process
+```
+
+A review template is provided at
+`.foundry/deterministic-containerapp-gov.yaml`. It uses internal ingress,
+managed identities, bounded replicas/resources, and placeholders rather than
+credentials. It deliberately does **not** configure Easy Auth or claim to
+sandbox parsers. Run `dev/Test-DeterministicDeploymentReadiness.ps1` for local,
+non-Azure checks.
+
+The existing `Dockerfile`, `/responses` smoke test, and `bom-processor-gov`
+commands below deploy the prompt-driven agent—not this deterministic API. Build
+the deterministic image from `Dockerfile.deterministic` under a distinct image
+and Container App name. Do not replace the existing app until both services'
+ownership and migration plan are approved.
+
+Required production settings:
+
+```dotenv
+BOM_STORAGE_ACCOUNT_URL=https://etbomstoragegov.blob.core.usgovcloudapi.net
+# Optional for a user-assigned identity:
+# BOM_STORAGE_MANAGED_IDENTITY_CLIENT_ID=<client-id>
+BOM_API_AUTH_MODE=easy_auth
+BOM_API_ALLOWED_APP_IDS=<quick-quote-workload-app-id>
+# Optional additional restriction:
+BOM_API_ALLOWED_OBJECT_IDS=<quick-quote-service-principal-object-id>
+BOM_API_MAX_BODY_BYTES=131072
+BOM_API_MAX_CONCURRENT_JOBS=2
+```
+
+Container Apps Authentication must validate the Entra token before forwarding
+the `X-MS-CLIENT-PRINCIPAL` identity header. The application allowlist is defense
+in depth; the header is spoofable if public traffic can reach the container
+without passing through authenticated ingress.
+
+Azure configuration must also provide:
+
+- private/internal ingress or an approved authenticated public ingress;
+- least-privilege Blob RBAC or the existing storage secret until managed
+  identity storage access is configured (production should use managed identity);
+- no network egress for parser execution;
+- non-root execution and CPU, memory, process, and filesystem limits;
+- no storage credentials or unrelated secrets in the parser process environment;
+- log redaction for auth headers, request bodies, Blob paths, and credentials.
+
+The code intentionally does not perform direct JWT validation. That would need
+approved Government-cloud issuer/audience rules, JWKS rotation, and an additional
+security-reviewed dependency. Easy Auth is the agreed implementation boundary
+for this increment.
+
+Easy Auth must be configured and independently verified after creating the app.
+With an approved tenant, application registration, issuer, and audience, use the
+locally installed Container Apps CLI's `az containerapp auth microsoft update`
+and `az containerapp auth update` commands. Require HTTPS and set unauthenticated
+requests to `Return401`; do not add excluded paths. Then verify the effective
+settings with `az containerapp auth show`. Exact Government issuer and audience
+values are deployment inputs and must not be guessed or copied from commercial
+Azure examples.
+
+## Unresolved parser isolation gate
+
+`shell=False`, temporary directories, and timeouts reduce accidental failures
+but do not isolate Python parser code. Before deployment, approve and validate a
+separate short-lived parser worker/job with no unrelated secrets, no network
+egress, a non-root identity, a disposable filesystem, and CPU/memory/process
+limits. Until that boundary exists, only reviewed trusted parser code may be
+used and production customer BOM processing remains blocked.
+
 > **Why Container Apps?** Foundry Hosted Agents are not enabled in Azure Government regions. The agent container is self-contained (a Responses API server on port 8088), so it runs unchanged in a Container App. The only code difference is a Gov scope fix in `main.py` (see note below).
 
 ## Gov Info You Need Before Starting

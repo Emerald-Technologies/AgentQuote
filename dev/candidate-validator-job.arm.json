@@ -1,0 +1,50 @@
+{
+  "location": "usgovvirginia",
+  "identity": {
+    "type": "UserAssigned",
+    "userAssignedIdentities": {
+      "/subscriptions/37d47e73-56ae-433b-a340-86eac088c78e/resourceGroups/et-rg-adf/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-bom-processor-gov": {}
+    }
+  },
+  "properties": {
+    "environmentId": "/subscriptions/37d47e73-56ae-433b-a340-86eac088c78e/resourceGroups/et-rg-adf/providers/Microsoft.App/managedEnvironments/et-bom-ca-env",
+    "configuration": {
+      "triggerType": "Manual",
+      "replicaTimeout": 900,
+      "replicaRetryLimit": 0,
+      "manualTriggerConfig": {
+        "parallelism": 1,
+        "replicaCompletionCount": 1
+      },
+      "registries": [
+        {
+          "server": "etcontainerregistry.azurecr.us",
+          "identity": "system-environment"
+        }
+      ]
+    },
+    "template": {
+      "containers": [
+        {
+          "name": "candidate-validator",
+          "image": "etcontainerregistry.azurecr.us/agentquote-candidate-validator@sha256:85dedd788c9f8266dfbdf251296343c6f0e9afe830bd4aeab968e9440580f7f5",
+          "resources": {
+            "cpu": 1,
+            "memory": "2Gi"
+          },
+          "env": [
+            {"name": "AZURE_CLIENT_ID", "value": "be929738-e913-4160-aa81-c09644585d93"},
+            {"name": "BOM_STORAGE_ACCOUNT_URL", "value": "https://etbomstoragegov.blob.core.usgovcloudapi.net"},
+            {"name": "BOM_JOB_SUBSCRIPTION_ID", "value": "37d47e73-56ae-433b-a340-86eac088c78e"},
+            {"name": "BOM_JOB_RESOURCE_GROUP", "value": "et-rg-adf"},
+            {"name": "BOM_JOB_NAME", "value": "aq-parser-worker-synth"},
+            {"name": "BOM_JOB_CONTAINER_NAME", "value": "synthetic-parser-worker"},
+            {"name": "BOM_WORKER_IMAGE", "value": "etcontainerregistry.azurecr.us/agentquote-parser-worker:20260920-isolated-worker-3"},
+            {"name": "BOM_PROCESS_TIMEOUT_SECONDS", "value": "600"},
+            {"name": "BOM_POLL_INTERVAL_SECONDS", "value": "2"}
+          ]
+        }
+      ]
+    }
+  }
+}
