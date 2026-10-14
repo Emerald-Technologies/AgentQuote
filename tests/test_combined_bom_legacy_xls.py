@@ -150,6 +150,8 @@ def test_a_legacy_xls_combined_bom_with_drawing_rows_resolves_to_one_result_per_
     model = Model()
     authored = CandidateAuthoringService(REQUEST, store, model).author()
     assert any(rule.startswith("the input is a legacy binary Excel workbook") for rule in model.rules)
+    # A047: values come from sheet.row_values / cell_value / cell.value, never xlrd Cell objects.
+    assert any("never an xlrd Cell object" in rule and "sheet.row_values(row)" in rule for rule in model.rules)
     assert any("each assembly's own row has \"line\": null" in rule for rule in model.rules)
 
     # No association: the Document rows name four items, so there is no single identity and the

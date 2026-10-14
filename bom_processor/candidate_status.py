@@ -24,6 +24,12 @@ class CandidateStatusError(ProcessingError):
     pass
 
 
+def _manufacturer_retry_hint(event: Any) -> dict[str, Any] | None:
+    """A047: the lookup hint of a manufacturer stop that may get one automatic retry."""
+    from .manufacturer_lookup import retry_hint
+    return retry_hint(event) if isinstance(event, dict) else None
+
+
 def _json(storage: Any, path: str, candidate: bool) -> dict[str, Any]:
     try:
         data = (storage.download_candidate if candidate else storage.download_registry)(path, 1_000_000)
@@ -242,6 +248,13 @@ class CandidateStatusService:
                             # Plan 8.8 step 4b: 2 rounds spent; a person decides (locations only).
                             result["automation_error"] = outcome
                             result["row_accounting"] = failure_event["row_accounting"]
+                    elif failure_event is not None and _manufacturer_retry_hint(failure_event) is not None:
+                        # A047: makers and MPNs kept on another sheet get one automatic retry first.
+                        outcome = self.automation.start_manufacturer_retry(request_id, candidate_id, failure_event)
+                        if outcome in {"manufacturer_data_review_required", "exhausted"}:
+                            result["automation_error"] = "manufacturer_data_review_required"
+                        elif isinstance(outcome, str) and outcome.startswith("budget_"):
+                            result["automation_error"] = outcome
                     elif failure_event is not None:
                         # Round 8: a BOM without any manufacturer/MPN pair is named, not a generic stop.
                         reason = failure_event.get("review_reason")
@@ -249,7 +262,54 @@ class CandidateStatusService:
                                                       else "validation_failure_requires_review")
                 except Exception:
                     result.setdefault("automation_error", "author_refinement_start_failed")
+            elif not self.automation and not budget_held and status in {"generated_unvalidated", "schema_invalid"}:
+                # A047: package review reads status without automation; a held file still says why.
+                try:
+                    held = self._held_reason(request_id, candidate_id, validation_id, status,
+                                             evidence.get(candidate_id, []), manifest)
+                except Exception:
+                    held = None
+                if held is not None:
+                    result["automation_error"] = held[0]
+                    if held[1] is not None:
+                        result["row_accounting"] = held[1]
         return result
+
+    def _held_reason(self, request_id: str, candidate_id: str, validation_id: str | None, status: str,
+                     selected_evidence: list[dict[str, Any]],
+                     manifest: dict[str, Any]) -> tuple[str, dict[str, Any] | None] | None:
+        """The hold the automated path would report, read only: never starts a job or spends budget.
+
+        None while automation would still act (a refinement or the A047 manufacturer retry to start or
+        running), so such a file shows as in progress, not held.
+        """
+        from .validation_policy import superseded_layout_failure
+        if status == "generated_unvalidated" and any(superseded_layout_failure(item) for item in selected_evidence):
+            return None
+        failure_event = self._latest_validation_failure(request_id, candidate_id, validation_id)
+        if failure_event is None:
+            if status == "schema_invalid" and any(item.get("failure_feedback_policy") == "candidate-failure-feedback.v1"
+                                                  for item in selected_evidence):
+                return "validation_failure_requires_review", None
+            return None
+        if failure_event.get("repairable") is False:
+            reason = failure_event.get("review_reason")
+            if reason == "manufacturer_data_review_required":
+                from .manufacturer_lookup import retry_state
+                if (_manufacturer_retry_hint(failure_event) is not None
+                        and retry_state(self.storage, request_id, candidate_id) != "spent"):
+                    return None
+                return reason, None
+            return "validation_failure_requires_review", None
+        accounting = failure_event.get("row_accounting")
+        if isinstance(accounting, dict) and isinstance(manifest.get("version"), str):
+            from .candidate_validation import MAX_ROW_ACCOUNTING_ROUNDS
+            from .row_refinement import HOLD_REASON, row_accounting_rounds
+            rounds = row_accounting_rounds(self.storage, request_id, candidate_id, manifest["version"],
+                                           lambda prefix: self.storage.list_registry_paths(prefix, self.max_results))
+            if rounds >= MAX_ROW_ACCOUNTING_ROUNDS:
+                return HOLD_REASON, accounting
+        return None
 
     def _latest_validation_failure(self, request_id: str, candidate_id: str,
                                    validation_id: str | None = None) -> dict[str, Any] | None:

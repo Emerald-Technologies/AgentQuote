@@ -376,16 +376,42 @@ class CandidateAutomationService:
             author_attempt_kind="author-refinement")
         return result
 
+    def start_manufacturer_retry(self, request_id: str, candidate_id: str,
+                                 failure_event: dict[str, Any]) -> str | None:
+        """A047 (Nick 2026-10-14): one more refinement when makers and MPNs sit on another sheet.
+
+        The stop stays a person-review stop unless its event carries a validated lookup hint and no
+        other candidate of this request has used the retry; the retry then runs as an ordinary
+        refinement within the same attempt budget. Returns the hold reason on any doubt.
+        """
+        from .manufacturer_lookup import REVIEW_REASON, claim_retry, retry_hint, retry_state
+        try:
+            if self.author_starter is None or retry_hint(failure_event) is None:
+                return REVIEW_REASON
+            state = retry_state(self.storage, request_id, candidate_id)
+            if state == "eligible" and not claim_retry(self.storage, request_id, candidate_id,
+                                                       str(failure_event.get("validation_id"))):
+                return REVIEW_REASON
+            if state == "spent":
+                return REVIEW_REASON
+        except Exception:
+            return REVIEW_REASON
+        # Already claimed by this candidate: starting again is deduplicated by the attempt markers
+        # and the budget, and restarts a try that died before producing a parser.
+        return self.start_author_refinement(request_id, candidate_id, failure_event)
+
     @staticmethod
     def _row_refinement_values(candidate_id: str | None, failure_event: dict[str, Any] | None) -> dict[str, str]:
         """Plan 8.8 step 4b: a row-accounting failure is fixed from the prior parser, not from scratch.
 
         Only identifiers travel in the job environment; the author job reloads the hash-pinned
-        failure event and prior code from storage.
+        failure event and prior code from storage. A047: so is a manufacturer lookup retry.
         """
+        from .manufacturer_lookup import retry_hint
         from .row_refinement import parser_crash_message
         if (not isinstance(failure_event, dict)
-                or not (isinstance(failure_event.get("row_accounting"), dict) or parser_crash_message(failure_event))
+                or not (isinstance(failure_event.get("row_accounting"), dict) or parser_crash_message(failure_event)
+                        or retry_hint(failure_event) is not None)
                 or not isinstance(candidate_id, str) or not isinstance(failure_event.get("validation_id"), str)):
             return {}
         return {"AUTHOR_REFINE_CANDIDATE": candidate_id,

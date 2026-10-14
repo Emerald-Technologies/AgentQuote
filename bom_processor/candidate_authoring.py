@@ -84,7 +84,9 @@ HTML_XLS_WORKBOOK_RULE = (
 OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 LEGACY_XLS_RULE = (
     "the input is a legacy binary Excel workbook (OLE2/BIFF .xls), which openpyxl cannot open: read it with "
-    "xlrd.open_workbook(file_contents=...) (or pandas.read_excel with engine='xlrd'); xlrd counts rows and "
+    "xlrd.open_workbook(file_contents=...) (or pandas.read_excel with engine='xlrd'); read cell values with "
+    "sheet.row_values(row), sheet.cell_value(row, column) or cell.value, never an xlrd Cell object itself (its "
+    "text is not the cell's value, so headings never match; A047); xlrd counts rows and "
     "columns from 0, while the row map uses the 1-based numbers a spreadsheet shows, so add 1 to each"
 )
 CANONICAL_OUTPUT_RULES = (
@@ -298,14 +300,19 @@ class CandidateAuthoringService:
         failure = event.get("row_accounting") if isinstance(event, dict) else None
         from .row_refinement import crash_refinement_instructions, parser_crash_message
         crash = parser_crash_message(event) if isinstance(event, dict) and failure is None else None
+        from .manufacturer_lookup import refinement_instructions as lookup_instructions, retry_hint
+        lookup = retry_hint(event) if isinstance(event, dict) and failure is None and crash is None else None
         if (not isinstance(manifest, dict) or manifest.get("candidate_id") != candidate_id
                 or manifest.get("code_sha256") != hashlib.sha256(code).hexdigest()
                 or event.get("candidate_id") != candidate_id or event.get("validation_id") != validation_id
-                or not (isinstance(failure, dict) or crash is not None)):
+                or not (isinstance(failure, dict) or crash is not None or lookup is not None)):
             raise AuthoringError("REFINEMENT_INTEGRITY")
         if crash is not None:
             # Round 9: fix the crash in the prior code instead of rewriting from the error line alone.
             return {"previous_parser_code": code.decode("utf-8"), "instructions": crash_refinement_instructions(crash)}
+        if lookup is not None:
+            # A047: makers and MPNs kept on another sheet were left out; bring them in by lookup.
+            return {"previous_parser_code": code.decode("utf-8"), "instructions": lookup_instructions(lookup)}
         source = next((item for item in fixtures if item["sha256"].lower() == failure.get("source_sha256")), None)
         if source is None:
             raise AuthoringError("REFINEMENT_INTEGRITY")

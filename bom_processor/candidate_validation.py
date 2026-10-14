@@ -469,6 +469,8 @@ class CandidateValidationService:
         review_reason = None
         if schema_valid:
             semantic, review_reason = _manufacturer_check(semantic, output)
+        manufacturer_lookup = (self._manufacturer_hint(semantic, source, source_evidence, output)
+                               if review_reason == MANUFACTURER_REVIEW_REASON else None)
         validation_valid = schema_valid and semantic["valid"] is True
         arena_evidence = None
         if (schema_valid and str(request.get("profile", {}).get("source_subtype", "")) == "html_table_xls"
@@ -541,7 +543,8 @@ class CandidateValidationService:
                 {"error_type": "SemanticError",
                  "error_message": _semantic_feedback(semantic)},
                 row_accounting=_row_failure(semantic, source_evidence),
-                row_accounting_fields=_row_fields(semantic), review_reason=review_reason)
+                row_accounting_fields=_row_fields(semantic), review_reason=review_reason,
+                manufacturer_lookup=manufacturer_lookup)
             failure = CandidateValidationError("SEMANTIC_INVALID")
             failure.feedback_recorded = recorded
             raise failure
@@ -619,6 +622,10 @@ class CandidateValidationService:
                                              "error_message": "output schema invalid" if not schema_valid else _semantic_feedback(semantic)}}
                     if review_reason is not None:
                         record["failure"]["review_reason"] = review_reason
+                        lookup = (self._manufacturer_hint(semantic, source, source_evidence, output)
+                                  if review_reason == MANUFACTURER_REVIEW_REASON else None)
+                        if lookup is not None:
+                            record["failure"]["manufacturer_lookup"] = lookup
             except Exception as exc:
                 all_valid = False
                 code_value = exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED"
@@ -851,6 +858,20 @@ class CandidateValidationService:
                                 "size": row_map["size"], "content_type": "application/json", "bytes": mapped}
         return value
 
+    def _manufacturer_hint(self, semantic: dict[str, Any], source: bytes, source_evidence: dict[str, Any],
+                           output: bytes) -> dict[str, Any] | None:
+        """A047: the other sheet holding makers and MPNs for unpaired lines, from the pinned row map; None on doubt."""
+        from .manufacturer_lookup import lookup_hint
+        try:
+            reference = semantic["row_accounting"]["row_map"]
+            data = self.storage.download_candidate(reference["blob_path"], MAX_ROW_MAP_BYTES)
+            if _sha256(data) != reference["sha256"]:
+                return None
+            sheets = {line["sheet"] for line in json.loads(data.decode("utf-8"))["lines"]}
+            return lookup_hint(source, PurePosixPath(source_evidence["blob_path"]).suffix.lower(), output, sheets)
+        except Exception:
+            return None
+
     def _with_row_accounting(self, semantic: dict[str, Any], source: bytes, source_evidence: dict[str, Any],
                              item: WorkItem, output: bytes, worker: dict[str, Any]) -> dict[str, Any]:
         """Fold the row-map check into the semantic result (plan 8.8 step 4a).
@@ -958,6 +979,12 @@ class CandidateValidationService:
         reasons = sorted({failure["review_reason"] for failure in failures if failure.get("review_reason")})
         if reasons:
             event["review_reason"] = reasons[0]
+        # A047: one more attempt only when every failure is this manufacturer stop with the same hint.
+        lookups = [failure.get("manufacturer_lookup") for failure in failures]
+        if (reasons == [MANUFACTURER_REVIEW_REASON] and lookups and lookups[0] is not None
+                and all(failure.get("review_reason") == MANUFACTURER_REVIEW_REASON for failure in failures)
+                and all(lookup == lookups[0] for lookup in lookups)):
+            event["manufacturer_lookup"] = lookups[0]
         rows = [fixture["row_accounting_failure"] for fixture in evidence["fixtures"]
                 if isinstance(fixture.get("row_accounting_failure"), dict)]
         if rows:
@@ -977,7 +1004,8 @@ class CandidateValidationService:
                                        classification: dict[str, str] | None,
                                        row_accounting: dict[str, Any] | None = None,
                                        row_accounting_fields: list[dict[str, Any]] | None = None,
-                                       review_reason: str | None = None) -> bool:
+                                       review_reason: str | None = None,
+                                       manufacturer_lookup: dict[str, Any] | None = None) -> bool:
         """Persist an immutable validation-failed event for the refinement loop.
 
         Best effort: a failure to write the event must not mask the original
@@ -1001,6 +1029,8 @@ class CandidateValidationService:
                 **({"row_accounting": row_accounting} if row_accounting is not None else {}),
                 **({"row_accounting_fields": row_accounting_fields}
                    if row_accounting is not None and row_accounting_fields else {}),
+                # A047: the sheet holding makers and MPNs, so one automatic retry may bring them in.
+                **({"manufacturer_lookup": manufacturer_lookup} if manufacturer_lookup is not None else {}),
             }
             path = (f"candidates/events/{self.request_id}/{self.candidate_id}/"
                     f"validation-failed-{validation_id}.json")
