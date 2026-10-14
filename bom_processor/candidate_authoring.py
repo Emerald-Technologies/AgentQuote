@@ -33,12 +33,16 @@ ROW_MAP_RULE = (
     "\"sheet\", never [sheet, row] pairs), \"fields\": {output column name: [source row, source column] of the cell the value came from}}. "
     "When the BOM shows sub-assemblies (a level column, item numbers such as 1, 1.1, 1.1.1, indented text, or a "
     "column naming each row's parent part number), give every line \"parent\": {\"line\": the output_row of its "
-    "parent line, or null for a line directly under the quoted assembly, \"from\": [source row, source column] of "
-    "the cell that shows it, \"by\": one of level, number, parent, indent}, using one kind and one column for "
-    "every line; validation works out each parent from those cells. "
+    "parent line (the number that parent line has as its own output_row, so 2 or more; never its line_number, "
+    "its position in lines or a source row), or null for a line directly under the quoted assembly, \"from\": "
+    "[source row, source column] of the cell that shows it, \"by\": one of level, number, parent, indent}, using "
+    "one kind and one column for every line; validation works out each parent from those cells. "
     "When one BOM lists several assemblies, each with its own lines (for example two boards in one sheet with a "
     "parent part number column), each assembly's own row has \"line\": null and every line under it points at "
-    "that row; a parent cell naming the row's own part number marks such a top-level row. "
+    "that row; a parent cell naming the row's own part number marks such a top-level row. Worked example (A048): "
+    "heading in row 1, board A in source row 2 (output_row 2) with its lines in rows 3-7 (output_rows 3-7), "
+    "board B in source row 8 (output_row 8) with its lines in rows 9-13: output_rows 2 and 8 have \"line\": null, "
+    "output_rows 3-7 have \"line\": 2 and output_rows 9-13 have \"line\": 8. "
     "Link every populated output column except line_number and item_category; use [row, column, \"part\"] "
     "when the value is one separated part of a combined cell; use [row, column, \"code\"] for a manufacturer "
     "name written without the customer's short code that stands in front of it in the cell (the cell "
@@ -298,8 +302,12 @@ class CandidateAuthoringService:
         except Exception:
             raise AuthoringError("REFINEMENT_UNAVAILABLE") from None
         failure = event.get("row_accounting") if isinstance(event, dict) else None
-        from .row_refinement import crash_refinement_instructions, parser_crash_message
+        from .row_refinement import (crash_refinement_instructions, fresh_crash_instructions, parser_crash_message,
+                                     repeated_crash)
         crash = parser_crash_message(event) if isinstance(event, dict) and failure is None else None
+        version = ASSOCIATION_AUTHORING_VERSION if self.source_associations else AUTHORING_VERSION
+        def paths(prefix: str) -> list[str]:
+            return self.storage.list_registry_paths(prefix, 100)
         from .manufacturer_lookup import refinement_instructions as lookup_instructions, retry_hint
         lookup = retry_hint(event) if isinstance(event, dict) and failure is None and crash is None else None
         if (not isinstance(manifest, dict) or manifest.get("candidate_id") != candidate_id
@@ -308,6 +316,10 @@ class CandidateAuthoringService:
                 or not (isinstance(failure, dict) or crash is not None or lookup is not None)):
             raise AuthoringError("REFINEMENT_INTEGRITY")
         if crash is not None:
+            # A048 (Nick 2026-10-14): patching kept one slip through four refinements; when the prior
+            # code's own parent stopped with the same error, the next attempt starts fresh.
+            if repeated_crash(self.storage, self.request_id, candidate_id, crash, version, paths):
+                return {"instructions": fresh_crash_instructions(crash)}
             # Round 9: fix the crash in the prior code instead of rewriting from the error line alone.
             return {"previous_parser_code": code.decode("utf-8"), "instructions": crash_refinement_instructions(crash)}
         if lookup is not None:
@@ -323,9 +335,6 @@ class CandidateAuthoringService:
         fields = event.get("row_accounting_fields")
         excerpt = failed_row_excerpt(data, extension, failure, fields if isinstance(fields, list) else None)
         from .row_refinement import row_accounting_rounds
-        def paths(prefix: str) -> list[str]:
-            return self.storage.list_registry_paths(prefix, 100)
-        version = ASSOCIATION_AUTHORING_VERSION if self.source_associations else AUTHORING_VERSION
         round_number = row_accounting_rounds(self.storage, self.request_id, candidate_id, version, paths) + 1
         instructions = refinement_instructions(excerpt, round_number, MAX_ROW_ACCOUNTING_ROUNDS)
         # Every failed check, not only the rows (A046, Nick 2026-10-14): a malformed row map lists no
@@ -358,6 +367,11 @@ class CandidateAuthoringService:
             rules += HTML_XLS_RULES
         elif source.startswith(OLE2_MAGIC):
             rules += (LEGACY_XLS_RULE,)
+        # A048 (Nick 2026-10-14): the service reads the heading row; the author only reads the rows.
+        from .table_heading import heading_clues, heading_rule
+        heading = heading_rule(heading_clues(source, "." + analysis.extension))
+        if heading is not None:
+            rules += (heading,)
         row_refinement = self._row_refinement(fixtures)
         if self.policy_retry:
             rules = rules + (POLICY_RETRY_RULE,)
@@ -373,7 +387,7 @@ class CandidateAuthoringService:
         profile["fixture_count"] = len(fixtures)
         profile["fixtures"] = [{"sha256": item.get("sha256"), "size_bytes": item.get("size_bytes"),
                     "source_aliases": item.get("source_aliases", [])[:32]} for item in fixtures]
-        if row_refinement is not None:
+        if row_refinement is not None and "previous_parser_code" in row_refinement:
             profile["previous_parser_code"] = row_refinement["previous_parser_code"]
         prompt = AuthoringPrompt(tuple(CANONICAL_COLUMNS), rules, profile, analysis)
         source_subtype = request["profile"].get("source_subtype", "")

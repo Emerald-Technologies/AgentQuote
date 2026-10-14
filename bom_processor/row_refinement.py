@@ -125,13 +125,30 @@ def crash_refinement_instructions(message: str) -> str:
             "row to get past the error.")
 
 
-def _row_failure_recorded(storage: Any, request_id: str, candidate_id: str) -> bool:
-    """True when a validation failure of this candidate was a row-accounting failure."""
+def fresh_crash_instructions(message: str) -> str:
+    """A048: the prior parser and its own parent stopped with the same error, so patching is not working."""
+    return ("FRESH PARSER ATTEMPT. The last two parsers both stopped with this same error when they ran on the "
+            "source: " + json.dumps(message, ensure_ascii=False) + ". Correcting the previous code did not fix "
+            "it, so it is not supplied: write a new parser from the start, read the table where the heading "
+            "clues say it is, and do not repeat that error.")
+
+
+def crash_signature(message: str) -> str:
+    """The comparable part of a crash message: the error before its traceback (line numbers differ)."""
+    text = message.split(" Traceback", 1)[0]
+    if text.startswith("parser failed"):
+        text = text.split("|", 1)[-1]
+    return " ".join(text.split())[:200]
+
+
+def _validation_failures(storage: Any, request_id: str, candidate_id: str) -> list[dict[str, Any]]:
+    """The candidate's recorded validation-failed events (unreadable ones are skipped)."""
     root = f"candidates/events/{request_id}/{candidate_id}/"
     try:
         paths = storage.list_candidate_paths(root, 100)
     except Exception:
-        return False
+        return []
+    events = []
     for path in paths:
         if not (path.startswith(root) and "/validation-failed-" in path and path.endswith(".json")):
             continue
@@ -139,18 +156,31 @@ def _row_failure_recorded(storage: Any, request_id: str, candidate_id: str) -> b
             event = json.loads(storage.download_candidate(path, 1_000_000).decode("utf-8"))
         except Exception:
             continue
-        if isinstance(event, dict) and isinstance(event.get("row_accounting"), dict):
-            return True
-    return False
+        if isinstance(event, dict):
+            events.append(event)
+    return events
 
 
-def row_accounting_rounds(storage: Any, request_id: str, candidate_id: str, authoring_version: str,
-                          list_paths: Any) -> int:
-    """Row-accounting refinement rounds already spent on this candidate's lineage.
+def _row_failure_recorded(storage: Any, request_id: str, candidate_id: str) -> bool:
+    """True when a validation failure of this candidate was a row-accounting failure."""
+    return any(isinstance(event.get("row_accounting"), dict)
+               for event in _validation_failures(storage, request_id, candidate_id))
 
-    Each ancestor whose own validation failed row accounting counts once; an ancestor that crashed or
-    failed for another reason does not (round 9: three crashes made the first row failure a hold).
-    """
+
+def repeated_crash(storage: Any, request_id: str, candidate_id: str, message: str, authoring_version: str,
+                   list_paths: Any) -> bool:
+    """True when the candidate's refinement parent also crashed with the same error (A048)."""
+    parent = refinement_parents(storage, request_id, authoring_version, list_paths).get(candidate_id)
+    if parent is None:
+        return False
+    signature = crash_signature(message)
+    return any(crash_signature(other) == signature
+               for other in (parser_crash_message(event) for event in _validation_failures(storage, request_id, parent))
+               if other is not None)
+
+
+def refinement_parents(storage: Any, request_id: str, authoring_version: str, list_paths: Any) -> dict[str, str]:
+    """Map of refined candidate to the candidate it was refined from, for one request."""
     # attempt-N.started.json names refinement_of (written by the dispatcher); attempt-N.completed.json
     # names the candidate the author job produced. Together they link a candidate to its parent.
     root = f"candidate-automation/{request_id}/author-refinement/{authoring_version}/"
@@ -170,6 +200,17 @@ def row_accounting_rounds(storage: Any, request_id: str, candidate_id: str, auth
         parent = read(path[: -len(".completed.json")] + ".started.json").get("refinement_of")
         if isinstance(child, str) and isinstance(parent, str) and child != parent:
             parents.setdefault(child, parent)
+    return parents
+
+
+def row_accounting_rounds(storage: Any, request_id: str, candidate_id: str, authoring_version: str,
+                          list_paths: Any) -> int:
+    """Row-accounting refinement rounds already spent on this candidate's lineage.
+
+    Each ancestor whose own validation failed row accounting counts once; an ancestor that crashed or
+    failed for another reason does not (round 9: three crashes made the first row failure a hold).
+    """
+    parents = refinement_parents(storage, request_id, authoring_version, list_paths)
     rounds, seen, current = 0, set(), candidate_id
     while current in parents and current not in seen:
         seen.add(current)
