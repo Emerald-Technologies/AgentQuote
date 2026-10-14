@@ -172,8 +172,10 @@ _SCHEMA_RULES = {
         "every Part line needs a finite quantity of 0 or more. A row giving only a manufacturer and MPN "
         "under a part is that part's alternate: its pair goes on the line above, not a new line. A "
         "reference row at the top of the BOM (the assembly or its documents) with no quantity is a "
-        "Document with quantity None. A real part with a blank quantity stays a Part with its quantity "
-        "left empty; never derive it from designators and never relabel it as a Document"),
+        "Document with quantity None; among those lines the assembly's one bare board, when its quantity is "
+        "not printed, is a Part of quantity 1 cited as derived and flagged in bom_notes. A real part with a "
+        "blank quantity stays a Part with its quantity left empty; never derive it from designators and never "
+        "relabel it as a Document"),
     "required value invalid": "item_number, item_name and item_category must be filled on every line",
     "item category invalid": "item_category must be exactly Part or Document",
     "invalid line numbers": "line_number must be the integers 1, 2, 3 and so on in output order",

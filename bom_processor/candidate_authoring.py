@@ -45,7 +45,8 @@ ROW_MAP_RULE = (
     "'63 ACME INC.' written as 'ACME INC.'); use {\"lookup\": [sheet, row, column], \"key\": column} for a value "
     "kept on another sheet in a row whose key column holds the line's part number (for example manufacturer part "
     "numbers on a separate manufacturer sheet), carrying every such row for that part; use {\"derived\": reason} only for "
-    "unit_of_measure or bom_notes values not copied from one cell. Every listed row must supply at least "
+    "unit_of_measure or bom_notes values not copied from one cell, and for the one bare-board quantity of 1 the "
+    "output rules describe. Every listed row must supply at least "
     "one linked value, and both halves of a manufacturer/MPN pair come from the same source row. A linked "
     "cell must hold exactly the written value (ignoring outer spaces): a value with added words, such as "
     "'Source category: Capacitor' in bom_notes, is not copied from one cell and is cited as {\"derived\": "
@@ -102,16 +103,32 @@ ALTERNATE_ROW_RULE = (
 # Kind 2: the rows naming the assembly and its documents are listed but not priced. Only rows that
 # print no quantity are described here; a printed quantity (even 0) is kept as before.
 REFERENCE_ROW_RULE = (
-    "rows near the top of a BOM that name the assembly itself and its documents (for example its artwork, "
-    "schematic, test specification or fabrication drawing), with no designator and no quantity printed, are "
-    "reference lines, not parts to place: write each as its own item_category='Document' line (its ID in "
-    "item_number, its description in item_name, its revision when given) with quantity None, so it stays "
-    "listed but is not priced; never drop such a row and never give it a quantity. The bare board (a PCB "
-    "fabrication or bare board line) is bought even though it reads like a drawing: keep its quantity when "
-    "one is printed; when none is printed, write it as such a Document line with quantity None and say in "
-    "bom_notes that the bare board is bought but the BOM gives no quantity, so a person sees it. Words such "
-    "as artwork, schematic or specification are clues, read together with the row's place at the top of the "
-    "BOM and its empty designator and quantity cells, not a rule"
+    "rows near the top of a BOM, or of each sub-assembly's group, that name the assembly itself and its "
+    "supporting documents (for example its artwork, schematic, test specification or fabrication drawing), "
+    "with no designator and no quantity printed, are reference lines, not parts to place: write each as its "
+    "own item_category='Document' line (its ID in item_number, its description in item_name, its revision "
+    "when given) with quantity None, so it stays listed but is not priced; never drop such a row and never "
+    "give it a quantity (the one bare board below is the only exception). Words such as artwork, schematic or "
+    "specification are clues, read together with the row's place in the BOM and its empty designator and "
+    "quantity cells, not a rule"
+)
+# Nick 2026-10-14: an assembly is almost always built on one bare board; a person picks its line out of
+# the supporting PCB lines at a glance. When the BOM prints no quantity for it, it is taken as 1 and
+# flagged; validation accepts a derived quantity only for that one line per assembly group.
+BARE_BOARD_RULE = (
+    "an assembly is almost always built on exactly one bare board, and the BOM usually names it on one of the "
+    "assembly's supporting PCB lines; choose that one line the way a person would, from clues read together, "
+    "not a rule: fabrication or bare board wording, a designator or category of PCB, a printed quantity of 1 "
+    "while the sibling lines show 0 or nothing, a part number family that differs from the documents'. Keep "
+    "its quantity when one is printed. When none is printed, write that one line as a Part with quantity 1, "
+    "cite the quantity as {\"derived\": reason}, and say in bom_notes, in plain words, that this line was "
+    "selected as the assembly's bare board and given quantity 1 because the BOM prints no quantity, so a "
+    "person can confirm; the other supporting lines stay Document lines with quantity None. Never mark more "
+    "than one line per assembly as its board. In a BOM with sub-assemblies each sub-assembly has its own group "
+    "of PCB lines and its own one board, chosen the same way within its group. When it is unclear which line "
+    "is the board or how many boards there are, give no line a derived quantity and leave it for a person. "
+    "Validation accepts a derived quantity only for that one board line per assembly: a Part of quantity 1 "
+    "with the bom_notes flag, no designator, no manufacturer part number and an empty quantity cell"
 )
 # Kind 3 must not change: a real part with a blank quantity still stops validation for a person.
 BLANK_PART_QUANTITY_RULE = (
@@ -126,7 +143,7 @@ CANONICAL_OUTPUT_RULES = (
     "item_number, item_name, and item_category must be non-empty trimmed strings",
     "map source component taxonomy such as Capacitor, Resistor, or PCB assembly to canonical item_category='Part'; reserve item_category='Document' for document, drawing, or specification rows; do not require the source category to already be Part or Document",
     "item_category must be exactly Part or Document after applying the source taxonomy mapping",
-    "Part quantity must be a finite number; a quantity of 0 is valid and kept as 0 (for example do-not-populate or the assembly's own top line), never dropped or changed; Document quantity is not priced, preserve supplied numeric values or None when absent, never invent a quantity",
+    "Part quantity must be a finite number; a quantity of 0 is valid and kept as 0 (for example do-not-populate or the assembly's own top line), never dropped or changed; Document quantity is not priced, preserve supplied numeric values or None when absent, never invent a quantity (the only exception is the assembly's one bare board, given quantity 1 and flagged as described below)",
     "for Document rows, use explicit source labels and row context to put the actual document ID in item_number and its revision in revision; a generic Document reference label is not an identity",
     "overloaded Manufacturer / Document ID and MPN / Revision columns contain document identity and revision on document rows, not manufacturer/MPN pairs; leave all manufacturer fields empty for those rows, preserve description and quantity, and fail on ambiguous roles rather than guess",
     "preserve actual Part quantities and all supplied primary and alternate manufacturer/MPN pairs independently of document references",
@@ -149,6 +166,7 @@ CANONICAL_OUTPUT_RULES = (
     # with a blank quantity still stops (its quantity is never derived from designators).
     ALTERNATE_ROW_RULE,
     REFERENCE_ROW_RULE,
+    BARE_BOARD_RULE,
     BLANK_PART_QUANTITY_RULE,
     "fail rather than truncate when a line has more than 50 manufacturer/MPN pairs",
     # Round 9 (A041, Nick 2026-10-12): parsers stopped on their own strict checks ("source row was not
