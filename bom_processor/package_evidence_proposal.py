@@ -233,6 +233,9 @@ def produce_proposal(context: dict, roots: list[dict], workbooks: dict[str, byte
     return finish(prepared, hints, classifications, manufacturing, review_inputs=review_inputs)
 
 
+COMPLETE_TEXT_BYTES = 8_000_000
+
+
 def prepare(context: dict, roots: list[dict], workbooks: dict[str, bytes], *, producer: str,
             model_name: str, policy_version: str, prompt_sha256: str, run_id: str,
             inventory_limits: InventoryLimits | None = None, include_classification: bool = False,
@@ -250,18 +253,25 @@ def prepare(context: dict, roots: list[dict], workbooks: dict[str, bytes], *, pr
     provenance = {"kind": "agent", "producer": text(producer), "model": text(model_name),
                   "policyVersion": text(policy_version), "promptSha256": hash_value(prompt_sha256),
                   "runId": text(run_id)}
-    sources = []
+    # Complete-text sources share an 8 MB budget. The kept set is order-independent and mirrors
+    # QuickQuote's content collector: smallest files first (ties by evidenceId) while the total
+    # fits; a larger file is evicted whenever the total would exceed the budget. An evicted file
+    # stays in the inventory as evidence without quotable text (QuickQuote: CONTENT_BYTE_LIMIT).
+    kept: dict[str, tuple[int, dict]] = {}
     retained = 0
     def observe(identity, payload, file_name):
         nonlocal retained
         from .package_manufacturing_assessment import complete_source
         source = complete_source(identity, payload, file_name)
         if source is not None:
+            kept[source["evidenceId"]] = (len(payload), source)
             retained += len(payload)
-            require(retained <= 8_000_000, "ASSESSMENT_SOURCE_LIMIT")
-            sources.append(source)
+            while retained > COMPLETE_TEXT_BYTES:
+                largest = max(kept, key=lambda key: (kept[key][0], key))
+                retained -= kept.pop(largest)[0]
     require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
     inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
+    sources = [kept[key][1] for key in sorted(kept)]
     from .package_evidence_contracts import RETAINED_POLICIES
     require((policy_version in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
     retained_objects = {}
@@ -302,6 +312,19 @@ def finish(prepared: dict, hints, classifications, manufacturing, *, review_inpu
             "citations": []} for identity, kind in sorted(retained_objects.items()))
     categories, associations, dispositions = _hints(hints, inventory, rows["occurrences"],
                                                    context["assemblies"])
+    # Root archives not unpacked (aggregate size budget) keep a code-owned category. Their contents
+    # were never seen, so only an included link (for example a package name rule) may stand; any
+    # other answer is left for a person, never an unseen exclusion.
+    from .package_evidence_inventory import NOT_INVENTORIED_FORMAT
+    set_aside = {item["evidenceId"] for item in inventory
+                 if not item["archiveChain"] and item["format"] == NOT_INVENTORIED_FORMAT}
+    for identity in set_aside:
+        categories[identity] = NOT_INVENTORIED_FORMAT
+    dispositions = [item if item["evidenceId"] not in set_aside or item["state"] == "included" else
+                    {"evidenceId": item["evidenceId"], "state": "unresolved", "replacementEvidenceId": None,
+                     "rationale": "Archive not unpacked: the package is over the 500 MB evidence size limit, so its "
+                                  "contents were not checked. Open it and map it by hand.", "citations": []}
+                    for item in dispositions]
     body = {"version": "package-evidence-graph.v1",
             **{key: context[key] for key in CHECKPOINT_FIELDS},
             "parentProposalSha256": context.get("predecessorProposalSha256"),
