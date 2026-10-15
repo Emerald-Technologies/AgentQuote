@@ -1,22 +1,33 @@
-"""Candidate validation controller; generated parser code runs only in the worker Job."""
+"""Candidate validation controller; generated parser code runs only in the worker Job.
+
+Logs one agentquote-job-line.v1 START and END line for itself and, because the sandboxed worker's
+stdout must stay a single result line, one START and END line per parser-worker job it dispatches
+(bom_processor/job_identity_log.py). END lines come just before the existing final result line.
+"""
 from __future__ import annotations
 
 import json
 import os
 
+from bom_processor.job_identity_log import JobLog
+
 
 def main() -> int:
+    log = JobLog("validator")
     request_id = os.environ.get("REQUEST_ID", "")
     candidate_id = os.environ.get("CANDIDATE_ID", "")
     allowed = {"REQUEST_ID", "CANDIDATE_ID"}
     unknown = sorted(key for key in os.environ
                      if key.startswith(("REQUEST_", "CANDIDATE_")) and key not in allowed)
     if not request_id or not candidate_id or unknown:
+        log.end("failed", "invalid_request_environment")
         print(json.dumps({"status": "error", "error": "invalid_request_environment"}, sort_keys=True))
         return 2
+    log.note(request_id=request_id, candidate_id=candidate_id)
     try:
         from azure.identity import ManagedIdentityCredential
 
+        from bom_processor import job_identity_log as job_log
         from bom_processor.candidate_validation import CandidateValidationService
         from bom_processor.core import AzureBlobStorage, ProcessingError
         from bom_processor.job_orchestrator import AzureJobStarter, AzureSasFactory, JobOrchestrator
@@ -26,6 +37,16 @@ def main() -> int:
                       if client_id else ManagedIdentityCredential())
         account_url = os.environ["BOM_STORAGE_ACCOUNT_URL"]
         storage = AzureBlobStorage.from_account_url(account_url, credential)
+        context: dict = {}
+
+        def identify():
+            context.update(job_log.load_candidate_context(storage, request_id))
+            return "validator", job_log.candidate_identity(
+                request_id, context["request"], candidate_id=candidate_id,
+                choice_request=context["choice_request"], choice_result=context["choice_result"],
+                membership=context["membership"])
+
+        log.start(identify)
         max_source = int(os.environ.get("BOM_MAX_SOURCE_BYTES", "50000000"))
         max_parser = int(os.environ.get("BOM_MAX_PARSER_BYTES", "1000000"))
 
@@ -61,8 +82,14 @@ def main() -> int:
                           f"providers/Microsoft.App/jobs/{worker_job}"),
             worker_image=worker_image,
             serial_owner=os.environ.get("BOM_VALIDATOR_SERIAL_OWNER") or None,
+            worker_log=job_log.parser_worker_log(context, request_id, candidate_id),
         )
         result = service.validate()
+        # A finished validation that leaves the candidate unvalidated did not reach the job's goal.
+        if result.status == "awaiting_approval":
+            log.end("succeeded")
+        else:
+            log.end("failed", result.status)
         print(json.dumps({"status": result.status, "request_id": result.request_id,
                           "candidate_id": result.candidate_id,
                           "validation_id": result.validation_id,
@@ -74,6 +101,7 @@ def main() -> int:
             error = exc.code if isinstance(exc, CandidateValidationError) else type(exc).__name__
         except Exception:
             error = type(exc).__name__
+        log.end("failed", error)
         print(json.dumps({"status": "error", "request_id": request_id,
                           "candidate_id": candidate_id, "error": error}, sort_keys=True))
         return 1

@@ -5,18 +5,25 @@ import pytest
 import candidate_job
 
 
+def final_line(out):
+    """The existing result line stays last; the job identity START/END lines come before it (QQ #121)."""
+    lines = out.strip().splitlines()
+    assert [json.loads(line)["phase"] for line in lines[:-1]] == ["start", "end"]
+    return json.loads(lines[-1])
+
+
 def test_invalid_association_policy_fails_before_clients(monkeypatch, capsys):
     monkeypatch.setenv("REQUEST_ID", "request-1")
     monkeypatch.setenv("BOM_SOURCE_ASSOCIATIONS", "yes")
     assert candidate_job.main() == 2
-    assert json.loads(capsys.readouterr().out)["error"] == "invalid_association_policy"
+    assert final_line(capsys.readouterr().out)["error"] == "invalid_association_policy"
 
 
 def test_unknown_request_environment_is_rejected(monkeypatch, capsys):
     monkeypatch.setenv("REQUEST_ID", "request-1")
     monkeypatch.setenv("REQUEST_SECRET", "must-not-be-accepted")
     assert candidate_job.main() == 2
-    result = json.loads(capsys.readouterr().out)
+    result = final_line(capsys.readouterr().out)
     assert result == {"error": "invalid_request_environment", "status": "error"}
 
 
@@ -47,7 +54,7 @@ def test_job_success_prints_safe_identifiers(monkeypatch, capsys):
     monkeypatch.setattr("bom_processor.foundry_author.create_foundry_author", lambda: object())
     monkeypatch.setattr("bom_processor.core.AzureBlobStorage.from_account_url", lambda *args, **kwargs: object())
     assert candidate_job.main() == 0
-    result = json.loads(capsys.readouterr().out)
+    result = final_line(capsys.readouterr().out)
     assert result["candidate_id"] == "candidate-1"
     assert "source" not in result and "code" not in result
 
@@ -78,7 +85,7 @@ def test_job_reports_safe_authoring_error_code(monkeypatch, capsys):
     monkeypatch.setattr("bom_processor.foundry_author.create_foundry_author", lambda: object())
     monkeypatch.setattr("bom_processor.core.AzureBlobStorage.from_account_url", lambda *args, **kwargs: storage)
     assert candidate_job.main() == 1
-    output = json.loads(capsys.readouterr().out)
+    output = final_line(capsys.readouterr().out)
     assert output == {"error": "candidate_authoring_failed", "error_code": "CANDIDATE_CODE_POLICY",
                       "request_id": "request-1", "rule_id": "banned_import", "status": "error"}
     from bom_processor.candidate_authoring import AUTHORING_VERSION
@@ -107,7 +114,7 @@ def test_job_reports_safe_model_diagnostics(monkeypatch, capsys, rule_id):
     monkeypatch.setattr("bom_processor.foundry_author.create_foundry_author", lambda: object())
     monkeypatch.setattr("bom_processor.core.AzureBlobStorage.from_account_url", lambda *args, **kwargs: object())
     assert candidate_job.main() == 1
-    output = json.loads(capsys.readouterr().out)
+    output = final_line(capsys.readouterr().out)
     assert output["failure_stage"] == "response"
     assert output["failure_category"] == "json_invalid"
     assert output["error_code"] == "MODEL_FAILED"
@@ -145,7 +152,7 @@ def test_job_success_records_completed_attempt(monkeypatch, capsys):
     monkeypatch.setattr("bom_processor.core.AzureBlobStorage.from_account_url", lambda *args, **kwargs: storage)
 
     assert candidate_job.main() == 0
-    assert json.loads(capsys.readouterr().out)["candidate_id"] == "candidate-1"
+    assert final_line(capsys.readouterr().out)["candidate_id"] == "candidate-1"
     from bom_processor.candidate_authoring import AUTHORING_VERSION
     marker_path = (f"candidate-automation/request-1/author-refinement/{AUTHORING_VERSION}/"
                    "attempt-2.completed.json")

@@ -116,8 +116,14 @@ def test_worker_failure_log_names_stable_cause_chain_without_content(monkeypatch
     monkeypatch.setattr(evidence_job, "configured_policy", lambda: request["policy"])
     assert evidence_job.main() == 1
     out = capsys.readouterr().out
-    assert json.loads(out) == {"status": "error", "code": "EVIDENCE_WORKER_FAILED",
-                               "causes": ["EVIDENCE_JOB_FAILED", "MODEL_PROPOSAL_FAILED", "KeyError"]}
+    *identity, last = out.strip().splitlines()
+    assert json.loads(last) == {"status": "error", "code": "EVIDENCE_WORKER_FAILED",
+                                "causes": ["EVIDENCE_JOB_FAILED", "MODEL_PROPOSAL_FAILED", "KeyError"]}
+    # QQ #121: START/END identity lines come first and name the request and the most specific code.
+    start, end = (json.loads(line) for line in identity)
+    assert (start["phase"], end["phase"], end["result"]) == ("start", "end", "failed")
+    assert end["request_id"] == request["requestId"] and end["reason_code"] == "EVIDENCE_JOB_FAILED"
+    assert end["rfq_uuid"] == request["context"]["qqUuid"] and end["package_plan_id"] == request["context"]["bomPlanId"]
     assert "CUSTOMER" not in out and "provider" not in out
 
 
