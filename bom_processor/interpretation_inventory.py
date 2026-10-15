@@ -16,6 +16,7 @@ from hashlib import sha256
 from typing import Any
 
 from .master_registry import html_table_raw_rows, RegistryError
+from .source_format import reading_extension
 
 # v2: formula cells carry their stored (cached) result and are listed in
 # formula_cells; v1 refused every workbook containing a formula.
@@ -151,7 +152,9 @@ def extract_inventory(data: bytes, extension: str) -> SourceInventory:
                     raise InventoryError("SOURCE_CELL_LIMIT")
                 cells[(name, row_index, column)] = value
 
-    extension = extension.casefold()
+    # A macro-free .xlsm is the same OOXML package and is read as .xlsx; _zip_guard still refuses
+    # any VBA part, and openpyxl never loads one (keep_vba is off).
+    extension = reading_extension(extension)
     if extension == ".xlsx":
         from openpyxl import load_workbook
         _zip_guard(data)

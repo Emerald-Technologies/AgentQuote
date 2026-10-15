@@ -25,6 +25,7 @@ import pandas as pd
 from .blob_registry import BlobRegistryReader, RegistrySelection
 from .master_registry import RegistryError
 from .candidates import CandidateRequiredError, persist_candidate
+from .source_format import SOURCE_EXTENSIONS, SourceFormatError, check_source, staged_input_name
 
 CONTRACT_VERSION = "1"
 OUTPUT_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -35,7 +36,8 @@ from .canonical_format import (  # noqa: E402  (re-exported for existing importe
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
-_SOURCE_EXTENSIONS = {".xls", ".xlsx", ".csv"}
+# .xlsm (macro-free) is read and staged as the .xlsx it is (source_format.py).
+_SOURCE_EXTENSIONS = SOURCE_EXTENSIONS
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,254}$")
 # Package files (plan 8.8 step 2, Nick 2026-10-08): the uploaded root files for the
 # survey, staged content-addressed by QuickQuote. Limits mirror package evidence.
@@ -610,6 +612,7 @@ class BomProcessor:
         request_fingerprint = request.fingerprint()
         if request.force_candidate:
             first_source = self.storage.download_source(request.documents[0].blob_path, self.max_source_bytes)
+            checked_source_format(request.documents[0].blob_path, first_source)
             self._require_candidate(request, first_source, ProcessingError("replacement requested"))
         existing_manifest = self.storage.download_output(manifest_path, self.max_output_bytes)
         if existing_manifest is not None:
@@ -617,6 +620,7 @@ class BomProcessor:
 
         registry_selection = None
         first_source = self.storage.download_source(request.documents[0].blob_path, self.max_source_bytes)
+        checked_source_format(request.documents[0].blob_path, first_source)
         try:
             registry_selection = self.registry_reader.select(request.parser_key, request.customer_key,
                                                               first_source,
@@ -643,9 +647,10 @@ class BomProcessor:
                 source = self.storage.download_source(document.blob_path, self.max_source_bytes)
                 if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                     raise ProcessingError("source integrity check failed")
+                source_format = checked_source_format(document.blob_path, source)
                 document_root = temp_root / str(index)
                 document_root.mkdir()
-                input_path = document_root / f"input{PurePosixPath(document.blob_path).suffix}"
+                input_path = document_root / staged_input_name(document.blob_path)
                 output_path = document_root / "output.xlsx"
                 input_path.write_bytes(source)
                 self._run_parser(parser_path, input_path, output_path, document_root)
@@ -660,6 +665,8 @@ class BomProcessor:
                                "size_bytes": document.size_bytes, "sha256": document.sha256.lower()},
                     "output": {"blob_path": output_blob_path, "size_bytes": len(output),
                                "sha256": _sha256(output), "content_type": OUTPUT_CONTENT_TYPE},
+                    # Only for a .xlsm: how it was read. Beside "source", whose keys consumers check.
+                    **({"source_format": source_format} if source_format is not None else {}),
                 })
         manifest = {
             "version": CONTRACT_VERSION, "status": "completed", "job_id": request.job_id,
@@ -687,9 +694,10 @@ class BomProcessor:
         profile = __import__("bom_processor.master_registry", fromlist=["profile_bytes"]).profile_bytes(
             first_source, PurePosixPath(request.documents[0].blob_path).suffix)
         for document in request.documents[1:]:
+            other_source = self.storage.download_source(document.blob_path, self.max_source_bytes)
+            checked_source_format(document.blob_path, other_source)
             other = __import__("bom_processor.master_registry", fromlist=["profile_bytes"]).profile_bytes(
-                self.storage.download_source(document.blob_path, self.max_source_bytes),
-                PurePosixPath(document.blob_path).suffix)
+                other_source, PurePosixPath(document.blob_path).suffix)
             if other.profile_hash != profile.profile_hash:
                 raise ProcessingError("parser variant mismatch") from cause
         evidence = ({"document_id": request.documents[0].document_id,
@@ -746,6 +754,24 @@ class BomProcessor:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+_SOURCE_FORMAT_MESSAGES = {
+    "SOURCE_WORKBOOK_UNREADABLE": "source workbook unreadable",
+    "SOURCE_WORKBOOK_HAS_MACROS": "source workbook contains macros",
+    "SOURCE_WORKBOOK_CONTENT_TYPE": "source workbook type unsupported",
+}
+
+
+def checked_source_format(blob_path: str, data: bytes) -> dict[str, Any] | None:
+    """Fail closed on a .xlsm source before any parser or model sees it (source_format.py).
+
+    Returns the format provenance for a .xlsm, None for every other source format.
+    """
+    try:
+        return check_source(blob_path, data)
+    except SourceFormatError as exc:
+        raise ProcessingError(_SOURCE_FORMAT_MESSAGES.get(exc.code, "source workbook unreadable")) from exc
 
 
 def _json_bytes(value: dict[str, Any]) -> bytes:

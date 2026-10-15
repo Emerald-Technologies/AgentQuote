@@ -9,6 +9,7 @@ import re
 from html.parser import HTMLParser
 from typing import Any, Callable
 from .author_failure import failure_stage
+from .source_format import reading_extension
 
 MAX_SHEETS = 4
 MAX_ROWS = 20
@@ -108,7 +109,7 @@ def _html_table_preview(data: bytes) -> list[list[str]] | None:
 
 def build_preview(source: bytes, extension: str) -> str:
     """Return bounded, redacted spreadsheet structure; never send raw bytes."""
-    ext = extension.lower().lstrip(".")
+    ext = reading_extension(extension).lstrip(".")  # a .xlsm previews as the .xlsx it is
     sheets: list[tuple[str, list[list[Any]]]] = []
     if ext == "csv":
         sheets = [("csv", _csv_preview(source))]
