@@ -243,6 +243,19 @@ class _Plan:
         self.file_short = {item["evidenceId"]: f"F{i}" for i, item in enumerate(self.files, 1)}
         self.file_full = {v: k for k, v in self.file_short.items()}
         self.paths = {item["evidenceId"]: _path(item, names) for item in inventory}
+        # Package name rules (Nick 2026-10-14): code maps a file only when the rule and any survey
+        # reading agree. Board and kit matches are linked by code and not sent to the model; a
+        # BOM-file match is a placement clue only. A disagreement leaves the file to the model.
+        from .package_evidence_name_rules import match_names
+        self.rule_links: dict[str, dict] = {}
+        for identity, match in match_names(self.files, self.paths, self.assemblies, rows["occurrences"]).items():
+            clue = self.clues.get(identity)
+            if clue is not None and clue["assembly"] not in (None, match["assembly"]):
+                continue
+            self.clues[identity] = {"assembly": match["assembly"], "link": "unconfirmed",
+                                    "kind": "name rule " + match["rule"], "rule": match}
+            if match["rule"] in {"board", "kit"}:
+                self.rule_links[identity] = match
         self.views = {}
         for item in self.files:
             identity = item["evidenceId"]
@@ -349,13 +362,14 @@ class _Plan:
         everything = {"assemblies": [a["assemblyUuid"] for a in self.assemblies],
                       "subjects": {a["assemblyUuid"] for a in self.assemblies},
                       "line_indexes": list(range(len(self.lines))),
-                      "files": [item["evidenceId"] for item in self.files]}
+                      "files": [item["evidenceId"] for item in self.files if item["evidenceId"] not in self.rule_links]}
         if self.fits(self.packet(everything)):
             return [everything]
         result = []
         for assembly in self.assemblies:
             uuid = assembly["assemblyUuid"]
-            files = sorted(set(self.placed[uuid]) | set(self.shared_files), key=lambda i: int(self.file_short[i][1:]))
+            files = sorted((set(self.placed[uuid]) | set(self.shared_files)) - set(self.rule_links),
+                           key=lambda i: int(self.file_short[i][1:]))
             indexes = [i for i, line in enumerate(self.lines) if self.line_asm[line["id"]] == uuid]
             base = {"assemblies": [uuid], "subjects": {uuid}, "line_indexes": [], "files": files}
             # The assembly requirement and other fixed parts are counted once; blocks keep a
@@ -679,6 +693,16 @@ def merge(plan: _Plan, calls: list[dict], answers: list[dict | None], failures: 
     final: dict[str, dict] = {}
     for item in plan.files:
         identity = item["evidenceId"]
+        rule = plan.rule_links.get(identity)
+        if rule is not None:
+            # Code-owned name-rule link; never text-verified, so a person confirms it in review.
+            from .package_evidence_name_rules import rationale as rule_rationale
+            why = rule_rationale(rule, asm_name[rule["assembly"]])
+            final[identity] = {"state": "included", "rationale": why, "replacement": None, "category": None,
+                               "links": [(None, {"occurrenceIds": rule["occurrenceIds"], "assemblyUuids": [rule["assembly"]],
+                                                 "role": rule["role"], "sharing": "not_shared", "rationale": why,
+                                                 "textVerified": False, "citations": []})]}
+            continue
         seen = by_file.get(identity, [])
         failed = failed_files.get(identity, [])
         states = {answer["state"] for _, answer in seen}
@@ -778,6 +802,10 @@ def _clue_citation(plan: "_Plan", identity: str) -> dict:
     """What the review panel shows for a not-text-verified link: the survey's reading of the file."""
     clue = plan.clues[identity]
     assembly = next(a for a in plan.assemblies if a["assemblyUuid"] == clue["assembly"])
+    if "rule" in clue:
+        return {"evidenceId": identity, "locator": "package name rule",
+                "observation": f"The name {clue['rule']['name']} places this file with {assembly['partNumber']} "
+                               f"({clue['rule']['rule']} rule); not from quoted text. Confirm it."}
     return {"evidenceId": identity, "locator": "package survey",
             "observation": f"The package survey linked this file to {assembly['partNumber']} ({clue['link']}); "
                            "linked from that, its folder and its name, not from quoted text. Confirm it."}
@@ -787,6 +815,9 @@ def _survey_citation(plan: "_Plan", identity: str) -> dict:
     """The survey's reading of an unresolved file, for the person deciding where it belongs."""
     clue = plan.clues[identity]
     assembly = next(a for a in plan.assemblies if a["assemblyUuid"] == clue["assembly"])
+    if "rule" in clue:
+        return {"evidenceId": identity, "locator": "package name rule",
+                "observation": f"The name {clue['rule']['name']} places this file with {assembly['partNumber']}."}
     return {"evidenceId": identity, "locator": "package survey",
             "observation": f"The package survey linked this file to {assembly['partNumber']} ({clue['link']})."}
 
@@ -949,7 +980,11 @@ def review_compact(review_inputs: dict, graph: dict, classification: dict, asses
             claim["kind"] == "exclusion" or asm & set(claim["association"]["assemblyUuids"])))
         if mine:
             calls.append({**call, "claims": mine})
-    require(set(claims) <= {c for call in calls for c in call["claims"]}, "REVIEW_CLAIM_ROUTING")
+    routed = {c for call in calls for c in call["claims"]}
+    # Name-rule links are code-owned and not sent to the reviewer model; they are recorded as
+    # uncertain so a person confirms them. Every other claim must be routed to a review call.
+    unrouted = set(claims) - routed
+    require(all(claims[c]["evidenceId"] in plan.rule_links for c in unrouted), "REVIEW_CLAIM_ROUTING")
     identity = {**review_inputs["compact_identity"], "reviewPromptSha256": REVIEW_PROMPT_SHA256}
 
     def packet_for(call: dict, extra: dict | None) -> dict:
@@ -972,9 +1007,12 @@ def review_compact(review_inputs: dict, graph: dict, classification: dict, asses
     error = None
     if calls and all(answer is None for answer in answers):
         error = next((code for code in failures if code), "REVIEW_REQUEST_FAILED")
-    merged: dict[str, dict] = {}
+    merged: dict[str, dict] = {c: {"verdict": "uncertain", "reason": "other", "quotes": [],
+                                   "explanation": "Linked by the package name rule from its folder or archive name; "
+                                                  "not checked by the reviewer. A person confirms it."}
+                               for c in sorted(unrouted)}
     findings: list[dict] = []
-    verdicts = set()
+    verdicts = {"needs_human"} if unrouted else set()
     names = {a["assemblyUuid"]: a["partNumber"] for a in plan.assemblies}
     for call, answer, code in zip(calls, answers, failures):
         if answer is None:
@@ -1028,8 +1066,11 @@ def produce_compact(context: dict, roots: list[dict], workbooks: dict[str, bytes
     identity = {"model": model_name, "policyVersion": policy_version, "promptSha256": prompt_sha256}
     calls, answers, failures, made = run_calls(plan, model, identity=identity, correction=correction,
                                                call_store=call_store)
-    # Nothing to keep when every call failed: the job fails as before (plan 8.8 step 5, decision d).
-    require(any(answer is not None for answer in answers), "MODEL_PROPOSAL_FAILED")
+    # Nothing to keep when every call failed: the job fails as before (plan 8.8 step 5, decision d),
+    # unless code already mapped every file (package name rules). Then the file mapping is kept and
+    # the lines stay open (unknown, EVIDENCE_CALL_FAILED) for a person, as for any failed call.
+    require(any(answer is not None for answer in answers)
+            or (plan.rule_links and not any(call["files"] for call in calls)), "MODEL_PROPOSAL_FAILED")
     hints, classifications, manufacturing = merge(plan, calls, answers, failures)
     result = finish(prepared, hints, classifications, manufacturing, review_inputs=review_inputs)
     if review_inputs is not None:

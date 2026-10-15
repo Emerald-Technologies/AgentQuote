@@ -12,7 +12,7 @@ from bom_processor.package_evidence_contracts import (
     PackageEvidenceError, association_id, digest, evidence_id, occurrence_id, semantic_key,
     member_path, text,
 )
-from bom_processor.package_evidence_inventory import InventoryLimits, build_inventory
+from bom_processor.package_evidence_inventory import NOT_INVENTORIED_FORMAT, InventoryLimits, build_inventory, select_archives
 
 U = "12345678-1234-4234-8234-123456789012"
 V = "12345678-1234-4234-8234-123456789013"
@@ -206,8 +206,11 @@ def test_default_limits_accept_root_over_previous_50mb_and_mirror_quickquote():
 
 def test_combined_root_expansion_budget_and_malformed_workbook_zip():
     data = archive([("member", b"x" * 100)])
-    with pytest.raises(PackageEvidenceError, match="AGGREGATE"):
-        build_inventory([root(data)], limits=InventoryLimits(aggregate_bytes=len(data) + 99))
+    # Over the aggregate budget the root archive is kept whole and marked, never failed or dropped.
+    kept = build_inventory([root(data)], limits=InventoryLimits(aggregate_bytes=len(data) + 99))
+    assert [(item["archiveChain"], item["format"]) for item in kept] == [([], NOT_INVENTORIED_FORMAT)]
+    with pytest.raises(PackageEvidenceError, match="ROOT_AGGREGATE"):
+        build_inventory([root(data)], limits=InventoryLimits(aggregate_bytes=len(data) - 1))
     for name, payload in [("bad.zip", b"PK\x03\x04broken"), ("bad.xlsx", b"PKbroken")]:
         with pytest.raises(PackageEvidenceError, match="ARCHIVE_INVALID"):
             build_inventory([root(payload, name)])
