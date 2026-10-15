@@ -156,12 +156,24 @@ class CandidateStatusService:
                         "approved": 3, "rejected": 3}[current]
             records.append((_authoring_rank(manifest.get("version")), priority,
                             candidate_id, current, validation_id, manifest, decision))
+        # An operator-supplied parser named by one immutable selection record (operator_candidate,
+        # Nick 2026-10-14) is chosen ahead of the budget lineage and the authoring rank. It is still
+        # validated, reviewed and approved like any candidate; a bad record fails closed.
+        from .operator_candidate import OperatorCandidateError, operator_selection
+        try:
+            operator_candidate = operator_selection(self.storage, request_id, manifests, self.max_results)
+        except OperatorCandidateError as exc:
+            raise CandidateStatusError("invalid operator selection") from exc
         if not records:
             status, selected = request.get("status", "requested"), None
         else:
             top = max(row[0] for row in records)
             choices = [row for row in records if row[0] == top]
-            if budget_candidate is not None:
+            if operator_candidate is not None:
+                choices = [row for row in records if row[2] == operator_candidate]
+                if len(choices) != 1:
+                    raise CandidateStatusError("invalid operator selection")
+            elif budget_candidate is not None:
                 choices = [row for row in records if row[2] == budget_candidate]
                 if len(choices) != 1:
                     raise CandidateStatusError("invalid budget candidate lineage")
@@ -220,6 +232,11 @@ class CandidateStatusService:
                     self.automation.start_validator(request_id, candidate_id)
                 except Exception:
                     result["automation_error"] = "validator_start_failed"
+            if (operator_candidate is not None and status == "schema_invalid"
+                    and self.automation and not budget_held):
+                # An operator parser is never re-authored by the model; a person fixes it.
+                result["automation_error"] = "validation_failure_requires_review"
+                return result
             if self.automation and not budget_held and status in {"generated_unvalidated", "schema_invalid"}:
                 if status == "generated_unvalidated" and any(superseded_layout_failure(item)
                     for item in evidence.get(candidate_id, [])):

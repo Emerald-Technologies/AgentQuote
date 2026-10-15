@@ -25,6 +25,9 @@ locations only, never customer values. Code checks, on every row of the real fil
   number, the cell must hold the value, every row on that sheet holding a maker or MPN for the part
   must be carried by the line (LOOKUP_ROW_NOT_CARRIED), and looked-up rows count as accounted for;
 - every source column with data in BOM lines feeds a field or is declared ignored;
+- a quantity may be cited as {"derived": reason} only for an assembly's one bare board when the BOM
+  prints none (QQ A052, Nick 2026-10-14): a Part of quantity 1 with a bom_notes flag, no designator or
+  manufacturer/MPN, an empty quantity cell, and at most one such line per parent line;
 - the manufacturer/MPN pattern holds on every line row (plan 8.12, step 4d): a column is never a
   manufacturer in one pair and an MPN in another, a manufacturer column always pairs with the same
   MPN column, a populated pair cell in a mapped pair column is carried, a combined cell splits into
@@ -59,6 +62,13 @@ MAX_SKIPPED_ROW_SPAN = 200_000
 SKIP_REASONS = frozenset({"header", "title", "blank", "total", "note", "section", "signature",
                           "other_sheet", "other"})
 DERIVABLE_FIELDS = frozenset({"unit_of_measure", "bom_notes"})
+# QQ A052 (Nick 2026-10-14): an assembly's one bare board may be given quantity 1 when the BOM prints
+# none, flagged in bom_notes for a person. Only that: a Part line of quantity exactly 1 with a note, no
+# designator and no manufacturer/MPN (so a real placed part with a blank quantity still stops), no
+# value in its rows' quantity column, and at most one such line per assembly group (parent line).
+BOARD_QUANTITY_INVALID = "BOARD_QUANTITY_DERIVATION_INVALID"
+BOARD_QUANTITY_PRINTED = "BOARD_QUANTITY_PRINTED"
+BOARD_QUANTITY_REPEATED = "BOARD_QUANTITY_REPEATED"
 _FIXED = frozenset({"line_number", "item_category"})
 # Sheet names the parser cites for sources without named sheets.
 CSV_SHEET = "CSV"
@@ -273,6 +283,8 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
     item_column = columns.index("item_number") + 1
     allowed_fields = set(columns) - _FIXED
     claims: list[tuple[int, str, int, dict[str, Any]]] = []
+    # A052: lines whose quantity is cited as derived (the bare board), checked after every line.
+    derived_quantities: list[tuple[int, str, list[int], tuple[str, int], Any]] = []
     for line in lines:
         base = {"output_row", "sheet", "rows", "fields"}
         _keys(line, base | ({"parent"} if proposal["version"] == VERSION and "parent" in line else set()),
@@ -351,7 +363,11 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
             if isinstance(link, dict):
                 _keys(link, {"derived"}, "ROW_MAP_LINK_INVALID")
                 _require(_reason(link["derived"]), "ROW_MAP_LINK_INVALID")
-                if field not in DERIVABLE_FIELDS:
+                if field == "quantity":
+                    parent = line.get("parent")
+                    derived_quantities.append((out, sheet, rows, first,
+                                               parent.get("line") if isinstance(parent, dict) else None))
+                elif field not in DERIVABLE_FIELDS:
                     fail(first, "FIELD_DERIVATION_NOT_ALLOWED")
                 continue
             _require(isinstance(link, list) and len(link) in (2, 3)
@@ -424,6 +440,34 @@ def verify_row_map(source: bytes, extension: str, output: bytes, row_map: bytes)
             for out, item in sorted(items.items()):
                 for key in sorted(by_key.get(item, set()) - line_lookups.get(out, set())):
                     fail(key, "LOOKUP_ROW_NOT_CARRIED")
+
+    # A052: the one bare board per assembly group given quantity 1 because the BOM prints none.
+    def output_value(out: int, field: str) -> str:
+        value = parsed.cells.get((out_sheet, out, columns.index(field) + 1))
+        return "" if value is None else _text(value)
+
+    def source_value(sheet: str, row: int, column: int) -> str:
+        value = original.cells.get((sheet, row, column))
+        return "" if value is None else _text(value)
+
+    boards: Counter[tuple[str, Any]] = Counter()
+    for out, sheet, rows, first, group in derived_quantities:
+        pair_values = [output_value(out, f"{prefix}_{index}") for index in range(1, pairs + 1)
+                       for prefix in ("manufacturer", "manufacturer_item_number")]
+        if (output_value(out, "item_category") != "Part" or _number(output_value(out, "quantity")) != 1
+                or not output_value(out, "bom_notes") or output_value(out, "reference_designator")
+                or any(pair_values)):
+            fail(first, BOARD_QUANTITY_INVALID)
+            continue
+        # The BOM's quantity column (the one other lines cite) must be empty on this line's rows.
+        columns_here = {column for s, column in quantity_columns if s == sheet}
+        if not columns_here or any(source_value(sheet, row, column)
+                                   for row in rows for column in columns_here):
+            fail(first, BOARD_QUANTITY_PRINTED)
+            continue
+        boards[(sheet, group)] += 1
+        if boards[(sheet, group)] > 1:
+            fail(first, BOARD_QUANTITY_REPEATED)
 
     # Sub-assembly structure (unit 2): code works out each line's parent from the cited cells and
     # compares it with the parser's claim. All lines or none, one kind, one column, one sheet.

@@ -122,6 +122,13 @@ class AdminDecisionService:
         evidence_manifest_hash = review.get("evidence", {}).get("manifest_sha256")
         if not isinstance(evidence_manifest_hash, str):
             evidence_manifest_hash = _hash(evidence.get("fixtures", []))
+        # A package child's assembly identity comes from its package plan review (survey and file
+        # names), not from this parser decision, so registering its parser does not need a mapping.
+        mapping_required = any(group.get("mapping_required") is True for group in review.get("groups", []))
+        package_child = False
+        if decision == "approve" and grouped_v3 and mapping_required:
+            from .author_budget import _membership
+            package_child = _membership(self.storage, request_id) is not None
         if decision == "approve" and grouped_v3:
             if review_manifest_sha256 is None or review_manifest_sha256.lower() != evidence_manifest_hash:
                 raise RegistryError("REVIEW_MANIFEST_BINDING")
@@ -134,7 +141,7 @@ class AdminDecisionService:
                 displayed = {item.get("fixture_sha256") for item in required_groups[group_id].get("fixtures", [])}
                 if selected_hash not in displayed:
                     raise RegistryError("FIXTURE_SELECTION_INVALID")
-            if any(group.get("mapping_required") is True for group in review.get("groups", [])):
+            if mapping_required and not package_child:
                 raise RegistryError("MAPPING_REQUIRED")
         elif fixture_selections:
             raise RegistryError("FIXTURE_SELECTION_INVALID")
@@ -165,6 +172,8 @@ class AdminDecisionService:
         if grouped_v3:
             identity["review_manifest_sha256"] = evidence_manifest_hash
             identity["fixture_selections"] = dict(sorted((fixture_selections or {}).items()))
+            if package_child:
+                identity["assembly_mapping"] = "package_plan"
         approval_id = _hash(identity)
         decision_path = f"candidates/decisions/{request_id}/{candidate_id}/{validation_id}.json"
         record = {**identity, "approved_time": timestamp, "decision_id": approval_id}

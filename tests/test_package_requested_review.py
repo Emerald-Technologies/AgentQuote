@@ -287,3 +287,59 @@ def test_identity_is_left_to_today_s_rules_when_not_obvious(links, rows, parsed)
     elif isinstance(parsed, tuple):
         parsed = AssemblyIdentity(*parsed)
     assert requested_identity(_identity_result(links), sorted(links), rows, parsed) is None
+
+
+# --- A056 (Nick 2026-10-14): the survey linked no file and the BOM has no assembly line ---------
+
+FILE_A, FILE_B = "cccccccc-3333-4333-8333-333333333333", "dddddddd-4444-4444-8444-444444444444"
+FILE_REQUESTED = [{"assembly_id": FILE_A, "part_number": "0100-11111", "revision": "02"},
+                  {"assembly_id": FILE_B, "part_number": "0100-22222", "revision": "01"}]
+
+
+def _file_result(paths_by_document, links=None):
+    files = [{"file_id": f"F{index}", "path": path}
+             for index, path in enumerate(sorted({p for paths in paths_by_document.values() for p in paths}))]
+    ids = {item["path"]: item["file_id"] for item in files}
+    return {"requested_assemblies": FILE_REQUESTED, "survey": {"files": files},
+            "documents": [{"document_id": doc, "requested_assembly_ids": (links or {}).get(doc, []),
+                           "survey_file_ids": [ids[path] for path in paths]}
+                          for doc, paths in paths_by_document.items()]}
+
+
+def test_a_bom_without_an_assembly_line_takes_the_one_assembly_its_file_name_names():
+    from bom_processor.package_resolution import requested_identity
+    from bom_processor.semantic import AssemblyIdentity
+    rows = [{"item_number": "0110-99999", "revision": "02", "quantity": 1},
+            {"item_number": "0630-00001", "revision": None, "quantity": 4}]
+    result = _file_result({"d1": ["package/BOM 0100-11111 REV 02.xlsx"]})
+    assert requested_identity(result, ["d1"], rows, None) == AssemblyIdentity("0100-11111", "02")
+
+
+@pytest.mark.parametrize("paths, parsed", [
+    # The file name names no requested assembly.
+    ({"d1": ["package/parts list.xlsx"]}, None),
+    # The file name names two requested assemblies.
+    ({"d1": ["package/BOM 0100-11111 and 0100-22222.xlsx"]}, None),
+    # Two source files of one fixture name different assemblies.
+    ({"d1": ["a/BOM 0100-11111.xlsx"], "d2": ["b/BOM 0100-22222.xlsx"]}, None),
+    # Something parsed names an identity: today's rules (or a person) decide.
+    ({"d1": ["package/BOM 0100-11111 REV 02.xlsx"]}, "DOC-555"),
+    # The parsed identity names the other requested assembly.
+    ({"d1": ["package/BOM 0100-11111 REV 02.xlsx"]}, "0100-22222"),
+    # The file name's revision contradicts the requested revision (02).
+    ({"d1": ["package/BOM 0100-11111 REV 03.xlsx"]}, None),
+])
+def test_the_file_name_clue_stays_out_when_it_is_not_obvious(paths, parsed):
+    from bom_processor.package_resolution import requested_identity
+    from bom_processor.semantic import AssemblyIdentity
+    rows = [{"item_number": "0630-00001", "quantity": 4}]
+    parsed = AssemblyIdentity(parsed, "") if parsed else None
+    assert requested_identity(_file_result(paths), sorted(paths), rows, parsed) is None
+
+
+def test_a_survey_link_is_never_overridden_by_the_file_name():
+    from bom_processor.package_resolution import requested_identity
+    from bom_processor.semantic import AssemblyIdentity
+    rows = [{"item_number": "0630-00001", "quantity": 4}]
+    result = _file_result({"d1": ["package/BOM 0100-11111 REV 02.xlsx"]}, {"d1": [FILE_B]})
+    assert requested_identity(result, ["d1"], rows, None) == AssemblyIdentity("0100-22222", "01")

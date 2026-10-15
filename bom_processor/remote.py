@@ -130,8 +130,14 @@ class RemoteBomProcessor:
                         PurePosixPath(document.blob_path).suffix,
                     )
                 except RegistryError as item_error:
-                    if item_error.code not in {"PARSER_FORMAT_NOT_RECOGNIZED"}:
+                    if item_error.code not in {"PARSER_FORMAT_NOT_RECOGNIZED"} and not (
+                            choice is not None and item_error.code == "PARSER_FORMAT_AMBIGUOUS"):
                         raise
+                    current = None
+                if current is None or choice is not None:
+                    # A package BOM always becomes a child candidate request, so the package review
+                    # sees every BOM the same way; a registry match is reused when the child is
+                    # authored (registry_reuse), an ambiguous match is authored as before.
                     profile = profile_bytes(verified_sources[document.document_id],
                                             PurePosixPath(document.blob_path).suffix)
                     profiles.setdefault(profile.profile_hash, (profile, []))[1].append(document)

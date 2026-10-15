@@ -1446,7 +1446,9 @@ def package_file_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
             reason = document["reason"]
         rows.append({"file_id": record["file_id"], "path": record["path"], "kind": record["kind"],
                      "role": record["role"],
-                     "classification_status": record.get("classification_status", "classified"),
+                     # A file the name-match pre-pass listed but did not survey reads as unclassified (QQ #99).
+                     "classification_status": "unclassified" if record.get("classification_status") == "not_surveyed"
+                     else record.get("classification_status", "classified"),
                      "requested_assembly_id": None if link is None else link["assembly_id"],
                      "link": "none" if link is None else link["link"],
                      "decision": decision, "reason": reason,
@@ -1523,9 +1525,12 @@ def requested_identity(result: dict[str, Any], document_ids: list[str], rows: li
        Level 0 line of the assembly itself: that line's part number and revision.
     2. Else the requested assembly every source document is code-confirmed to belong to (file
        name, folder or title cells, checked by the survey), when the parsed identity names none.
+    3. Else, when the survey linked none of the source files and nothing parsed names an assembly,
+       the one requested assembly every source file's own name names (A056).
     None leaves today's behaviour: the parsed identity, or a person's mapping. A BOM whose lines or
     parsed identity name a different requested assembly than its link is never overridden.
     """
+    from pathlib import PurePosixPath
     from .assembly_core import find_assembly, revision_contradicts
     from .semantic import AssemblyIdentity
     requested = {item["assembly_id"]: item for item in result["requested_assemblies"]}
@@ -1559,4 +1564,32 @@ def requested_identity(result: dict[str, Any], document_ids: list[str], rows: li
         if parsed is not None and revision_contradicts(item["revision"], parsed.revision):
             return None
         return AssemblyIdentity(item["part_number"], item["revision"] or "")
-    return None
+    # 3. Last clue (QQ A056, Nick 2026-10-14): the survey linked no file, but every source file's own
+    #    name names the same one requested assembly (core-number rule), and nothing parsed names another.
+    #    A BOM without an assembly line is otherwise unreadable to review; a file name naming two
+    #    assemblies, or none, still leaves it to a person.
+    if links or named or (parsed is not None and str(parsed.name or "").strip()):
+        return None
+    survey_files = {item.get("file_id"): item.get("path") for item in (result.get("survey") or {}).get("files", [])
+                    if isinstance(item, dict)}
+    named_by_file: set[str] = set()
+    for item in sources:
+        paths = [survey_files.get(file_id) for file_id in (item or {}).get("survey_file_ids", [])]
+        names = [PurePosixPath(path).name for path in paths if isinstance(path, str) and path]
+        if item is None or not names:
+            return None
+        found = {assembly_id for assembly_id, wanted in requested.items()
+                 if any(find_assembly(wanted["part_number"], name) is not None for name in names)}
+        if len(found) != 1:
+            return None
+        wanted = requested[next(iter(found))]
+        # A revision written in the file name ('REV 03') that clearly differs is a contradiction.
+        written = [match.group(1) for name in names
+                   for match in re.finditer(r"(?i)\brev(?:ision)?[\s._-]*([A-Za-z0-9]+(?:\.[0-9]+)*)", name)]
+        if any(revision_contradicts(wanted["revision"], revision) for revision in written):
+            return None
+        named_by_file |= found
+    if len(named_by_file) != 1:
+        return None
+    item = requested[next(iter(named_by_file))]
+    return AssemblyIdentity(item["part_number"], item["revision"] or "")
