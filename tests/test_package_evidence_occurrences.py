@@ -86,7 +86,7 @@ def test_invalid_quantities(value):
 
 @pytest.mark.parametrize("changes", [{"item_category": "Other"}, {"item_number": 123},
     {"item_number": None}, {"line_number": 2}, {"line_number": True}, {"quantity": -1},
-    {"quantity": True}, {"revision": 3}, {"item_name": None}, {"manufacturer_1": 5},
+    {"quantity": True}, {"item_name": None}, {"manufacturer_1": 5},
     {"item_number": datetime(2020, 1, 1)}, {"item_category": None}, {"bom_notes": "=1+1"}])
 def test_every_nonempty_row_validated(changes):
     with pytest.raises(PackageEvidenceError):
@@ -150,6 +150,11 @@ def test_xml_locators_bounded_before_openpyxl(old, new):
                    if name == "xl/worksheets/sheet1.xml" else payload)
     with pytest.raises(PackageEvidenceError):
         read(data)
+
+
+def test_numeric_revision_is_read_as_quickquote_reads_it():
+    # QQ #99: canonical BOMs carry numeric revisions; QuickQuote reads them as String(number).
+    assert read(workbook([{"revision": 3}]))["occurrences"][0]["revision"] == "3"
 
 
 def test_malformed_document_row_not_silently_omitted():
@@ -243,7 +248,7 @@ def test_complete_row_observations_include_all_manufacturer_slots_and_document_t
 
 @pytest.mark.parametrize("field,maximum", [("item_number", 256), ("revision", 256),
     ("item_name", 2000), ("bom_notes", 2000), ("unit_of_measure", 2000),
-    ("reference_designator", 2000), ("manufacturer_1", 2000),
+    ("reference_designator", 20_000), ("manufacturer_1", 2000),
     ("manufacturer_item_number_8", 2000)])
 def test_workbook_text_utf16_exact_boundaries(field, maximum):
     accepted = "😀" * (maximum // 2)
