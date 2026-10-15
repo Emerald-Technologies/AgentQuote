@@ -52,6 +52,11 @@ def match_request(storage: Any, request: dict[str, Any], *, reader: Any = None):
     from .blob_registry import BlobRegistryReader
     from .candidates import unique_fixtures
     from .master_registry import RegistryError
+    from .core import BlobNotFoundError
+    try:
+        storage.download_registry(f"registry/{request['parser_key']}/master.json", 1_000_000)
+    except (BlobNotFoundError, FileNotFoundError):
+        return None, "registry_absent"  # checked before any source is read
     reader = reader or BlobRegistryReader(storage.download_registry)
     chosen = None
     for fixture in unique_fixtures(request["source_evidence"]):
@@ -91,8 +96,12 @@ def reuse(storage: Any, request_id: str, *, clock: Callable[[], datetime] | None
     """
     from .operator_candidate import FixedCodeAuthor, select, selection_record
     from .candidate_authoring import CandidateAuthoringService
-    request = json.loads(storage.download_registry(f"candidates/requests/{request_id}.json", 1_000_000))
-    if request.get("request_id") != request_id or request.get("status") != "requested":
+    from .core import BlobNotFoundError
+    try:
+        request = json.loads(storage.download_registry(f"candidates/requests/{request_id}.json", 1_000_000))
+    except (BlobNotFoundError, FileNotFoundError):
+        return None  # today's path reports a missing request as before
+    if not isinstance(request, dict) or request.get("request_id") != request_id or request.get("status") != "requested":
         return None
     selection, outcome = match_request(storage, request, reader=reader)
     if selection is None:
