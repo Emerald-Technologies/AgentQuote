@@ -16,12 +16,23 @@ Commands (all read-only unless --execute is given to submit):
   submit  --request-id ID (--parser P | --config C) --actor ID --reason TEXT [--execute]
                                               check first (refuses unless every source passes), then
                                               print (dry run) or write the candidate and selection record
+  promote --request-id ID --variant-id V --version N --approver ID --reason TEXT [--ticket T] [--execute]
+                                              register the request's validated candidate in the
+                                              customer's registry through AdminDecisionService
+                                              (operator_promotion); refuses an unvalidated candidate
+                                              or a signature that would be ambiguous; dry run prints
+                                              the variant, signature and the blobs it would write
 
 Inputs: BOM_STORAGE_ACCOUNT_URL (or --account-url), the operator's `az login` (AzureCliCredential,
 Azure Government cloud set in the CLI). Outputs: JSON on stdout; customer rows are never printed.
 Writes (submit --execute only), all write-once in the parsers container:
   candidates/<request>/<candidate>/parse.py, candidate-manifest.json,
   candidates/events/<request>/<candidate>.json, candidates/operator-selections/<request>/<candidate>.json
+Writes (promote --execute only): the decision record, approved/<key>/<variant>/<version>/{parse.py,
+  signature.json, approval.json, provenance.json}, the registry generation snapshot and event
+  (all write-once) and a conditional update of registry/<key>/master.json. Run promotions one at
+  a time; each later dry run checks its signature against the variants already registered.
+  Rollback: restore master.json from the previous generations/ snapshot (or delete it for the first).
 Rollback: delete the selection record (status returns to the budget/rank choice); for a request
 without an author budget also delete the three candidate blobs, or status sees two candidates.
 Run: python dev/operator_parser_candidate.py lookup --rfq <uuid>
@@ -86,6 +97,15 @@ class RecordingStorage:
     def list_candidate_paths(self, prefix: str, max_results: int) -> list[str]:
         return sorted(set(self.live.list_candidate_paths(prefix, max_results))
                       | {path for path in self.writes if path.startswith(prefix)})
+
+    def download_registry_with_etag(self, path: str, max_bytes: int):
+        if path in self.writes:
+            return self.writes[path][0], "recorded"
+        return self.live.download_registry_with_etag(path, max_bytes)
+
+    def upload_registry_if_match(self, path: str, data: bytes, content_type: str, etag: Any) -> str:
+        self.writes[path] = (data, content_type, "conditional-update" if etag is not None else "new")
+        return "recorded"
 
 
 def live_storage(account_url: str):
@@ -158,6 +178,58 @@ def lookup(account_url: str, rfq: str, since_hours: int) -> list[dict[str, Any]]
     return found
 
 
+def planned_writes(plan: RecordingStorage) -> list[dict[str, Any]]:
+    return [{"path": path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+             "content_type": content_type, "state": state}
+            for path, (data, content_type, state) in sorted(plan.writes.items())]
+
+
+def fixture_selections(args: argparse.Namespace) -> dict[str, str]:
+    selections = {}
+    for item in args.select_fixture:
+        group, _, sha = item.partition("=")
+        if not group or not sha or group in selections:
+            raise SystemExit(f"invalid --select-fixture {item!r}")
+        selections[group] = sha
+    return selections
+
+
+def promote_dry_run(storage: Any, args: argparse.Namespace) -> tuple[dict[str, Any], RecordingStorage]:
+    """Every check, then the same decision on a recording view; nothing is written."""
+    from bom_processor.operator_promotion import decide, plan as promotion_plan
+    checked = promotion_plan(storage, args.request_id, variant_id=args.variant_id, version=args.version)
+    recording = RecordingStorage(storage)
+    try:
+        result = decide(recording, checked, approver=args.approver, reason=args.reason, ticket=args.ticket,
+                        fixture_selections=fixture_selections(args), hold_writer=False)
+    except Exception as exc:
+        exc.checked = checked
+        raise
+    return {"mode": "dry-run", **checked,
+            "registry_generation": result["parser"]["registry_generation"],
+            "decision_id": result["decision_id"], "writes": planned_writes(recording)}, recording
+
+
+def promote(storage: Any, args: argparse.Namespace) -> int:
+    from bom_processor.master_registry import RegistryError
+    from bom_processor.operator_promotion import PromotionRefused, decide
+    try:
+        report, _ = promote_dry_run(storage, args)
+    except (PromotionRefused, RegistryError) as exc:
+        checked = getattr(exc, "checked", {})
+        print(json.dumps({"refused": str(exc), "request_id": args.request_id,
+                          **({"conflict_groups": checked["conflict_groups"]} if checked else {})}, indent=1))
+        return 1
+    if not args.execute:
+        print(json.dumps(report, indent=1))
+        return 0
+    result = decide(storage, report, approver=args.approver, reason=args.reason, ticket=args.ticket,
+                    fixture_selections=fixture_selections(args))
+    print(json.dumps({**report, "mode": "execute",
+                      "parser": result["parser"], "decision_id": result["decision_id"]}, indent=1))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     import os
     parser = argparse.ArgumentParser(description="Operator parser candidates (see module docstring).")
@@ -179,6 +251,17 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--reason", required=True)
             command.add_argument("--execute", action="store_true",
                                  help="write to live storage; without it nothing is written")
+    promotion = commands.add_parser("promote")
+    promotion.add_argument("--request-id", required=True)
+    promotion.add_argument("--variant-id", required=True)
+    promotion.add_argument("--version", required=True)
+    promotion.add_argument("--approver", required=True)
+    promotion.add_argument("--reason", required=True)
+    promotion.add_argument("--ticket", default="")
+    promotion.add_argument("--select-fixture", action="append", default=[], metavar="GROUP=SHA256",
+                        help="for a review group with conflicting fixtures, the fixture to record")
+    promotion.add_argument("--execute", action="store_true",
+                        help="write to live storage; without it nothing is written")
     args = parser.parse_args(argv)
     if args.command == "lookup":
         print(json.dumps(lookup(args.account_url, args.rfq, args.since_hours), indent=1))
@@ -187,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         print(json.dumps(status(storage, args.request_id), indent=1, default=str))
         return 0
+    if args.command == "promote":
+        return promote(storage, args)
     code = parser_code(args)
     results = check(storage, args.request_id, code)
     print(json.dumps({"offline_validation": results}, indent=1, default=str))
