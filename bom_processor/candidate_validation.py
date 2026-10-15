@@ -343,7 +343,8 @@ class CandidateValidationService:
                  worker_image: str = "", clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
                  assembly_associations: dict[str, dict[str, Any]] | None = None,
-                 serial_owner: str | None = None) -> None:
+                 serial_owner: str | None = None,
+                 worker_log: Callable[..., None] | None = None) -> None:
         self.request_id = _identifier(request_id, "INVALID_REQUEST_ID")
         self.candidate_id = _identifier(candidate_id, "INVALID_CANDIDATE_ID")
         limits = (timeout_seconds, poll_interval_seconds, max_source_bytes,
@@ -358,6 +359,8 @@ class CandidateValidationService:
         self.clock, self.sleep = clock, sleep
         self.assembly_associations = assembly_associations
         self.serial_owner = serial_owner
+        # Optional log hook called around each parser-worker job (job_identity_log.parser_worker_log).
+        self.worker_log = worker_log
         self.validation_version = ("candidate-validation.v4" if assembly_associations is not None
                                    else VALIDATION_VERSION)
         # Set from the candidate manifest: v9/v10 parsers must write a row map (plan 8.8 step 4a).
@@ -456,11 +459,8 @@ class CandidateValidationService:
             "output.xlsx", "result.json",
             row_map_name=ROW_MAP_NAME if self.row_map_required else None,
         )
-        raw_result = None
         try:
-            started = self.orchestrator.start(item)
-            raw_result = self._poll(item)
-            worker = self._verify_worker_result(raw_result, item)
+            started, worker = self._run_worker(item)
             output = self.storage.download_candidate(item.output_blob, self.max_output_bytes)
         except CandidateValidationError as exc:
             classification = exc.classification
@@ -613,9 +613,7 @@ class CandidateValidationService:
             record = {"fixture_sha256": source_evidence["sha256"].lower(), "document_id": source_evidence["document_id"],
                       "source_aliases": source_evidence.get("source_aliases", []), "status": "failed"}
             try:
-                started = self.orchestrator.start(item)
-                raw = self._poll(item)
-                worker = self._verify_worker_result(raw, item)
+                started, worker = self._run_worker(item)
                 output = self.storage.download_candidate(item.output_blob, self.max_output_bytes)
                 schema_valid = True
                 try:
@@ -787,6 +785,32 @@ class CandidateValidationService:
         if len(source) != evidence["size_bytes"] or _sha256(source) != evidence["sha256"].lower():
             raise CandidateValidationError("SOURCE_INTEGRITY")
         return source
+
+    def _run_worker(self, item: WorkItem) -> tuple[Any, dict[str, Any]]:
+        """Start one parser-worker job, wait for and verify its result; logs START/END when hooked.
+
+        The worker's own END is "succeeded" once its result is verified as completed; judging the
+        output (schema, semantics) belongs to the validator's END. Errors propagate unchanged.
+        """
+        self._log_worker("start", item)
+        try:
+            started = self.orchestrator.start(item)
+            worker = self._verify_worker_result(self._poll(item), item)
+        except Exception as exc:
+            self._log_worker("end", item, "failed",
+                             exc.code if isinstance(exc, CandidateValidationError) else "WORKER_FAILED")
+            raise
+        self._log_worker("end", item, "succeeded")
+        return started, worker
+
+    def _log_worker(self, *args: Any) -> None:
+        hook = getattr(self, "worker_log", None)
+        if hook is None:
+            return
+        try:
+            hook(*args)
+        except Exception:
+            pass  # Logging never changes a validation outcome.
 
     def _poll(self, item: WorkItem) -> bytes:
         deadline = self.clock() + self.timeout_seconds

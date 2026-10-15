@@ -1,9 +1,14 @@
-"""Local candidate authoring job entrypoint; only REQUEST_ID is request-scoped."""
+"""Local candidate authoring job entrypoint; only REQUEST_ID is request-scoped.
+
+Logs one agentquote-job-line.v1 START and END line (bom_processor/job_identity_log.py); the END
+line comes just before the existing final result line, which stays last.
+"""
 from __future__ import annotations
 import json
 import os
 
 from bom_processor.candidate_authoring import AUTHORING_VERSION, ASSOCIATION_AUTHORING_VERSION
+from bom_processor.job_identity_log import JobLog
 
 
 _ATTEMPT_KINDS = {"author", "author-refinement"}
@@ -36,22 +41,41 @@ def _write_attempt_marker(storage, request_id: str, context: tuple[str, int], st
         path, json.dumps(marker, sort_keys=True).encode(), "application/json")
 
 
+def _identify(storage, request_id: str, attempt_context: tuple[str, int] | None):
+    """Job kind and identity for the START line; read-only, and any error only nulls the fields."""
+    from bom_processor import job_identity_log as job_log
+    budget = [os.environ.get(key, "") for key in
+              ("AUTHOR_BUDGET_GROUP", "AUTHOR_BUDGET_SLOT", "AUTHOR_BUDGET_RESERVATION")]
+    claim = job_log.load_budget_claim(storage, request_id, *budget) if all(budget) else None
+    job, attempt, limit = job_log.author_job(attempt_context, claim,
+                                             refinement=bool(os.environ.get("AUTHOR_REFINE_CANDIDATE")))
+    context = job_log.load_candidate_context(storage, request_id)
+    return job, job_log.candidate_identity(request_id, context["request"], choice_request=context["choice_request"],
+                                           choice_result=context["choice_result"], membership=context["membership"],
+                                           attempt=attempt, max_attempts=limit)
+
+
 def main() -> int:
+    log = JobLog("author")
     request_id = os.environ.get("REQUEST_ID", "")
     unknown = sorted(key for key in os.environ if key.startswith("REQUEST_") and key != "REQUEST_ID")
     if not request_id or unknown:
+        log.end("failed", "invalid_request_environment")
         print(json.dumps({"status": "error", "error": "invalid_request_environment"}, sort_keys=True))
         return 2
     association_policy = os.environ.get("BOM_SOURCE_ASSOCIATIONS", "false")
     if association_policy not in {"true", "false"}:
+        log.end("failed", "invalid_association_policy")
         print(json.dumps({"status": "error", "error": "invalid_association_policy"}, sort_keys=True))
         return 2
     try:
         attempt_context = _attempt_context()
     except ValueError:
+        log.end("failed", "invalid_author_attempt_environment", request_id=request_id)
         print(json.dumps({"status": "error", "error": "invalid_author_attempt_environment",
                           "request_id": request_id}, sort_keys=True))
         return 2
+    log.note(request_id=request_id)
     storage = None
     try:
         from azure.identity import ManagedIdentityCredential
@@ -62,6 +86,7 @@ def main() -> int:
         credential = (ManagedIdentityCredential(client_id=client_id)
                   if client_id else ManagedIdentityCredential())
         storage = AzureBlobStorage.from_account_url(os.environ["BOM_STORAGE_ACCOUNT_URL"], credential)
+        log.start(lambda: _identify(storage, request_id, attempt_context))
         budget_values = [os.environ.get(key, "") for key in
                          ("AUTHOR_BUDGET_GROUP", "AUTHOR_BUDGET_SLOT", "AUTHOR_BUDGET_RESERVATION")]
         if any(budget_values):
@@ -91,6 +116,7 @@ def main() -> int:
             from bom_processor.author_budget import complete
             complete(storage, budget_values[0], int(budget_values[1]), request_id,
                      budget_values[2], "completed", result.candidate_id, execution_owner=budget_owner)
+        log.end("succeeded", candidate_id=result.candidate_id)
         print(json.dumps({"status": result.status, "request_id": result.request_id,
                           "candidate_id": result.candidate_id, "manifest_path": result.manifest_path}, sort_keys=True))
         return 0
@@ -127,6 +153,7 @@ def main() -> int:
         payload = {"status": "error", "request_id": request_id, "error": error, **diagnostics}
         if error_code: payload["error_code"] = error_code
         if rule_id: payload["rule_id"] = rule_id
+        log.end("failed", error_code or error)
         print(json.dumps(payload, sort_keys=True))
         return 1
 

@@ -5,6 +5,13 @@ from types import ModuleType
 import validation_job
 
 
+def final_line(out):
+    """The existing result line stays last; the job identity START/END lines come before it (QQ #121)."""
+    lines = out.strip().splitlines()
+    assert [json.loads(line)["phase"] for line in lines[:-1]] == ["start", "end"]
+    return json.loads(lines[-1])
+
+
 def install_fakes(monkeypatch, service):
     azure = ModuleType("azure")
     identity = ModuleType("azure.identity")
@@ -38,7 +45,7 @@ def test_unknown_request_environment_is_rejected(monkeypatch, capsys):
     configure(monkeypatch)
     monkeypatch.setenv("CANDIDATE_SECRET", "not-accepted")
     assert validation_job.main() == 2
-    assert json.loads(capsys.readouterr().out) == {
+    assert final_line(capsys.readouterr().out) == {
         "error": "invalid_request_environment", "status": "error"}
 
 
@@ -60,7 +67,7 @@ def test_success_prints_only_safe_identifiers(monkeypatch, capsys):
     configure(monkeypatch)
     install_fakes(monkeypatch, Service)
     assert validation_job.main() == 0
-    result = json.loads(capsys.readouterr().out)
+    result = final_line(capsys.readouterr().out)
     assert result["status"] == "awaiting_approval"
     assert result["validation_id"] == "validation-1"
     assert "source" not in result and "code" not in result and "url" not in result
@@ -79,4 +86,4 @@ def test_safe_validation_error_is_reported(monkeypatch, capsys):
     configure(monkeypatch)
     install_fakes(monkeypatch, Service)
     assert validation_job.main() == 1
-    assert json.loads(capsys.readouterr().out)["error"] == "SOURCE_INTEGRITY"
+    assert final_line(capsys.readouterr().out)["error"] == "SOURCE_INTEGRITY"
