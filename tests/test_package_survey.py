@@ -221,12 +221,16 @@ def test_name_that_disagrees_with_contents_is_a_finding():
     assert "NAME_CONTENT_DISAGREE" in {finding["code"] for finding in item["findings"]}
 
 
+# A refused role citation refuses the file only when no citation is left (QQ #182), so each of
+# these cases is the record's only citation.
 @pytest.mark.parametrize("change, code", [
-    (lambda r: r["evidence"].__setitem__(0, cell("BOM", 3, 2, "Invented")), "SURVEY_EVIDENCE_VALUE_CHANGED"),
-    (lambda r: r["evidence"].__setitem__(0, cell("BOM", 99, 2, "Part Number")), "SURVEY_EVIDENCE_CELL_NOT_SHOWN"),
-    (lambda r: r["evidence"].__setitem__(0, path("ASSY-555")), "SURVEY_EVIDENCE_NOT_IN_PATH"),
+    (lambda r: r.update(evidence=[cell("BOM", 3, 2, "Invented")]), "SURVEY_EVIDENCE_VALUE_CHANGED"),
+    (lambda r: r.update(evidence=[cell("BOM", 99, 2, "Part Number")]), "SURVEY_EVIDENCE_CELL_NOT_SHOWN"),
+    (lambda r: r.update(evidence=[path("ASSY-555")]), "SURVEY_EVIDENCE_NOT_IN_PATH"),
     # A whole word inside the cell may be cited ('Part' of 'Part Number'); a partial word may not.
-    (lambda r: r["evidence"].__setitem__(0, cell("BOM", 3, 2, "Numb")), "SURVEY_EVIDENCE_VALUE_CHANGED"),
+    (lambda r: r.update(evidence=[cell("BOM", 3, 2, "Numb")]), "SURVEY_EVIDENCE_VALUE_CHANGED"),
+    # A cut-short citation must start the cell; text from inside it with the mark is still refused.
+    (lambda r: r.update(evidence=[cell("BOM", 3, 2, "Number…")]), "SURVEY_EVIDENCE_VALUE_CHANGED"),
     (lambda r: r.update(evidence=[]), "SURVEY_ROLE_EVIDENCE_REQUIRED"),
     (lambda r: r.update(role="drawing"), "SURVEY_RECORD_INVALID"),
     (lambda r: r.update(assembly={"name": [], "revision": []}), "SURVEY_ASSEMBLY_INVALID"),
@@ -311,7 +315,8 @@ def test_view_bounds_cells_and_redacts_links_and_long_tokens():
     file_id = ids["long.xlsx"]
     batch = next(b for b in plan_batches(view) if file_id in b.file_ids)
     answers = {i: record(i, "other") for i in batch.file_ids}
-    answers[file_id] = record(file_id, "other", evidence=[cell("S", 1, 1, long_value[:256])])
+    # A role that needs evidence is refused when its only citation is (QQ #182 keeps 'other' files).
+    answers[file_id] = record(file_id, "bom", evidence=[cell("S", 1, 1, long_value[:256])])
     with pytest.raises(SurveyError, match="SURVEY_EVIDENCE_VALUE_CHANGED"):
         verify_batch(view, batch, {"version": "package-survey-reply.v1",
                                    "files": [answers[i] for i in batch.file_ids], "findings": []})
@@ -619,6 +624,122 @@ def test_the_call_ceiling_counts_calls_with_no_reply():
     assert survey["model_calls"] == len(sent) == 2 and waits == [2.0]
     finding = batch_failure(survey, "SURVEY_CALL_LIMIT")
     assert finding["severity"] == "blocking" and finding["attempt_failures"] == [NO_REPLY_ATTEMPT] * 2
+
+
+# --- QQ #182: a refused role citation is dropped; the file is refused only when none is left ------
+
+LONG_NOTE = "Inspect every solder joint under magnification and record the result " * 4  # 280 characters
+QC_ROWS = [["Final QC checklist"], ["Step", "Check"], [10, LONG_NOTE.strip()]]
+A062_ROWS = [["Item", "Part Number", "Qty"], [1, "P-1", 2]]          # sheet "BOM", A1 holds "Item"
+EMPTY_A1_ROWS = [[None, "Part Number", "Qty"], [None, "P-1", 2]]     # sheet "Test", A1 empty
+
+
+def one_sheet_run(sheet, rows, evidence_by_call, *, role="bom", requested=None, fail_first=False):
+    """Survey one workbook; evidence_by_call(n, file_id, view) gives call n's citations."""
+    roots = [("pkg.zip", archive({"QC.xlsx": xlsx({sheet: rows})}))]
+    view = build_view(expand_package(roots), requested)
+    sent, waits = [], []
+
+    def agent(_instructions, user_text):
+        sent.append(user_text)
+        if fail_first and len(sent) == 1:
+            raise no_reply()
+        file_id = json.JSONDecoder().raw_decode(user_text)[0]["classify"][0]
+        item = record(file_id, role, evidence=evidence_by_call(len(sent), file_id, view))
+        if requested:
+            item["requested_assembly"] = None
+        return {"version": "package-survey-reply.v2" if requested else "package-survey-reply.v1",
+                "files": [item], "findings": []}
+    from bom_processor.package_survey_run import survey_view
+    survey = survey_view(view, agent, sleep=waits.append)
+    return sent, survey, survey["files"][0]
+
+
+def codes_of(item):
+    return {finding["code"] for finding in item["findings"]}
+
+
+def shown_cell(view, file_id, row, column):
+    """The value exactly as the survey view showed it to the agent."""
+    top = dict(view.entries[file_id]["sheets"][0]["top"])
+    return dict(top[row])[column]
+
+
+@pytest.mark.parametrize("mark", ["…", "..."])
+def test_a_long_cell_cited_as_shown_with_its_mark_is_accepted_as_its_leading_text(mark):
+    def evidence(_, file_id, view):
+        shown = shown_cell(view, file_id, 3, 2)
+        assert len(shown) == 201 and shown.endswith("…")
+        return [cell("Final QC", 3, 2, shown[:-1] + mark)]
+    sent, survey, item = one_sheet_run("Final QC", QC_ROWS, evidence, role="work_instruction")
+    assert len(sent) == survey["model_calls"] == 1 and not survey["has_blocking_findings"]
+    assert item.get("classification_status") != "unclassified" and item["role"] == "work_instruction"
+    # The record keeps the source text the agent was shown, never the mark or the unseen rest.
+    assert item["evidence"] == [cell("Final QC", 3, 2, LONG_NOTE.strip()[:200].rstrip())]
+    assert "SURVEY_EVIDENCE_CITATION_REFUSED" not in codes_of(item)
+
+
+@pytest.mark.parametrize("requested", [None, "v2"])
+@pytest.mark.parametrize("sheet, rows, code", [
+    ("BOM", A062_ROWS, "SURVEY_EVIDENCE_VALUE_CHANGED"),
+    ("Test", EMPTY_A1_ROWS, "SURVEY_EVIDENCE_CELL_NOT_SHOWN"),
+])
+def test_a_sheet_name_cited_as_cell_one_is_dropped_and_the_file_keeps_its_role(sheet, rows, code, requested):
+    from test_package_requested_assemblies import REQUESTED
+    sent, survey, item = one_sheet_run(
+        sheet, rows, lambda *_: [cell(sheet, 1, 1, sheet), cell(sheet, 1, 2, "Part Number")],
+        requested=REQUESTED if requested else None)
+    assert len(sent) == survey["model_calls"] == 1 and not survey["has_blocking_findings"]
+    assert item["role"] == "bom" and item["evidence"] == [cell(sheet, 1, 2, "Part Number")]
+    assert "SURVEY_EVIDENCE_CITATION_REFUSED" in codes_of(item)
+    assert "SURVEY_LINK_CITATION_REFUSED" not in codes_of(item)
+    assert next(f for f in item["findings"] if f["code"] == "SURVEY_EVIDENCE_CITATION_REFUSED")["severity"] == "warning"
+    assert item["refused_citations"] == [{"field": "evidence", "failure_code": code, "source": "cell",
+                                          "value": sheet, "cell": {"sheet": sheet, "row": 1, "column": 1}}]
+
+
+def test_a_062_shape_a_call_with_no_reply_then_a_partly_refused_reply_completes():
+    sent, survey, item = one_sheet_run(
+        "BOM", A062_ROWS, lambda *_: [cell("BOM", 1, 1, "BOM"), cell("BOM", 1, 2, "Part Number")], fail_first=True)
+    assert len(sent) == survey["model_calls"] == 2 and not survey["has_blocking_findings"]
+    assert item["role"] == "bom" and "SURVEY_EVIDENCE_CITATION_REFUSED" in codes_of(item)
+
+
+def test_a_062_shape_a_call_with_no_reply_then_only_refused_citations_still_blocks():
+    sent, survey, item = one_sheet_run("BOM", A062_ROWS, lambda *_: [cell("BOM", 1, 1, "BOM")], fail_first=True)
+    # The lost call used no attempt; the refused reply and its one retry did.
+    assert len(sent) == survey["model_calls"] == 3 and survey["has_blocking_findings"]
+    assert item["classification_status"] == "unclassified"
+    finding = batch_failure(survey)
+    assert finding["failure_code"] == "SURVEY_EVIDENCE_VALUE_CHANGED"
+    refusal = {"failure_code": "SURVEY_EVIDENCE_VALUE_CHANGED", "file_id": item["file_id"], "field": "evidence"}
+    assert finding["attempt_failures"] == [NO_REPLY_ATTEMPT, refusal, refusal]
+    assert finding["rejected_citations"][0]["cell"] == {"sheet": "BOM", "row": 1, "column": 1}
+
+
+def test_a_record_whose_citations_are_all_refused_still_blocks():
+    sent, survey, item = one_sheet_run(
+        "Test", EMPTY_A1_ROWS, lambda *_: [cell("Test", 1, 1, "Test"), cell("Test", 1, 2, "Invented")])
+    assert len(sent) == survey["model_calls"] == 2 and survey["has_blocking_findings"]
+    assert item["classification_status"] == "unclassified"
+    # The file is refused with its first citation's own code, so the retry says what was wrong.
+    assert batch_failure(survey)["failure_code"] == "SURVEY_EVIDENCE_CELL_NOT_SHOWN"
+    assert '"failure_code":"SURVEY_EVIDENCE_CELL_NOT_SHOWN"' in sent[1]
+
+
+def test_a_record_whose_citations_are_all_refused_is_kept_when_its_role_needs_none():
+    sent, survey, item = one_sheet_run("BOM", A062_ROWS, lambda *_: [cell("BOM", 1, 1, "BOM")], role="other")
+    assert len(sent) == 1 and not survey["has_blocking_findings"]
+    assert item["role"] == "other" and item["evidence"] == []
+    assert "SURVEY_EVIDENCE_CITATION_REFUSED" in codes_of(item)
+
+
+def test_a_refused_citation_corrected_on_retry_classifies_the_file():
+    def evidence(call, *_):
+        return [cell("BOM", 1, 1, "BOM")] if call == 1 else [cell("BOM", 1, 1, "Item")]
+    sent, survey, item = one_sheet_run("BOM", A062_ROWS, evidence)
+    assert len(sent) == 2 and not survey["has_blocking_findings"] and item["role"] == "bom"
+    assert "SURVEY_EVIDENCE_CITATION_REFUSED" not in codes_of(item)
 
 
 def test_the_default_ceiling_gives_each_batch_its_own_transport_retries():
