@@ -119,6 +119,10 @@ def name_match_survey(view: SurveyView, document_hashes: set[str]) -> dict[str, 
                                  unopened))
     survey = assemble(view, records, findings, model_calls=0)
     survey["basis"] = BASIS
+    # Provenance (QQ #99): which files were examined (here, from their names alone), which were not, and why.
+    survey["examination"] = {"version": PREPASS_VERSION, "stopped_early": bool(others), "basis": BASIS,
+                             "files": [{"file_id": file_id, "status": "examined" if file_id in mapped else "not_examined",
+                                        "reason": None if file_id in mapped else "not_needed"} for file_id in view.ids]}
     survey["prepass"] = {"version": PREPASS_VERSION, "links": [
         {"file_id": file_id, "assembly_id": mapped[file_id][0]["assembly_id"], "matched_text": mapped[file_id][1],
          "file_name_revision": mapped[file_id][2]} for file_id in linked]}

@@ -479,14 +479,21 @@ def build_view(files: list[PackageFile], requested: list[dict[str, Any]] | None 
 
 
 def plan_batches(view: SurveyView, *, char_limit: int = BATCH_CHAR_LIMIT,
-                 file_limit: int = BATCH_FILE_LIMIT) -> list[SurveyBatch]:
-    """Files in path order, so folders stay together; every file is in exactly one batch."""
+                 file_limit: int = BATCH_FILE_LIMIT,
+                 file_ids: list[str] | tuple[str, ...] | None = None) -> list[SurveyBatch]:
+    """Files in path order, so folders stay together; every file is in exactly one batch.
+
+    file_ids: only these files, in this order (the ranked survey, QQ #99); none gives no batch.
+    """
     base = len(_compact({**view.header(), "classify": [], "files": []}))
     if base + FILE_CHAR_LIMIT * 2 > char_limit:
         raise SurveyError("SURVEY_BATCH_LIMIT")
+    if file_ids is not None and not file_ids:
+        return []
     groups: list[list[str]] = [[]]
     size = base
-    for file_id, entry in view.entries.items():
+    for file_id in (view.ids if file_ids is None else file_ids):
+        entry = view.entries[file_id]
         cost = len(_compact(entry)) + len(file_id) + 4
         if groups[-1] and (size + cost > char_limit or len(groups[-1]) >= file_limit):
             groups.append([])

@@ -3,17 +3,25 @@
 Inputs: package root files as (name, bytes) and a caller that sends one batch to
 the agent. Output: the survey record (package_survey_check.assemble). Files whose
 records pass are kept; only refused files are asked again, once, with their
-stable codes and survey ids. A file still refused is unclassified: a spreadsheet
-blocks (package choice retains every BOM), any other kind is a warning. Each
-attempt's codes and the refused citations are kept in the finding.
-Run python -m pytest tests/test_package_survey.py.
+stable codes and survey ids. Each attempt's codes and the refused citations are
+kept in the finding.
+Without requested assemblies (v1), a file still refused is unclassified: a
+spreadsheet blocks (package choice retains every BOM), any other kind is a warning.
+With requested assemblies (QQ #99, Nick 2026-10-14), files are surveyed most
+likely BOM first and less likely files only until every requested assembly has a
+confirmed BOM; the rest are listed as not surveyed. A file still refused is
+listed as not examined with a warning, and blocks only when the evidence says
+the BOM choice is impossible or unsafe without it (package_survey_rank.py).
+Run python -m pytest tests/test_package_survey.py tests/test_package_survey_rank.py.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .document_role import ROLES
 from .package_survey import (SPREADSHEET_KINDS, SurveyError, build_view, expand_package,
                              plan_batches, sub_batch, survey_instructions)
 from .package_survey_check import assemble, verify_batch_files
@@ -31,53 +39,212 @@ def survey_package(roots: list[tuple[str, bytes]], call: Caller, *, max_calls: i
 
 
 def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dict[str, Any]:
-    """The survey of an already built view (stage 2 reuses the same view)."""
+    """The survey of an already built view (stage 2 reuses the same view).
+
+    With requested assemblies the files are surveyed most likely BOM first and a refused file is
+    judged by package_survey_rank (QQ #99); without them every file is surveyed in path order.
+    """
+    if view.requested:
+        return _ranked_survey(view, call, max_calls=max_calls)
     batches = plan_batches(view)
-    ceiling = max_calls if max_calls is not None else len(batches) * ATTEMPTS_PER_BATCH
-    calls = 0
+    budget = _Budget(max_calls if max_calls is not None else len(batches) * ATTEMPTS_PER_BATCH)
     records: list[dict] = []
     package_findings: list[dict] = []
     for batch in batches:
-        pending = list(batch.file_ids)
-        codes: dict[str, str] = {}
-        rejected: dict[str, dict[str, Any]] = {}
-        attempts: list[dict[str, Any]] = []
-        feedback, agent_findings_kept = None, False
-        for _ in range(ATTEMPTS_PER_BATCH):
-            if calls >= ceiling:
-                codes.update({file_id: "SURVEY_CALL_LIMIT" for file_id in pending})
-                break
-            calls += 1
-            current = batch if len(pending) == len(batch.file_ids) else sub_batch(view, pending)
-            try:
-                found, findings, failed = verify_batch_files(
-                    view, current, call(survey_instructions(view), current.user_text + (feedback or "")))
-            except Exception as exc:
-                # The reply as a whole was unusable: every pending file is asked again.
-                failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
-                codes.update({file_id: failure for file_id in pending})
-                # The exception class name is code, never customer text (round 3, A036 diagnosis).
-                attempts.append({"failure_code": failure, "file_id": None,
-                                 **({} if isinstance(exc, SurveyError) else {"exception_type": type(exc).__name__})})
-                feedback = _retry_text(failure)
+        outcome = _survey_batch(view, batch, call, budget, records, package_findings)
+        package_findings.extend(_unclassified(view, records, outcome.pending, outcome.codes, outcome.attempts,
+                                              outcome.rejected))
+    return assemble(view, records, package_findings, model_calls=budget.used)
+
+
+@dataclass
+class _Budget:
+    ceiling: int
+    used: int = 0
+
+
+@dataclass
+class _Outcome:
+    """Files of one batch still refused after the retry, with each attempt's codes."""
+    pending: list[str]
+    codes: dict[str, str]
+    attempts: list[dict[str, Any]]
+    rejected: dict[str, dict[str, Any]]
+    proposed: dict[str, str] = field(default_factory=dict)
+
+
+def _survey_batch(view: Any, batch: Any, call: Caller, budget: _Budget, records: list[dict],
+                  package_findings: list[dict]) -> _Outcome:
+    """Survey one batch: records that pass are kept; only refused files are asked again, once."""
+    pending = list(batch.file_ids)
+    outcome = _Outcome(pending, {}, [], {})
+    feedback, agent_findings_kept = None, False
+    for _ in range(ATTEMPTS_PER_BATCH):
+        if budget.used >= budget.ceiling:
+            outcome.codes.update({file_id: "SURVEY_CALL_LIMIT" for file_id in pending})
+            break
+        budget.used += 1
+        current = batch if len(pending) == len(batch.file_ids) else sub_batch(view, pending)
+        try:
+            reply = call(survey_instructions(view), current.user_text + (feedback or ""))
+            found, findings, failed = verify_batch_files(view, current, reply)
+        except Exception as exc:
+            # The reply as a whole was unusable: every pending file is asked again.
+            failure = str(exc) if isinstance(exc, SurveyError) else "SURVEY_CALL_FAILED"
+            outcome.codes.update({file_id: failure for file_id in pending})
+            # The exception class name is code, never customer text (round 3, A036 diagnosis).
+            outcome.attempts.append({"failure_code": failure, "file_id": None,
+                                     **({} if isinstance(exc, SurveyError) else {"exception_type": type(exc).__name__})})
+            feedback = _retry_text(failure)
+            continue
+        records.extend(found)
+        if not agent_findings_kept:
+            # A retry repeats the package view; its package findings would be duplicates.
+            package_findings.extend(findings)
+            agent_findings_kept = True
+        for file_id, error in failed.items():
+            outcome.codes[file_id] = str(error)
+            field_name = (error.rejected or {}).get("field")
+            outcome.attempts.append({"failure_code": str(error), "file_id": file_id,
+                                     **({"field": field_name} if field_name else {})})
+            if error.rejected is not None:
+                outcome.rejected[file_id] = {"file_id": file_id, "failure_code": str(error), **error.rejected}
+        outcome.proposed.update(_proposed_roles(reply, failed))
+        pending = [file_id for file_id in batch.file_ids if file_id in failed]
+        if not pending:
+            break
+        feedback = _retry_text([{"file_id": file_id, "failure_code": outcome.codes[file_id]} for file_id in pending])
+    outcome.pending = pending
+    return outcome
+
+
+def _proposed_roles(reply: Any, failed: dict[str, Any]) -> dict[str, str]:
+    """The role the model gave each refused file: unverified, kept only as a clue (QQ #99)."""
+    roles = {}
+    for proposal in reply.get("files", []) if isinstance(reply, dict) else []:
+        if isinstance(proposal, dict) and proposal.get("file_id") in failed and proposal.get("role") in ROLES:
+            roles[proposal["file_id"]] = proposal["role"]
+    return roles
+
+
+def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None) -> dict[str, Any]:
+    """Survey likely BOM candidates first; stop once each requested assembly has a confirmed BOM (QQ #99).
+
+    Every likely candidate is surveyed, so a competing BOM for an assembly is never skipped. Less
+    likely files follow, in rank order, only while some requested assembly lacks a confirmed BOM;
+    the rest are listed as not surveyed with no model call. A file whose reading is still refused
+    after its retry is listed as not examined with a warning, unless the evidence says it could be
+    a chosen BOM or the choice is impossible without it (package_survey_rank.refusal_blocks).
+    """
+    from .package_survey_rank import RANK_VERSION, every_assembly_confirmed, rank_files, refusal_blocks
+    ranking = rank_files(view)
+    phases = [plan_batches(view, file_ids=[item["file_id"] for item in ranking if item["likely"]]),
+              plan_batches(view, file_ids=[item["file_id"] for item in ranking if not item["likely"]])]
+    budget = _Budget(max_calls if max_calls is not None
+                     else sum(len(batches) for batches in phases) * ATTEMPTS_PER_BATCH)
+    records: list[dict] = []
+    package_findings: list[dict] = []
+    refused: list[str] = []
+    codes: dict[str, str] = {}
+    attempts: list[dict[str, Any]] = []
+    rejected: dict[str, dict[str, Any]] = {}
+    proposed: dict[str, str] = {}
+    skipped: list[str] = []
+    for likely, batches in zip((True, False), phases):
+        for batch in batches:
+            if not likely and every_assembly_confirmed(view, records):
+                skipped.extend(batch.file_ids)
                 continue
-            records.extend(found)
-            if not agent_findings_kept:
-                # A retry repeats the package view; its package findings would be duplicates.
-                package_findings.extend(findings)
-                agent_findings_kept = True
-            for file_id, error in failed.items():
-                codes[file_id] = str(error)
-                field = (error.rejected or {}).get("field")
-                attempts.append({"failure_code": str(error), "file_id": file_id, **({"field": field} if field else {})})
-                if error.rejected is not None:
-                    rejected[file_id] = {"file_id": file_id, "failure_code": str(error), **error.rejected}
-            pending = [file_id for file_id in batch.file_ids if file_id in failed]
-            if not pending:
-                break
-            feedback = _retry_text([{"file_id": file_id, "failure_code": codes[file_id]} for file_id in pending])
-        package_findings.extend(_unclassified(view, records, pending, codes, attempts, rejected))
-    return assemble(view, records, package_findings, model_calls=calls)
+            outcome = _survey_batch(view, batch, call, budget, records, package_findings)
+            if not outcome.pending:
+                continue
+            refused.extend(outcome.pending)
+            codes.update(outcome.codes)
+            attempts.extend(item for item in outcome.attempts
+                            if item["file_id"] is None or item["file_id"] in outcome.pending)
+            rejected.update({key: value for key, value in outcome.rejected.items() if key in outcome.pending})
+            proposed.update({key: value for key, value in outcome.proposed.items() if key in outcome.pending})
+    blocks = refusal_blocks(view, ranking, records, refused, proposed)
+    package_findings.extend(_refused_findings(view, records, blocks, codes, attempts, rejected))
+    if skipped:
+        package_findings.append(_not_surveyed(view, records, skipped))
+    survey = assemble(view, records, package_findings, model_calls=budget.used)
+    reasons = {file_id: "not_needed" for file_id in skipped}
+    reasons.update({file_id: "call_limit" if codes[file_id] == "SURVEY_CALL_LIMIT" else "evidence_refused"
+                    for file_id in refused})
+    survey["examination"] = {
+        "version": RANK_VERSION, "stopped_early": bool(skipped),
+        "files": [{**item, "status": "not_examined" if item["file_id"] in reasons else "examined",
+                   "reason": reasons.get(item["file_id"]),
+                   **({"blocks": blocks[item["file_id"]]} if item["file_id"] in blocks else {})}
+                  for item in ranking]}
+    return survey
+
+
+NOT_EXAMINED = "not_examined"
+NOT_SURVEYED = "not_surveyed"
+
+
+def _base_record(view: Any, file_id: str) -> dict[str, Any]:
+    item, entry = view.files[file_id], view.entries[file_id]
+    return {"file_id": file_id, "path": item.path, "chain": list(item.chain), "sha256": item.sha256,
+            "size_bytes": item.size_bytes, "kind": entry["kind"], "assembly": None, "assembly_evidence": None,
+            "possibly_shared": False, "evidence": [], "requested_assembly": None, "refused_citations": []}
+
+
+def _refused_findings(view: Any, records: list[dict], blocks: dict[str, str | None], codes: dict[str, str],
+                      attempts: list[dict], rejected: dict[str, dict]) -> list[dict]:
+    """Findings and records for files still refused after the retry, judged by refusal_blocks.
+
+    A blocking file stops the package (PACKAGE_SURVEY_INCOMPLETE) as before; any other is listed as
+    not examined with a warning that names it, and BOM choice goes ahead without it.
+    """
+    blocked = [file_id for file_id, reason in blocks.items() if reason is not None]
+    groups = [("SURVEY_CALL_LIMIT", [file_id for file_id in blocked if codes[file_id] == "SURVEY_CALL_LIMIT"]),
+              ("SURVEY_BATCH_FAILED", [file_id for file_id in blocked if codes[file_id] != "SURVEY_CALL_LIMIT"]),
+              ("SURVEY_FILES_UNCLASSIFIED", [file_id for file_id, reason in blocks.items() if reason is None])]
+    findings = []
+    for code, group in groups:
+        if not group:
+            continue
+        group = sorted(group, key=lambda value: int(value[1:]))
+        blocking = code != "SURVEY_FILES_UNCLASSIFIED"
+        rationale = ("These files could not be classified, and one of them could be a requested assembly's BOM "
+                     "or the BOM choice is impossible without them; every BOM is retained for review."
+                     if blocking else
+                     "The survey could not verify a reading of these files after its retry. They are listed as not "
+                     "examined; none could be a chosen BOM for a requested assembly, so BOM choice went ahead.")
+        finding = {"code": code, "severity": "blocking" if blocking else "warning", "raised_by": "code",
+                   "rationale": rationale, "file_ids": group, "failure_code": codes[group[0]],
+                   "attempt_failures": [item for item in attempts if item["file_id"] is None or item["file_id"] in group],
+                   "rejected_citations": [rejected[file_id] for file_id in group if file_id in rejected]}
+        if blocking:
+            finding["block_reasons"] = {file_id: blocks[file_id] for file_id in group}
+        findings.append(finding)
+        for file_id in group:
+            if blocking:
+                records.append({**_base_record(view, file_id), "role": "other", "classification_status": "unclassified",
+                                "rationale": rationale, "findings": [finding]})
+            else:
+                records.append({**_base_record(view, file_id), "role": NOT_EXAMINED,
+                                "classification_status": NOT_EXAMINED,
+                                "not_examined_reason": "call_limit" if codes[file_id] == "SURVEY_CALL_LIMIT"
+                                else "evidence_refused",
+                                "rationale": rationale, "findings": [finding]})
+    return findings
+
+
+def _not_surveyed(view: Any, records: list[dict], skipped: list[str]) -> dict[str, Any]:
+    """Records and the finding for less likely files left unsurveyed once every assembly was confirmed."""
+    rationale = ("Not needed for BOM choice: every requested assembly already has a confirmed BOM among the "
+                 "more likely files, so this less likely file was listed but not surveyed.")
+    for file_id in skipped:
+        records.append({**_base_record(view, file_id), "role": NOT_SURVEYED, "classification_status": NOT_SURVEYED,
+                        "not_examined_reason": "not_needed", "rationale": rationale, "findings": []})
+    return {"code": "SURVEY_FILES_NOT_SURVEYED", "severity": "information", "raised_by": "code",
+            "rationale": "Every requested assembly has a confirmed BOM among the more likely files; these less "
+                         "likely files are listed and were not surveyed.",
+            "file_ids": sorted(skipped, key=lambda value: int(value[1:]))}
 
 
 def _unclassified(view: Any, records: list[dict], pending: list[str], codes: dict[str, str],
