@@ -158,7 +158,7 @@ REFERENCE_DESIGNATORS_MAX = 20_000
 
 
 def _js_text(value):
-    """A numeric cell as JavaScript String(number) spells it; other values unchanged."""
+    """A numeric revision as JavaScript String(number) spells it; other values unchanged."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
     if isinstance(value, float) and value.is_integer() and abs(value) < 1e21:
@@ -214,10 +214,10 @@ def read_occurrences(assemblies: list[dict], workbooks: dict[str, bytes], *,
                             "WORKBOOK_CELL_INVALID")
                     require(not any(isinstance(value, (bool, date, datetime, time)) for value in values),
                             "WORKBOOK_CELL_INVALID")
-                    # Numeric text cells (for example revision 1) read as QuickQuote reads them:
-                    # String(number). line_number and quantity keep their own checks.
-                    row = {key: _js_text(value) if key not in {"line_number", "quantity"} else value
-                           for key, value in zip(columns, values)}
+                    # A numeric revision cell (canonical BOMs carry revision 1) is read as QuickQuote
+                    # reads it: String(number). Every other text column stays strictly text.
+                    row = dict(zip(columns, values))
+                    row["revision"] = _js_text(row["revision"])
                     line += 1
                     require(type(row["line_number"]) in {int, float}
                             and row["line_number"] == line, "WORKBOOK_LINE_NUMBER")
