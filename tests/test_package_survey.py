@@ -504,3 +504,129 @@ def test_a_path_citation_of_a_long_file_name_is_accepted():
     result = survey_package(roots, agent)
     assert result["model_calls"] == 1 and not result["has_blocking_findings"]
     assert not any(f.get("classification_status") == "unclassified" for f in result["files"])
+
+
+# --- QQ #182: a call with no reply does not use up a classification attempt -----------------------
+
+class ServiceDown(Exception):
+    """Stands in for the model client's wrapper (ChatClientException) around the HTTP error."""
+
+
+class HttpError(Exception):
+    status_code = 503
+
+
+def no_reply():
+    exc = ServiceDown("private transport detail")
+    exc.__cause__ = HttpError("private transport detail")
+    return exc
+
+
+NO_REPLY_ATTEMPT = {"failure_code": "SURVEY_CALL_FAILED", "file_id": None, "exception_type": "ServiceDown",
+                    "cause_type": "HttpError", "status_code": 503}
+
+
+def scripted_run(script, *, max_calls=None, roots=None):
+    """script[n] decides call n (from 1): an exception is raised, 'refuse' cites a changed cell for the
+    ASSY-200 BOM, anything else answers correctly. Returns the BOM id, requests sent, waits and survey."""
+    roots = roots or a030_like()
+    view = build_view(expand_package(roots))
+    target = by_name(view).get("ASSY-200 BOM.xlsx")
+    agent = StubAgent(a030_answers(view)) if target else None
+    sent, waits = [], []
+
+    def call(instructions, user_text):
+        sent.append(user_text)
+        step = script(len(sent)) if callable(script) else script.get(len(sent))
+        if isinstance(step, BaseException):
+            raise step
+        reply = agent(instructions, user_text)
+        if step == "refuse":
+            for item in reply["files"]:
+                if item["file_id"] == target:
+                    item["evidence"] = [cell("BOM", 1, 2, "private-response-value")]
+        return reply
+    survey = survey_package(roots, call, max_calls=max_calls, sleep=waits.append)
+    return target, sent, waits, survey
+
+
+def batch_failure(survey, code="SURVEY_BATCH_FAILED"):
+    return next(f for f in survey["findings"] if f["code"] == code)
+
+
+def test_a_call_with_no_reply_is_sent_again_without_using_an_attempt():
+    _, sent, waits, survey = scripted_run({1: no_reply()})
+    assert survey["model_calls"] == len(sent) == 2 and waits == [2.0]
+    # The model never saw the first request, so the same request is sent again with no feedback.
+    assert sent[1] == sent[0] and "previous_reply_rejected" not in sent[1]
+    assert not survey["has_blocking_findings"]
+    assert not any(f.get("classification_status") == "unclassified" for f in survey["files"])
+
+
+def test_two_calls_with_no_reply_then_a_reply_complete_within_the_cap():
+    _, sent, waits, survey = scripted_run({1: no_reply(), 2: no_reply()})
+    assert survey["model_calls"] == len(sent) == 3 and waits == [2.0, 8.0]
+    assert not survey["has_blocking_findings"] and len(survey["files"]) == 8
+
+
+def test_calls_with_no_reply_past_the_transport_retries_fail_with_the_existing_codes():
+    _, sent, waits, survey = scripted_run(lambda _: no_reply())
+    # Two transport retries, then the batch's two attempts; nothing further is sent.
+    assert survey["model_calls"] == len(sent) == 4 and waits == [2.0, 8.0, 8.0]
+    assert all(text == sent[0] for text in sent)
+    finding = batch_failure(survey)
+    assert finding["severity"] == "blocking" and finding["failure_code"] == "SURVEY_CALL_FAILED"
+    # Each failed call is recorded with class names and the HTTP status only, never the message.
+    assert finding["attempt_failures"] == [NO_REPLY_ATTEMPT] * 4
+    assert "private transport detail" not in json.dumps(survey)
+
+
+def test_a_refused_citation_still_gets_exactly_one_retry_around_a_call_with_no_reply():
+    bom, sent, waits, survey = scripted_run({1: "refuse", 2: no_reply(), 3: "refuse"})
+    assert survey["model_calls"] == len(sent) == 3 and waits == [2.0]
+    # The retry after the lost call still carries the refusal; only the refused file is asked again.
+    assert sent[2] == sent[1] and '"failure_code":"SURVEY_EVIDENCE_VALUE_CHANGED"' in sent[1]
+    assert json.JSONDecoder().raw_decode(sent[1])[0]["classify"] == [bom]
+    finding = batch_failure(survey)
+    assert finding["file_ids"] == [bom] and finding["failure_code"] == "SURVEY_EVIDENCE_VALUE_CHANGED"
+    refusal = {"failure_code": "SURVEY_EVIDENCE_VALUE_CHANGED", "file_id": bom, "field": "evidence"}
+    assert finding["attempt_failures"] == [refusal, NO_REPLY_ATTEMPT, refusal]
+    assert "private-response-value" not in sent[1]
+
+
+def test_a_refused_citation_corrected_after_a_call_with_no_reply_completes():
+    _, sent, _, survey = scripted_run({1: "refuse", 2: no_reply()})
+    assert survey["model_calls"] == 3 and not survey["has_blocking_findings"]
+
+
+def test_two_refused_replies_still_fail_without_waiting():
+    bom, sent, waits, survey = scripted_run({1: "refuse", 2: "refuse"})
+    assert survey["model_calls"] == len(sent) == 2 and waits == []
+    assert batch_failure(survey)["failure_code"] == "SURVEY_EVIDENCE_VALUE_CHANGED"
+
+
+def test_a_reply_that_cannot_be_read_still_uses_an_attempt():
+    _, sent, waits, survey = scripted_run(lambda _: SurveyError("SURVEY_REPLY_TRUNCATED"))
+    assert survey["model_calls"] == len(sent) == 2 and waits == []
+    finding = batch_failure(survey)
+    assert finding["failure_code"] == "SURVEY_REPLY_TRUNCATED"
+    assert finding["attempt_failures"] == [{"failure_code": "SURVEY_REPLY_TRUNCATED", "file_id": None}] * 2
+
+
+def test_the_call_ceiling_counts_calls_with_no_reply():
+    _, sent, waits, survey = scripted_run(lambda _: no_reply(), max_calls=2)
+    # No wait is spent before a call the ceiling will not allow.
+    assert survey["model_calls"] == len(sent) == 2 and waits == [2.0]
+    finding = batch_failure(survey, "SURVEY_CALL_LIMIT")
+    assert finding["severity"] == "blocking" and finding["attempt_failures"] == [NO_REPLY_ATTEMPT] * 2
+
+
+def test_the_default_ceiling_gives_each_batch_its_own_transport_retries():
+    rows = [["Header", "Value"]] + [[f"row {index}", "x" * 150] for index in range(1, 20)]
+    members = {f"folder{index // 10}/sheet{index}.xlsx": xlsx({"S": rows}) for index in range(30)}
+    roots = [("big.zip", archive(members))]
+    batches = plan_batches(build_view(expand_package(roots)))
+    assert len(batches) > 1
+    _, sent, _, survey = scripted_run(lambda _: no_reply(), roots=roots)
+    assert survey["model_calls"] == len(sent) == 4 * len(batches)
+    assert {f["code"] for f in survey["findings"] if f["raised_by"] == "code"} == {"SURVEY_BATCH_FAILED"}

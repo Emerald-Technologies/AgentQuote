@@ -143,11 +143,12 @@ def test_one_assembly_choice_failure_keeps_its_boms_and_other_choice_succeeds():
 
 
 @pytest.mark.parametrize("transport", [False, True])
-def test_an_incomplete_survey_stops_for_a_person_before_any_parser_runs(transport):
+def test_an_incomplete_survey_stops_for_a_person_before_any_parser_runs(transport, monkeypatch):
     # Round 7 (Nick 2026-10-11): an unclassified spreadsheet could be any assembly's BOM; the choice
     # stops (PACKAGE_SURVEY_INCOMPLETE) instead of parsing every BOM on an unknown basis.
     from bom_processor.bom_package_choice import PackageChoicePendingError
     from choice_job import _summary
+    monkeypatch.setattr("bom_processor.package_survey_run.TRANSPORT_RETRY_DELAYS", (0.0, 0.0))
     calls = []
 
     def call(instructions, text):
@@ -158,7 +159,9 @@ def test_an_incomplete_survey_stops_for_a_person_before_any_parser_runs(transpor
         return {}
 
     storage, service, request, done = completed_service(call)
-    assert done["status"] == "failed" and done["code"] == "PACKAGE_SURVEY_INCOMPLETE" and len(calls) == 2
+    # A call with no reply is retried twice before it uses up an attempt (QQ #182).
+    assert done["status"] == "failed" and done["code"] == "PACKAGE_SURVEY_INCOMPLETE"
+    assert len(calls) == (4 if transport else 2)
     # The survey stays with the failure for diagnosis; the log line carries codes and ids only.
     finding = next(item for item in done["survey"]["findings"] if item["code"] == "SURVEY_BATCH_FAILED")
     assert finding["severity"] == "blocking"
