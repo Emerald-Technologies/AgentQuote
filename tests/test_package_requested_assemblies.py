@@ -335,9 +335,12 @@ def test_a_failed_call_records_its_exception_type_and_a_cut_off_reply_is_named()
     def down(_instructions, _text):
         raise TimeoutError("private transport detail")
 
-    survey = survey_view(build_view(expand_package([("package.zip", PACKAGE)]), REQUESTED), down)
+    waits = []
+    survey = survey_view(build_view(expand_package([("package.zip", PACKAGE)]), REQUESTED), down, sleep=waits.append)
     attempts = next(item for item in survey["findings"] if item["code"] == "SURVEY_BATCH_FAILED")["attempt_failures"]
-    assert attempts == [{"failure_code": "SURVEY_CALL_FAILED", "file_id": None, "exception_type": "TimeoutError"}] * 2
+    # Two transport retries (QQ #182), then the two attempts; every failed call is recorded.
+    assert attempts == [{"failure_code": "SURVEY_CALL_FAILED", "file_id": None, "exception_type": "TimeoutError"}] * 4
+    assert survey["model_calls"] == 4 and waits == [2.0, 8.0, 8.0]
     assert "private transport detail" not in json.dumps(survey)
 
 
