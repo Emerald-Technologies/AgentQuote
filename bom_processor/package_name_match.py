@@ -10,7 +10,8 @@ before any model call, and only when the clue is unambiguous:
 - no root spreadsheet names two requested assemblies, or none of them;
 - a revision written in the file name (its REV marker) does not contradict the requested one;
 - every such file is one of the request's BOM documents, with bytes unlike the others;
-- every root spreadsheet could be read.
+- every root spreadsheet could be read; an empty or header-only one is passed over (it has no
+  parts, QQ #99 D5) and listed as not surveyed.
 Archives are never searched, even one that could not be opened (A058: two PCB archives hit the
 expansion limit): a loose spreadsheet naming the assembly is the shallower, stronger clue.
 
@@ -24,7 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 from .assembly_core import find_assembly, revision_contradicts
-from .package_survey import SPREADSHEET_KINDS, SurveyView
+from .package_survey import SPREADSHEET_KINDS, SurveyView, nothing_to_read
 from .package_survey_check import assemble, cited_revision
 
 PREPASS_VERSION = "package-name-match.v1"
@@ -52,6 +53,8 @@ def _mapping(view: SurveyView, document_hashes: set[str]) -> dict[str, tuple[dic
             continue
         if entry["kind"] not in SPREADSHEET_KINDS or entry.get("unreadable"):
             return None
+        if nothing_to_read(view, file_id):
+            continue  # No parts to read: never the BOM, and no reason to stop the pre-pass (D5).
         named = [(item, found) for item in view.requested
                  for found in [find_assembly(item["part_number"], name)] if found is not None]
         if len(named) != 1:
@@ -119,6 +122,10 @@ def name_match_survey(view: SurveyView, document_hashes: set[str]) -> dict[str, 
                                  unopened))
     survey = assemble(view, records, findings, model_calls=0)
     survey["basis"] = BASIS
+    # Provenance (QQ #99): which files were examined (here, from their names alone), which were not, and why.
+    survey["examination"] = {"version": PREPASS_VERSION, "stopped_early": bool(others), "basis": BASIS,
+                             "files": [{"file_id": file_id, "status": "examined" if file_id in mapped else "not_examined",
+                                        "reason": None if file_id in mapped else "not_needed"} for file_id in view.ids]}
     survey["prepass"] = {"version": PREPASS_VERSION, "links": [
         {"file_id": file_id, "assembly_id": mapped[file_id][0]["assembly_id"], "matched_text": mapped[file_id][1],
          "file_name_revision": mapped[file_id][2]} for file_id in linked]}

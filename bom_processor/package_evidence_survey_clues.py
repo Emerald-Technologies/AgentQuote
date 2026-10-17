@@ -56,8 +56,9 @@ def match_clues(inventory: list[dict], names: dict[str, str], survey_files: list
     clues = {}
     for item in inventory:
         record = by_path.get(_inventory_path(item, names))
-        # A file the name-match pre-pass did not survey (QQ #99) carries no reading, so no clue.
-        if not record or record.get("sha256") != _leaf_sha(item) or record.get("classification_status") == "not_surveyed":
+        # A file not surveyed or not examined (QQ #99) carries no reading, so no clue.
+        if (not record or record.get("sha256") != _leaf_sha(item)
+                or record.get("classification_status") in ("not_surveyed", "not_examined")):
             continue
         requested = record.get("requested_assembly") or {}
         assembly = requested.get("assembly_id")

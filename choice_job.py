@@ -25,6 +25,13 @@ def _summary(state: dict) -> dict:
                 if item.get("code") in ("SURVEY_BATCH_FAILED", "SURVEY_CALL_LIMIT", "SURVEY_FILES_UNCLASSIFIED")]
     if failures:
         line["survey_failures"] = failures
+    examination = survey.get("examination")
+    if isinstance(examination, dict) and isinstance(examination.get("files"), list):
+        # QQ #99: counts and survey ids only; why each file was not examined stays in the stored result.
+        skipped = [item for item in examination["files"] if item.get("status") == "not_examined"]
+        line["examination"] = {"examined": len(examination["files"]) - len(skipped), "not_examined": len(skipped),
+                               "stopped_early": bool(examination.get("stopped_early")),
+                               "blocking_file_ids": [item["file_id"] for item in skipped if item.get("blocks")]}
     return line
 
 

@@ -373,6 +373,28 @@ def read_top_rows(kind: str, data: bytes, *, max_row: int | None = TOP_ROWS,
     raise _Unreadable("NOT_A_SPREADSHEET")
 
 
+def nothing_to_read(view: SurveyView, file_id: str) -> bool:
+    """Whether a readable spreadsheet is empty or header-only: no sheet has a second row with a value.
+
+    Such a file has no parts to read, so it is never a BOM candidate and never fails the package
+    (QQ #99 D5, Nick 2026-10-17). Decided from the whole file, not only the shown top rows: the
+    view is a cheap first check, then the file is read again in full with a ceiling of one full row
+    per sheet, so a file with more than that is never called empty.
+    """
+    entry = view.entries[file_id]
+    if entry["kind"] not in SPREADSHEET_KINDS or entry.get("unreadable"):
+        return False
+    shown = entry.get("sheets", [])
+    if any(len(sheet["top"]) > 1 for sheet in shown):
+        return False
+    try:
+        sheets, _ = read_top_rows(entry["kind"], view.files[file_id].data, max_row=None,
+                                  cell_limit=MAX_COLUMNS * max(len(shown), 1))
+    except _Unreadable:
+        return False
+    return all(len({row for row, _ in sheet.cells}) <= 1 for sheet in sheets)
+
+
 def _shown_value(value: Any) -> Any:
     if not isinstance(value, str):
         return value
@@ -479,14 +501,21 @@ def build_view(files: list[PackageFile], requested: list[dict[str, Any]] | None 
 
 
 def plan_batches(view: SurveyView, *, char_limit: int = BATCH_CHAR_LIMIT,
-                 file_limit: int = BATCH_FILE_LIMIT) -> list[SurveyBatch]:
-    """Files in path order, so folders stay together; every file is in exactly one batch."""
+                 file_limit: int = BATCH_FILE_LIMIT,
+                 file_ids: list[str] | tuple[str, ...] | None = None) -> list[SurveyBatch]:
+    """Files in path order, so folders stay together; every file is in exactly one batch.
+
+    file_ids: only these files, in this order (the ranked survey, QQ #99); none gives no batch.
+    """
     base = len(_compact({**view.header(), "classify": [], "files": []}))
     if base + FILE_CHAR_LIMIT * 2 > char_limit:
         raise SurveyError("SURVEY_BATCH_LIMIT")
+    if file_ids is not None and not file_ids:
+        return []
     groups: list[list[str]] = [[]]
     size = base
-    for file_id, entry in view.entries.items():
+    for file_id in (view.ids if file_ids is None else file_ids):
+        entry = view.entries[file_id]
         cost = len(_compact(entry)) + len(file_id) + 4
         if groups[-1] and (size + cost > char_limit or len(groups[-1]) >= file_limit):
             groups.append([])
