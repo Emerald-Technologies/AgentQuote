@@ -325,6 +325,16 @@ def finish(prepared: dict, hints, classifications, manufacturing, *, review_inpu
                      "rationale": "Archive not unpacked: the package is over the 500 MB evidence size limit, so its "
                                   "contents were not checked. Open it and map it by hand.", "citations": []}
                     for item in dispositions]
+    # Known-unused files (QuickQuote #134) carry their reason code as category only while they are
+    # not needed; a file the producer still links keeps a plain format category.
+    from .package_file_relevance import is_not_used
+    states = {item["evidenceId"]: item["state"] for item in dispositions}
+    for item in inventory:
+        if is_not_used(item["category"]):
+            if states[item["evidenceId"]] == "unrelated":
+                categories[item["evidenceId"]] = item["category"]
+            elif is_not_used(categories.get(item["evidenceId"], item["category"])):
+                categories[item["evidenceId"]] = item["format"]
     body = {"version": "package-evidence-graph.v1",
             **{key: context[key] for key in CHECKPOINT_FIELDS},
             "parentProposalSha256": context.get("predecessorProposalSha256"),

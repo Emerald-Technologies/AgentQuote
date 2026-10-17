@@ -105,13 +105,20 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
     from .package_survey import build_view, expand_package
     from .package_survey_run import survey_view
 
+    from .package_survey_relevance import empty_survey, known_unused, with_not_used, without
+
     linked = "requested_assemblies" in request
     view = build_view(expand_package(roots), request.get("requested_assemblies"))
+    # QQ #134 (Nick 2026-10-17): known-unused files (ODB++, design source, 3D models, duplicate CAD
+    # drawings, viewer files) are listed as not used with their reason and never sent to the model.
+    unused, unused_findings = known_unused(view)
+    remaining = without(view, unused) if unused else view
     # QQ #99 (Nick 2026-10-14): when each requested assembly is plainly named by one top-level
     # spreadsheet, map those from their names and skip the model survey; otherwise survey as before.
-    survey = name_match_survey(view, {item["sha256"] for item in request["documents"]}) if linked else None
+    survey = name_match_survey(remaining, {item["sha256"] for item in request["documents"]}) if linked else None
     if survey is None:
-        survey = survey_view(view, call)
+        survey = survey_view(remaining, call) if remaining.entries else empty_survey(remaining)
+    survey = with_not_used(view, survey, unused, unused_findings)
     calls = survey["model_calls"]
     choices = []
     failed_files = set()

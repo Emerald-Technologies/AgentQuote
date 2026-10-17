@@ -1439,6 +1439,9 @@ def package_file_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
         link = record.get("requested_assembly")
         if document is None:
             decision, reason = "not_parsed", "not_staged" if record["role"] == "bom" else record["role"]
+            # QQ #134: a known-unused file shows its reason code (not_used_odbpp, ...) and counts as classified.
+            if record.get("not_used"):
+                reason = record["not_used"]["reason_code"]
         elif document["decision"] == "excluded":
             decision, reason = "excluded", document["reason"]
         else:
@@ -1448,6 +1451,7 @@ def package_file_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
                      "role": record["role"],
                      # A file the name-match pre-pass listed but did not survey reads as unclassified (QQ #99).
                      "classification_status": "unclassified" if record.get("classification_status") == "not_surveyed"
+                     else "classified" if record.get("classification_status") == "not_used"
                      else record.get("classification_status", "classified"),
                      "requested_assembly_id": None if link is None else link["assembly_id"],
                      "link": "none" if link is None else link["link"],

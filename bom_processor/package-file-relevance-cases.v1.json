@@ -1,0 +1,131 @@
+{
+  "version": "package-file-relevance-cases.v1",
+  "about": "Shared cases for package_file_relevance.py (QuickQuote and AgentQuote) and package-file-relevance.ts (QuickQuote). Each path is the uploaded file name, then the path inside each archive, joined by '/'. disregarded lists every path expected to be marked, with its reason code; every other path must stay in use. findings lists code, scope and count.",
+  "cases": [
+    {
+      "name": "ODB++ folder next to Gerbers in a board archive",
+      "paths": ["Board-1.zip/Gerber/top.gtl", "Board-1.zip/Gerber/drill.drl", "Board-1.zip/ODB/matrix/matrix",
+        "Board-1.zip/ODB/steps/pcb/layers/top/features", "Board-1.zip/Fab drawing.pdf"],
+      "disregarded": {"Board-1.zip/ODB/matrix/matrix": "not_used_odbpp",
+        "Board-1.zip/ODB/steps/pcb/layers/top/features": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "ODB++ that is the board's only fab data is kept with a warning",
+      "paths": ["Board-2.zip/odb++/matrix/matrix", "Board-2.zip/odb++/steps/pcb/layers/top/features",
+        "Board-2.zip/Assembly drawing.pdf"],
+      "disregarded": {},
+      "findings": [{"code": "ONLY_FAB_DATA_KEPT", "scope": "Board-2.zip", "count": 2}]
+    },
+    {
+      "name": "ODB++ job recognised by its structure, no ODB in its name",
+      "paths": ["Board-3.zip/job1/matrix/matrix", "Board-3.zip/job1/misc/info", "Board-3.zip/job1/steps/pcb/layers/bot/features",
+        "Board-3.zip/gerbers/bottom.gbl"],
+      "disregarded": {"Board-3.zip/job1/matrix/matrix": "not_used_odbpp", "Board-3.zip/job1/misc/info": "not_used_odbpp",
+        "Board-3.zip/job1/steps/pcb/layers/bot/features": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "Nested archive named exactly ODB next to a drill file",
+      "paths": ["Board-4.zip/ODB.tgz", "Board-4.zip/NC Drill/board.xln", "Board-4.zip/Board-4.G1"],
+      "disregarded": {"Board-4.zip/ODB.tgz": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "Design source from Altium, KiCad and Eagle",
+      "paths": ["Board-5.zip/Altium/Board.PcbDoc", "Board-5.zip/Altium/Board.SchDoc", "Board-5.zip/Altium/Board.PrjPcb",
+        "Board-5.zip/KiCad/board.kicad_pcb", "Board-5.zip/Eagle/board.brd", "Board-5.zip/Eagle/board.sch",
+        "Board-5.zip/Gerber/board.gbr"],
+      "disregarded": {"Board-5.zip/Altium/Board.PcbDoc": "not_used_design_source",
+        "Board-5.zip/Altium/Board.SchDoc": "not_used_design_source", "Board-5.zip/Altium/Board.PrjPcb": "not_used_design_source",
+        "Board-5.zip/KiCad/board.kicad_pcb": "not_used_design_source", "Board-5.zip/Eagle/board.brd": "not_used_design_source",
+        "Board-5.zip/Eagle/board.sch": "not_used_design_source"},
+      "findings": []
+    },
+    {
+      "name": "3D models",
+      "paths": ["Mech.zip/housing.STEP", "Mech.zip/board.stp", "Mech.zip/old.igs", "Mech.zip/part.x_t", "Mech.zip/view.wrl"],
+      "disregarded": {"Mech.zip/housing.STEP": "not_used_3d_model", "Mech.zip/board.stp": "not_used_3d_model",
+        "Mech.zip/old.igs": "not_used_3d_model", "Mech.zip/part.x_t": "not_used_3d_model", "Mech.zip/view.wrl": "not_used_3d_model"},
+      "findings": []
+    },
+    {
+      "name": "CAD drawings: duplicates of a PDF are not used; one with no PDF is kept",
+      "paths": ["Board-6.zip/Drawings/fab.dxf", "Board-6.zip/Drawings/fab.pdf", "Board-6.zip/DWG/outline.dwg",
+        "Board-6.zip/DWG/assembly.dwg", "Other.zip/Mech/DXF/panel.dxf", "Loose panel.pdf"],
+      "disregarded": {"Board-6.zip/Drawings/fab.dxf": "not_used_cad_drawing", "Board-6.zip/DWG/outline.dwg": "not_used_cad_drawing",
+        "Board-6.zip/DWG/assembly.dwg": "not_used_cad_drawing"},
+      "findings": [{"code": "CAD_DRAWING_KEPT", "scope": "Other.zip/Mech", "count": 1}]
+    },
+    {
+      "name": "A CAD drawing with a same-named PDF elsewhere in the package is a duplicate",
+      "paths": ["Drawings.zip/DXF/sub/12345-01 fab.dxf", "Pdfs.zip/12345-01 FAB.pdf"],
+      "disregarded": {"Drawings.zip/DXF/sub/12345-01 fab.dxf": "not_used_cad_drawing"},
+      "findings": []
+    },
+    {
+      "name": "Viewer files",
+      "paths": ["Board-7.zip/viewer/board.cvg", "Board-7.zip/Gerber/top.gtl"],
+      "disregarded": {"Board-7.zip/viewer/board.cvg": "not_used_viewer"},
+      "findings": []
+    },
+    {
+      "name": "Spreadsheets and PDFs are never disregarded, even inside ODB++ or design folders",
+      "paths": ["Board-8.zip/ODB/bom.xlsx", "Board-8.zip/ODB/readme.pdf", "Board-8.zip/ODB/matrix/matrix",
+        "Board-8.zip/Altium/BOM.csv", "Board-8.zip/Gerber/top.gtl"],
+      "disregarded": {"Board-8.zip/ODB/matrix/matrix": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "Two boards in one archive: only the board without Gerbers keeps its ODB++",
+      "paths": ["Boards.zip/Board1/Gerber/top.gtl", "Boards.zip/Board1/ODB/matrix/matrix", "Boards.zip/Board2/ODB/matrix/matrix",
+        "Boards.zip/Board2/ODB/steps/pcb/layers/top/features"],
+      "disregarded": {"Boards.zip/Board1/ODB/matrix/matrix": "not_used_odbpp"},
+      "findings": [{"code": "ONLY_FAB_DATA_KEPT", "scope": "Boards.zip/Board2", "count": 2}]
+    },
+    {
+      "name": "A loose ODB++ archive is not used when the package has Gerbers",
+      "paths": ["ODB++.tgz", "Board-9 Gerbers.zip", "Board-9 Gerbers.zip/top.gtl", "BOM 0100-9.xlsx"],
+      "disregarded": {"ODB++.tgz": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "A loose ODB++ archive with no Gerbers anywhere is kept",
+      "paths": ["Board-10_odb.zip", "Board-10_odb.zip/matrix/matrix", "BOM 0100-10.xlsx"],
+      "disregarded": {},
+      "findings": [{"code": "ONLY_FAB_DATA_KEPT", "scope": "", "count": 2}]
+    },
+    {
+      "name": "Names that only contain the letters odb are not ODB++",
+      "paths": ["Board-11.zip/Kodbase/notes.txt", "Board-11.zip/odbc-driver.txt", "Board-11.zip/Gerber/top.gtl"],
+      "disregarded": {},
+      "findings": []
+    },
+    {
+      "name": "An upload whose name contains ODB but holds only Gerbers and drill files",
+      "paths": ["Board ODB and Gerbers.zip", "Board ODB and Gerbers.zip/Gerber/top.gtl", "Board ODB and Gerbers.zip/Drill/board.drl"],
+      "disregarded": {},
+      "findings": []
+    },
+    {
+      "name": "An archive whose name only contains ODB is not ODB++ without its structure",
+      "paths": ["Board-13.zip/Board-13_ODB.tgz", "Board-13.zip/Gerber/top.gtl"],
+      "disregarded": {},
+      "findings": []
+    },
+    {
+      "name": "An ODB++ job at an archive root next to Gerbers: only the job's own folders are ODB++",
+      "paths": ["Board-12.zip", "Board-12.zip/matrix/matrix", "Board-12.zip/misc/info", "Board-12.zip/steps/pcb/layers/top/features",
+        "Board-12.zip/Gerber/top.gtl"],
+      "disregarded": {"Board-12.zip/matrix/matrix": "not_used_odbpp", "Board-12.zip/misc/info": "not_used_odbpp",
+        "Board-12.zip/steps/pcb/layers/top/features": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "An ODB++ job recognised by misc/info",
+      "paths": ["Board-14.zip/job/misc/info", "Board-14.zip/job/fonts/standard", "Board-14.zip/top.gbr"],
+      "disregarded": {"Board-14.zip/job/misc/info": "not_used_odbpp", "Board-14.zip/job/fonts/standard": "not_used_odbpp"},
+      "findings": []
+    }
+  ]
+}

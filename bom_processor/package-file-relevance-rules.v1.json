@@ -1,0 +1,50 @@
+{
+  "version": "package-file-relevance-rules.v1",
+  "about": "Known-unused package files (QuickQuote #134, #99 unit 3). Reviewed data, not code: change it by pull request in both repositories, byte for byte. Clues, not rules: a file marked here is listed as not used with its reason and a person can bring it back. Patterns are lower-case, ASCII-only regular expressions that read the same in Python and JavaScript.",
+  "neverDisregardExtensions": [".pdf", ".xls", ".xlsx", ".xlsm", ".csv"],
+  "archiveExtensions": [".zip", ".tgz", ".tar", ".gz", ".7z", ".rar"],
+  "odbpp": {
+    "kind": "odbpp",
+    "reasonCode": "not_used_odbpp",
+    "reason": "ODB++ data, a second copy of the board layers the Gerber files already give",
+    "rootNames": ["odb", "odb++", "odbpp"],
+    "jobFolders": ["matrix", "steps", "misc", "fonts", "symbols", "input", "output", "user", "ext", "wheels"],
+    "aboutRecognition": "ODB++ needs its structure (<job>/matrix/matrix, <job>/steps/<step>/layers/..., <job>/misc/info; only the job's own top-level folders count) or a folder or archive named exactly one of rootNames. A name that merely contains ODB is not a clue."
+  },
+  "extensionKinds": [
+    {
+      "kind": "design_source",
+      "reasonCode": "not_used_design_source",
+      "reason": "PCB design source, the editable design rather than fabrication output",
+      "extensions": [".pcbdoc", ".schdoc", ".prjpcb", ".prjpcbstructure", ".pcblib", ".schlib", ".intlib", ".outjob",
+        ".kicad_pcb", ".kicad_sch", ".kicad_pro", ".kicad_prl", ".kicad_sym", ".kicad_mod",
+        ".brd", ".sch", ".lbr", ".dsn", ".opj", ".olb", ".dra", ".psm"]
+    },
+    {
+      "kind": "3d_model",
+      "reasonCode": "not_used_3d_model",
+      "reason": "3D model, a mechanical model that quoting does not read",
+      "extensions": [".step", ".stp", ".igs", ".iges", ".x_t", ".x_b", ".wrl", ".stl", ".sldprt", ".sldasm"]
+    },
+    {
+      "kind": "viewer",
+      "reasonCode": "not_used_viewer",
+      "reason": "CAD viewer file, a copy of the drawings for a viewer program",
+      "extensions": [".cvg"]
+    }
+  ],
+  "cadDrawing": {
+    "kind": "cad_drawing",
+    "reasonCode": "not_used_cad_drawing",
+    "reason": "CAD drawing that duplicates a PDF drawing next to it",
+    "extensions": [".dxf", ".dwg", ".dwf", ".dwfx", ".pcbdwf"]
+  },
+  "fabClues": {
+    "extensions": [".gbr", ".gbx", ".ger", ".art", ".pho", ".gtl", ".gbl", ".gts", ".gbs", ".gto", ".gbo", ".gtp", ".gbp",
+      ".gko", ".gml", ".gm", ".cmp", ".sol", ".stc", ".sts", ".plc", ".pls", ".crc", ".crs",
+      ".drl", ".xln", ".exc", ".ncd", ".drd"],
+    "extensionPattern": "^\\.(g[0-9]{1,2}|gm[0-9]{1,2}|gp[0-9]|gd[0-9]|gg[0-9])$",
+    "namePattern": "gerber|artwork|drill"
+  },
+  "namedRules": []
+}
