@@ -321,3 +321,88 @@ def test_a_ranked_survey_call_with_no_reply_is_sent_again_without_using_an_attem
     assert waits == [2.0, 8.0] and survey["model_calls"] == 3 and CALLS_PER_BATCH == 4
     assert not survey["has_blocking_findings"] and survey["examination"]["stopped_early"]
     assert "private transport detail" not in json.dumps(survey)
+
+
+# --- QQ #99 D5: empty or header-only spreadsheets are "nothing to read" notes, never failures ------
+
+HEADER_ONLY = b"Item,Part Number,Manufacturer,MPN,Qty\r\n"
+PCB_1_TEST = archive({"XYZ0100-11111/fab/top.gbr": GERBER, "XYZ0100-11111/assy/pick.csv": PICK,
+                      "XYZ0100-11111/test/ICT/BOM 0100-11111 test points.csv": HEADER_ONLY})
+HEADER_ONLY_PATH = "XYZ0100-11111-TK.zip/XYZ0100-11111/test/ICT/BOM 0100-11111 test points.csv"
+
+
+def test_a_header_only_csv_deep_in_a_zip_and_an_empty_csv_are_nothing_to_read_and_never_sent():
+    # Assembly 2's BOM is only inside its PCB archive, so the less likely files are surveyed too.
+    # Were the empty files sent, the stub would claim them as BOMs and refuse them (blocking).
+    model = Surveyor(refuse={"BOM 0100-11111 test points.csv", "empty.csv"}, refuse_role="bom")
+    files = roots(**{"BOM 0100-22222 REV 03.xlsx": None, "XYZ0100-11111-TK.zip": PCB_1_TEST, "empty.csv": b""})
+    value = request(files)
+    # QuickQuote sends every spreadsheet as a BOM document.
+    value["documents"] += [{"document_id": key, "blob_path": f"src/{key}", "size_bytes": len(data),
+                            "sha256": hashlib.sha256(data).hexdigest()}
+                           for key, data in (("doc-header-only", HEADER_ONLY), ("doc-empty", b""))]
+    result = decide(value, files, model)
+    survey = result["survey"]
+    sent = [path for batch in model.batches for path in batch]
+    assert HEADER_ONLY_PATH not in sent and "empty.csv" not in sent
+    assert not survey["has_blocking_findings"]
+    assert decisions(result)["doc-1"] == ("process", "only_bom")
+    assert decisions(result)["doc-deep-2"] == ("process", "only_bom")
+    assert decisions(result)["doc-header-only"] == decisions(result)["doc-empty"] == ("excluded", "other")
+    note = next(item for item in survey["findings"] if item["code"] == "SURVEY_NOTHING_TO_READ")
+    by_path = records(survey)
+    assert note["severity"] == "information" and sorted(note["file_ids"]) == sorted(
+        by_path[path]["file_id"] for path in (HEADER_ONLY_PATH, "empty.csv"))
+    for path in (HEADER_ONLY_PATH, "empty.csv"):
+        record = by_path[path]
+        assert (record["role"], record["classification_status"]) == ("other", "classified")
+        assert [item["code"] for item in record["findings"]] == ["SURVEY_NOTHING_TO_READ"]
+        assert (examination(survey)[path]["status"], examination(survey)[path]["reason"]) == (
+            "examined", "nothing_to_read")
+    # A note, not a failure: it is not one of the package-choice findings QuickQuote shows.
+    assert "SURVEY_NOTHING_TO_READ" not in PACKAGE_CHOICE_FINDING_CODES
+    assert not any(item["code"] == "SURVEY_NOTHING_TO_READ" for item in result["findings"])
+    rows = {row["path"]: row for row in package_file_rows(result)}
+    assert rows[HEADER_ONLY_PATH]["classification_status"] == rows["empty.csv"]["classification_status"] == "classified"
+
+
+def test_a_refused_citation_on_one_file_keeps_the_survey_going_with_a_note():
+    # QQ #182 with QQ #99: an 'other' reading whose only citation is refused is kept with a warning;
+    # a claimed role whose citation is refused twice is listed as not examined. Both BOMs are found.
+    for role, status in (("other", "classified"), ("work_instruction", "not_examined")):
+        result = run(Surveyor(refuse={"pick.csv"}, refuse_role=role), **{"BOM 0100-22222 REV 03.xlsx": None})
+        survey = result["survey"]
+        assert not survey["has_blocking_findings"], role
+        assert decisions(result)["doc-1"] == decisions(result)["doc-deep-2"] == ("process", "only_bom")
+        pick = records(survey)[PICK_PATH]
+        assert pick.get("classification_status", "classified") == status
+        codes = {item["code"] for item in pick["findings"]}
+        assert ("SURVEY_EVIDENCE_CITATION_REFUSED" if role == "other" else "SURVEY_FILES_UNCLASSIFIED") in codes
+        assert not any(item["severity"] == "blocking" for item in pick["findings"])
+
+
+def _view_of(name, data):
+    return build_view([PackageFile((name,), hashlib.sha256(data).hexdigest(), len(data), data)], REQUESTED)
+
+
+NOTHING_TO_READ_CASES = [
+    ("empty.csv", b"", True),
+    ("bom-only.csv", b"\xef\xbb\xbf", True),
+    ("header.csv", HEADER_ONLY, True),
+    ("header and blank lines.csv", HEADER_ONLY + b",,,,\r\n\r\n" * 30, True),
+    ("one part.csv", HEADER_ONLY + b"1,P-1,Maker,M-1,2\r\n", False),
+    # The part row is below the shown top rows: the whole file decides, not the view.
+    ("late part.csv", HEADER_ONLY + b"\r\n" * 40 + b"1,P-1,Maker,M-1,2\r\n", False),
+    ("header.xlsx", xlsx({"BOM": [HEADER], "Notes": [], "Rev": [["Rev A"]]}), True),
+    ("late part.xlsx", xlsx({"BOM": [HEADER] + [[None]] * 40 + [lines(1)[0]]}), False),
+    ("part on sheet two.xlsx", xlsx({"Cover": [["Title"]], "BOM": [HEADER] + lines(1)}), False),
+    ("broken.xlsx", b"PK\x03\x04 not a workbook", False),
+    ("drawing.pdf", b"%PDF-1.4\n", False),
+]
+
+
+@pytest.mark.parametrize("name, data, expected", NOTHING_TO_READ_CASES,
+                         ids=[case[0] for case in NOTHING_TO_READ_CASES])
+def test_nothing_to_read_is_decided_from_the_whole_file(name, data, expected):
+    from bom_processor.package_survey import nothing_to_read
+    assert nothing_to_read(_view_of(name, data), "F1") is expected

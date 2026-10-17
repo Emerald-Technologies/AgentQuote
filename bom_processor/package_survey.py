@@ -373,6 +373,28 @@ def read_top_rows(kind: str, data: bytes, *, max_row: int | None = TOP_ROWS,
     raise _Unreadable("NOT_A_SPREADSHEET")
 
 
+def nothing_to_read(view: SurveyView, file_id: str) -> bool:
+    """Whether a readable spreadsheet is empty or header-only: no sheet has a second row with a value.
+
+    Such a file has no parts to read, so it is never a BOM candidate and never fails the package
+    (QQ #99 D5, Nick 2026-10-17). Decided from the whole file, not only the shown top rows: the
+    view is a cheap first check, then the file is read again in full with a ceiling of one full row
+    per sheet, so a file with more than that is never called empty.
+    """
+    entry = view.entries[file_id]
+    if entry["kind"] not in SPREADSHEET_KINDS or entry.get("unreadable"):
+        return False
+    shown = entry.get("sheets", [])
+    if any(len(sheet["top"]) > 1 for sheet in shown):
+        return False
+    try:
+        sheets, _ = read_top_rows(entry["kind"], view.files[file_id].data, max_row=None,
+                                  cell_limit=MAX_COLUMNS * max(len(shown), 1))
+    except _Unreadable:
+        return False
+    return all(len({row for row, _ in sheet.cells}) <= 1 for sheet in sheets)
+
+
 def _shown_value(value: Any) -> Any:
     if not isinstance(value, str):
         return value

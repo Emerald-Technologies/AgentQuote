@@ -12,6 +12,8 @@ likely BOM first and less likely files only until every requested assembly has a
 confirmed BOM; the rest are listed as not surveyed. A file still refused is
 listed as not examined with a warning, and blocks only when the evidence says
 the BOM choice is impossible or unsafe without it (package_survey_rank.py).
+An empty or header-only spreadsheet is never sent to the model: it is listed as
+'other' with a "nothing to read" note and never fails the package (QQ #99 D5).
 A call that raised without any reply (QQ #182) does not use up one of the two
 attempts: the same request is sent again after a short wait, up to
 TRANSPORT_RETRIES_PER_BATCH times per batch, and every call counts against the
@@ -27,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .document_role import ROLES
-from .package_survey import (SPREADSHEET_KINDS, SurveyError, build_view, expand_package,
+from .package_survey import (SPREADSHEET_KINDS, SurveyError, build_view, expand_package, nothing_to_read,
                              plan_batches, sub_batch, survey_instructions)
 from .package_survey_check import assemble, verify_batch_files
 
@@ -187,11 +189,16 @@ def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None, sleep: Sle
     the rest are listed as not surveyed with no model call. A file whose reading is still refused
     after its retry is listed as not examined with a warning, unless the evidence says it could be
     a chosen BOM or the choice is impossible without it (package_survey_rank.refusal_blocks).
+    An empty or header-only spreadsheet is never sent to the model (QQ #99 D5): it has no parts to
+    read, so it is listed as 'other' with a "nothing to read" note and the package goes ahead.
     """
     from .package_survey_rank import RANK_VERSION, every_assembly_confirmed, rank_files, refusal_blocks
     ranking = rank_files(view)
-    phases = [plan_batches(view, file_ids=[item["file_id"] for item in ranking if item["likely"]]),
-              plan_batches(view, file_ids=[item["file_id"] for item in ranking if not item["likely"]])]
+    empty = {item["file_id"] for item in ranking if nothing_to_read(view, item["file_id"])}
+    phases = [plan_batches(view, file_ids=[item["file_id"] for item in ranking
+                                           if item["likely"] and item["file_id"] not in empty]),
+              plan_batches(view, file_ids=[item["file_id"] for item in ranking
+                                           if not item["likely"] and item["file_id"] not in empty])]
     budget = _Budget(max_calls if max_calls is not None
                      else sum(len(batches) for batches in phases) * CALLS_PER_BATCH, sleep or time.sleep)
     records: list[dict] = []
@@ -202,6 +209,8 @@ def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None, sleep: Sle
     rejected: dict[str, dict[str, Any]] = {}
     proposed: dict[str, str] = {}
     skipped: list[str] = []
+    if empty:
+        package_findings.append(_nothing_to_read(view, records, empty))
     for likely, batches in zip((True, False), phases):
         for batch in batches:
             if not likely and every_assembly_confirmed(view, records):
@@ -224,10 +233,11 @@ def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None, sleep: Sle
     reasons = {file_id: "not_needed" for file_id in skipped}
     reasons.update({file_id: "call_limit" if codes[file_id] == "SURVEY_CALL_LIMIT" else "evidence_refused"
                     for file_id in refused})
+    # A file with nothing to read was examined (by code): its reason says why it holds no parts.
     survey["examination"] = {
         "version": RANK_VERSION, "stopped_early": bool(skipped),
         "files": [{**item, "status": "not_examined" if item["file_id"] in reasons else "examined",
-                   "reason": reasons.get(item["file_id"]),
+                   "reason": NOTHING_TO_READ if item["file_id"] in empty else reasons.get(item["file_id"]),
                    **({"blocks": blocks[item["file_id"]]} if item["file_id"] in blocks else {})}
                   for item in ranking]}
     return survey
@@ -235,6 +245,7 @@ def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None, sleep: Sle
 
 NOT_EXAMINED = "not_examined"
 NOT_SURVEYED = "not_surveyed"
+NOTHING_TO_READ = "nothing_to_read"
 
 
 def _base_record(view: Any, file_id: str) -> dict[str, Any]:
@@ -284,6 +295,18 @@ def _refused_findings(view: Any, records: list[dict], blocks: dict[str, str | No
                                 else "evidence_refused",
                                 "rationale": rationale, "findings": [finding]})
     return findings
+
+
+def _nothing_to_read(view: Any, records: list[dict], empty: set[str]) -> dict[str, Any]:
+    """Records and the note for empty or header-only spreadsheets: 'other', never a failure (D5)."""
+    rationale = ("Nothing to read: this spreadsheet is empty or holds only a heading row, so it has no parts "
+                 "and is not a BOM candidate. It was not sent to the survey model.")
+    note = {"code": "SURVEY_NOTHING_TO_READ", "severity": "information", "raised_by": "code", "rationale": rationale}
+    file_ids = sorted(empty, key=lambda value: int(value[1:]))
+    for file_id in file_ids:
+        records.append({**_base_record(view, file_id), "role": "other", "classification_status": "classified",
+                        "rationale": rationale, "findings": [dict(note)]})
+    return {**note, "file_ids": file_ids}
 
 
 def _not_surveyed(view: Any, records: list[dict], skipped: list[str]) -> dict[str, Any]:
