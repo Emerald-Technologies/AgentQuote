@@ -8,6 +8,7 @@ checked by package_survey_check.py. Run python -m pytest tests/test_package_surv
 """
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import json
@@ -171,6 +172,28 @@ def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[P
     return sorted(files, key=lambda item: (item.path.casefold(), item.path))
 
 
+def csv_encoding(data: bytes) -> str:
+    """How a CSV's bytes are decoded: by a UTF-16 LE or BE byte-order mark, else as UTF-8.
+
+    'utf-8-sig' also drops a UTF-8 byte-order mark. A UTF-32 mark (which begins like the UTF-16 LE
+    one) is not taken for UTF-16; such a file fails UTF-8 decoding and is listed as unreadable.
+    """
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return "utf-8-sig"
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return "utf-16"
+    return "utf-8-sig"
+
+
+def _utf16_text(data: bytes) -> bool:
+    """Whether a UTF-16 file's first 16 KiB decode to text (a character cut at the end is allowed)."""
+    try:
+        value = codecs.getincrementaldecoder("utf-16")("strict").decode(data[:16_384], final=len(data) <= 16_384)
+    except UnicodeDecodeError:
+        return False
+    return not any((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 127 for char in value)
+
+
 def file_kind(name: str, data: bytes) -> str:
     """Type from leading bytes and extension; never from the meaning of the content."""
     from .package_evidence_inventory import _safe_excerpt
@@ -184,7 +207,7 @@ def file_kind(name: str, data: bytes) -> str:
     excerpt = _safe_excerpt(data, 16_384)
     if suffix == "xls" and excerpt is not None and re.search(r"<table\b", excerpt, re.I):
         return "spreadsheet_html_xls"
-    if suffix == "csv" and excerpt is not None:
+    if suffix == "csv" and (excerpt is not None or (csv_encoding(data) == "utf-16" and _utf16_text(data))):
         return "spreadsheet_csv"
     if excerpt is not None and re.search(r"%FS[LA]|%MO(?:IN|MM)|G04", excerpt):
         return "gerber_text"
@@ -357,13 +380,14 @@ def read_top_rows(kind: str, data: bytes, *, max_row: int | None = TOP_ROWS,
     if kind == "spreadsheet_csv":
         whole = max_row is None
         prefix = data if whole else data[:CSV_PREFIX_BYTES]
+        encoding = csv_encoding(data)
         try:
-            text = prefix.decode("utf-8-sig")
+            text = prefix.decode(encoding)
         except UnicodeDecodeError as exc:
             # Only a character cut by the prefix boundary itself is tolerated.
             if whole or len(data) <= CSV_PREFIX_BYTES or exc.start < len(prefix) - 3:
                 raise _Unreadable("CSV_ENCODING") from exc
-            text = prefix[:exc.start].decode("utf-8-sig")
+            text = prefix[:exc.start].decode(encoding)
         try:
             reader = csv.reader(io.StringIO(text))
             rows = list(reader) if whole else [row for _, row in zip(range(max_row), reader)]
