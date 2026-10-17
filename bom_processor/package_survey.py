@@ -8,6 +8,7 @@ checked by package_survey_check.py. Run python -m pytest tests/test_package_surv
 """
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import json
@@ -21,6 +22,7 @@ from typing import Any
 
 from .document_role import ROLE_DEFINITIONS
 from .foundry_author import _SECRET
+from .text_encoding import csv_encoding
 
 # File and folder names are evidence the survey must see and cite exactly. The shared rule would
 # hide any 32+ run of letters, digits, "-", "_" and "/", which is an ordinary file path; for
@@ -45,6 +47,8 @@ OOXML_XML_ENTRY_BYTES = 32 * 1024 * 1024
 OOXML_XML_TOTAL_BYTES = 64 * 1024 * 1024
 OOXML_RATIO_LIMIT = 200
 CSV_PREFIX_BYTES = 1024 * 1024
+# Codes of an archive member listed, not read, because it is over a per-member limit (QQ #99 blocker 5).
+MEMBER_LIMIT_CODES = frozenset({"ARCHIVE_BYTE_LIMIT", "ARCHIVE_RATIO_LIMIT"})
 _OLE2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 SPREADSHEET_KINDS = frozenset({"spreadsheet_ooxml", "spreadsheet_xls", "spreadsheet_html_xls",
                                "spreadsheet_csv"})
@@ -76,7 +80,8 @@ class PackageFile:
     sha256: str
     size_bytes: int
     data: bytes = field(repr=False)
-    # Stable code when an archive could not be opened; its contents are then unknown.
+    # Stable code when an archive could not be opened, or a member over a per-member limit was listed,
+    # not read (QQ #99 blocker 5; data is then empty, sha256 and size are the member's own).
     unreadable: str | None = None
 
     @property
@@ -129,12 +134,16 @@ class SurveyBatch:
 def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[PackageFile]:
     """Unpack nested archives with the package-evidence limits; every leaf file is kept.
 
-    An archive that cannot be opened is kept as one unreadable file, never dropped.
+    An archive that cannot be opened is kept as one unreadable file, never dropped. A member over the
+    per-member byte or ratio limit is listed, not read (QQ #99 blocker 5): it is kept with its true
+    SHA-256 and size and its limit code, and the rest of its archive is still surveyed.
     """
     from .package_evidence_contracts import PackageEvidenceError
-    from .package_evidence_inventory import ArchiveBudget, InventoryLimits, read_zip
+    from .package_evidence_inventory import ArchiveBudget, InventoryLimits, read_zip_listing
     limits = limits or InventoryLimits()
     budget = ArchiveBudget(limits)
+    # Bytes streamed only to hash members listed, not read; never held (bounded like the aggregate).
+    hash_room = [limits.aggregate_bytes]
     files: list[PackageFile] = []
     names: set[str] = set()
 
@@ -145,12 +154,15 @@ def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[P
                 unreadable = "ARCHIVE_DEPTH_LIMIT"
             else:
                 try:
-                    members = read_zip(data, budget)
+                    members = read_zip_listing(data, budget, hash_room)
                 except PackageEvidenceError as exc:
                     unreadable = str(exc) if re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", str(exc)) else "ARCHIVE_INVALID"
                 else:
-                    for member, payload in members:
-                        visit((*chain, member), payload)
+                    for member, payload, digest, size, code in members:
+                        if payload is None:
+                            files.append(PackageFile((*chain, member), digest, size, b"", code))
+                        else:
+                            visit((*chain, member), payload)
                     return
         files.append(PackageFile(chain, sha256(data).hexdigest(), len(data), data, unreadable))
 
@@ -171,6 +183,15 @@ def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[P
     return sorted(files, key=lambda item: (item.path.casefold(), item.path))
 
 
+def _utf16_text(data: bytes) -> bool:
+    """Whether a UTF-16 file's first 16 KiB decode to text (a character cut at the end is allowed)."""
+    try:
+        value = codecs.getincrementaldecoder("utf-16")("strict").decode(data[:16_384], final=len(data) <= 16_384)
+    except UnicodeDecodeError:
+        return False
+    return not any((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 127 for char in value)
+
+
 def file_kind(name: str, data: bytes) -> str:
     """Type from leading bytes and extension; never from the meaning of the content."""
     from .package_evidence_inventory import _safe_excerpt
@@ -184,7 +205,7 @@ def file_kind(name: str, data: bytes) -> str:
     excerpt = _safe_excerpt(data, 16_384)
     if suffix == "xls" and excerpt is not None and re.search(r"<table\b", excerpt, re.I):
         return "spreadsheet_html_xls"
-    if suffix == "csv" and excerpt is not None:
+    if suffix == "csv" and (excerpt is not None or (csv_encoding(data) == "utf-16" and _utf16_text(data))):
         return "spreadsheet_csv"
     if excerpt is not None and re.search(r"%FS[LA]|%MO(?:IN|MM)|G04", excerpt):
         return "gerber_text"
@@ -357,13 +378,14 @@ def read_top_rows(kind: str, data: bytes, *, max_row: int | None = TOP_ROWS,
     if kind == "spreadsheet_csv":
         whole = max_row is None
         prefix = data if whole else data[:CSV_PREFIX_BYTES]
+        encoding = csv_encoding(data)
         try:
-            text = prefix.decode("utf-8-sig")
+            text = prefix.decode(encoding)
         except UnicodeDecodeError as exc:
             # Only a character cut by the prefix boundary itself is tolerated.
             if whole or len(data) <= CSV_PREFIX_BYTES or exc.start < len(prefix) - 3:
                 raise _Unreadable("CSV_ENCODING") from exc
-            text = prefix[:exc.start].decode("utf-8-sig")
+            text = prefix[:exc.start].decode(encoding)
         try:
             reader = csv.reader(io.StringIO(text))
             rows = list(reader) if whole else [row for _, row in zip(range(max_row), reader)]
@@ -371,6 +393,28 @@ def read_top_rows(kind: str, data: bytes, *, max_row: int | None = TOP_ROWS,
             raise _Unreadable("CSV_INVALID") from exc
         return _rows_top("csv", rows, len(rows) if whole else None, max_row, budget), False
     raise _Unreadable("NOT_A_SPREADSHEET")
+
+
+def nothing_to_read(view: SurveyView, file_id: str) -> bool:
+    """Whether a readable spreadsheet is empty or header-only: no sheet has a second row with a value.
+
+    Such a file has no parts to read, so it is never a BOM candidate and never fails the package
+    (QQ #99 D5, Nick 2026-10-17). Decided from the whole file, not only the shown top rows: the
+    view is a cheap first check, then the file is read again in full with a ceiling of one full row
+    per sheet, so a file with more than that is never called empty.
+    """
+    entry = view.entries[file_id]
+    if entry["kind"] not in SPREADSHEET_KINDS or entry.get("unreadable"):
+        return False
+    shown = entry.get("sheets", [])
+    if any(len(sheet["top"]) > 1 for sheet in shown):
+        return False
+    try:
+        sheets, _ = read_top_rows(entry["kind"], view.files[file_id].data, max_row=None,
+                                  cell_limit=MAX_COLUMNS * max(len(shown), 1))
+    except _Unreadable:
+        return False
+    return all(len({row for row, _ in sheet.cells}) <= 1 for sheet in sheets)
 
 
 def _shown_value(value: Any) -> Any:
@@ -385,7 +429,11 @@ def _compact(value: Any) -> str:
 
 
 def _entry(file_id: str, item: PackageFile, same: list[str]) -> tuple[dict[str, Any], dict]:
-    kind = "archive_unreadable" if item.unreadable else file_kind(item.chain[-1], item.data)
+    if item.unreadable:
+        # An archive that could not be opened, or any other member listed but not read (blocker 5).
+        kind = "archive_unreadable" if item.chain[-1].casefold().endswith(".zip") else "not_read"
+    else:
+        kind = file_kind(item.chain[-1], item.data)
     entry: dict[str, Any] = {"id": file_id, "path": _PATH_SECRET.sub("[REDACTED]", item.path),
                              "size": item.size_bytes, "kind": kind}
     if same:
@@ -479,14 +527,21 @@ def build_view(files: list[PackageFile], requested: list[dict[str, Any]] | None 
 
 
 def plan_batches(view: SurveyView, *, char_limit: int = BATCH_CHAR_LIMIT,
-                 file_limit: int = BATCH_FILE_LIMIT) -> list[SurveyBatch]:
-    """Files in path order, so folders stay together; every file is in exactly one batch."""
+                 file_limit: int = BATCH_FILE_LIMIT,
+                 file_ids: list[str] | tuple[str, ...] | None = None) -> list[SurveyBatch]:
+    """Files in path order, so folders stay together; every file is in exactly one batch.
+
+    file_ids: only these files, in this order (the ranked survey, QQ #99); none gives no batch.
+    """
     base = len(_compact({**view.header(), "classify": [], "files": []}))
     if base + FILE_CHAR_LIMIT * 2 > char_limit:
         raise SurveyError("SURVEY_BATCH_LIMIT")
+    if file_ids is not None and not file_ids:
+        return []
     groups: list[list[str]] = [[]]
     size = base
-    for file_id, entry in view.entries.items():
+    for file_id in (view.ids if file_ids is None else file_ids):
+        entry = view.entries[file_id]
         cost = len(_compact(entry)) + len(file_id) + 4
         if groups[-1] and (size + cost > char_limit or len(groups[-1]) >= file_limit):
             groups.append([])

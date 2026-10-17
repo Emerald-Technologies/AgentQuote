@@ -12,6 +12,7 @@ from .core import OUTPUT_CONTENT_TYPE
 from .remote import _validate_xlsx_bytes
 from .arena_policy import verify_evidence
 from .semantic import AssemblyIdentity, compare_boms, normalize_bom
+from .text_encoding import csv_encoding
 from .semantic_facts import facts_from_rows
 
 MAX_METADATA_BYTES = 1_000_000
@@ -58,7 +59,8 @@ def _source_frames(data: bytes, suffix: str) -> dict[str, Any]:
     import pandas as pd
     stream = io.BytesIO(data)
     if suffix == ".csv":
-        return {"CSV": pd.read_csv(stream, header=None, dtype=object, keep_default_na=False)}
+        return {"CSV": pd.read_csv(stream, header=None, dtype=object, keep_default_na=False,
+                                   encoding=csv_encoding(data))}
     if suffix in {".xls", ".xlsx"}:
         engine = "xlrd" if suffix == ".xls" else "openpyxl"
         return pd.read_excel(stream, sheet_name=None, header=None, dtype=object, engine=engine)

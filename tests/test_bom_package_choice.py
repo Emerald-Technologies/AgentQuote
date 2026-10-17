@@ -8,7 +8,8 @@ import pytest
 from bom_processor import InMemoryStorage, ProcessingError, ProcessingRequest, RemoteBomProcessor
 from bom_processor.bom_candidate_choice import REPLY_VERSION as CHOICE_VERSION
 from bom_processor.bom_package_choice import (PackageChoiceError, PackageChoicePendingError,
-                                              PackageChoiceService, choice_request, decide)
+                                              PackageChoiceService, apply_reopen, choice_request, decide,
+                                              excluded_assignments)
 from bom_processor.candidates import AggregateCandidateRequiredError, CandidateRequest
 from bom_processor.master_registry import StructuralProfile
 from bom_processor.package_resolution import ParentPackageService
@@ -192,12 +193,19 @@ def test_tampered_result_is_detected():
         service.status(state["request_id"])
 
 
-def test_document_missing_from_the_package_is_processed_with_a_finding():
+def test_document_missing_from_the_package_is_held_with_a_finding_and_can_be_brought_back():
+    # QQ #99 blocker 5: a document the survey never saw is held for a person, never parsed unseen.
     extra = xlsx({"BOM": [HEADER] + lines(2, start=90)})
     docs = {**DOCS, "doc-extra": extra}
     _, _, _, state = completed_service(docs=docs)
-    assert decisions(state)["doc-extra"] == ("process", "not_in_package")
-    assert state["result"]["findings"][0]["code"] == "CHOICE_DOCUMENT_NOT_IN_PACKAGE"
+    assert decisions(state)["doc-extra"] == ("excluded", "not_in_package")
+    finding = state["result"]["findings"][0]
+    assert (finding["code"], finding["severity"]) == ("CHOICE_DOCUMENT_NOT_IN_PACKAGE", "warning")
+    assert "held for review" in finding["rationale"]
+    assert {"kind": "excluded", "reason": "not_in_package"}.items() <= next(
+        item for item in excluded_assignments(state) if item["document_ids"] == ["doc-extra"]).items()
+    reopened = apply_reopen(state, ["doc-extra"])
+    assert decisions(reopened)["doc-extra"] == ("process", "reopened")
 
 
 def test_decide_refuses_a_package_with_no_bom_left():

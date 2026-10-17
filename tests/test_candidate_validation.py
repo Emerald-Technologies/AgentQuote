@@ -514,3 +514,28 @@ def test_a_zero_part_quantity_is_valid_and_a_bad_one_names_its_row():
     result = _semantic_output(negative, b"", "xlsx")
     assert result["coverage_basis"] == "quantity" and result["failed_output_row"] == 3
     assert "output_row=3" in _semantic_feedback(result) and "0 or more" in _semantic_feedback(result)
+
+
+def test_a_utf16_csv_with_a_byte_order_mark_is_profiled_authored_validated_and_row_accounted():
+    # QQ #99 (synthetic test kit, QuickQuote PR #232): Excel's "Unicode text" CSV export. The stub model
+    # authors, the stub worker returns the parsed workbook, and row accounting reads the real UTF-16 file.
+    import codecs
+    source = codecs.BOM_UTF16_LE + SOURCE.decode().encode("utf-16-le")
+    storage = InMemoryStorage(sources={SOURCE_PATH: source})
+    profile = profile_bytes(source, ".csv")
+    assert profile.header_candidates == profile_bytes(SOURCE, ".csv").header_candidates
+    request = persist_candidate(storage, "Customer1", "customer-key", profile, ({
+        "document_id": "doc1", "blob_path": SOURCE_PATH,
+        "size_bytes": len(source), "sha256": hashlib.sha256(source).hexdigest(),
+    },))
+    candidate = CandidateAuthoringService(request.request_id, storage, Model()).author()
+    orchestrator = Orchestrator(storage, workbook())
+    service = CandidateValidationService(
+        request.request_id, candidate.candidate_id, storage, orchestrator,
+        job_resource="subscriptions/sub/resourceGroups/rg/providers/Microsoft.App/jobs/worker",
+        worker_image="registry/worker@sha256:" + "a" * 64, sleep=lambda _: None)
+    result = service.validate()
+    assert result.status == "awaiting_approval"
+    evidence = json.loads(storage.candidates[result.evidence_path])
+    # The pinned fixture is the original UTF-16 bytes; nothing was re-encoded.
+    assert evidence["fixtures"][0]["sha256"] == hashlib.sha256(source).hexdigest()

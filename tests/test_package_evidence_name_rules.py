@@ -85,9 +85,133 @@ def test_any_conflict_or_unmatched_name_leaves_the_file_for_a_person():
         "AMT0110-00055.zip/top.gbr",                     # board on no BOM
         "AMT0100-00077-TK.zip/notes.txt",                # kit of an assembly not requested
         "BOM-0100-00002-REV-B.xlsx",                     # revision differs
-        "other-package/AMT0100-00001.zip/notes.txt",     # no -TK suffix: not the approved pattern
-        "drawings/0100-00001.pdf"])
+        "0100-00001/AMT0110-00012/top.gbr",              # folder of u1 holding the board of u2
+        "0100-00001/0100-00002/top.gbr",                 # two assemblies' folders on one path
+        "0100-00001 and 0100-00002/top.gbr",             # one folder naming both
+        "0100-00002 Rev C/top.gbr",                      # folder revision differs from the request
+        "0100-00001 Rev 02/0100-00002 drawing.pdf"])     # folder and file name disagree
     assert match_names(items, paths, ASSEMBLIES, OCCURRENCES) == {}
+
+
+# ------------------------------------------------------------------ general path clue (D7)
+
+@pytest.mark.parametrize("path", [
+    "0100-00001.zip/top.gbr",                                      # depth 1: the zip name
+    "Package.zip/0100-00001/top.gbr",                              # depth 2: "<PN>"
+    "Package.zip/0100-00001 Rev 02/Gerbers/top.gbr",               # depth 3: "<PN> Rev 02"
+    "Package.zip/Boards/0100-00001_Rev02/Fab/Gerbers/top.gbr",     # depth 5: "<PN>_Rev02"
+    "Package.zip/Boards/ASSY 0100-00001.zip/fab.zip/top.gbr",      # nested zips: "ASSY <PN>"
+    "other-package/AMT0100-00001.zip/notes.txt",                   # a customer prefix, no family suffix
+    "drawings/0100-00001.pdf",                                     # the file name
+])
+def test_a_folder_zip_or_file_name_naming_one_assembly_is_a_path_clue(path):
+    items, paths = _items([path])
+    found = match_names(items, paths, ASSEMBLIES, OCCURRENCES)
+    assert (found["e0"]["assembly"], found["e0"]["rule"], found["e0"]["occurrenceIds"]) == ("u1", "path", [])
+
+
+def test_a_file_copied_into_each_assembly_folder_is_used_for_each():
+    items, paths = _items(["Package.zip/0100-00001/common/notes.pdf", "Package.zip/0100-00002/common/notes.pdf"])
+    found = match_names(items, paths, ASSEMBLIES, OCCURRENCES)
+    assert (found["e0"]["assembly"], found["e1"]["assembly"]) == ("u1", "u2")
+
+
+@pytest.mark.parametrize("path,assembly,lines", [
+    ("Boards/PCB 0110-00011 Rev A.zip/top.gbr", "u1", ["o1"]),        # a board zip named for a BOM line
+    ("Package.zip/Fab 0110-00012_RevA/drill.drl", "u2", ["o2"]),      # a fab folder
+    ("Package.zip/fab/0110-00012_top.gbr", "u2", ["o2"]),             # the file name
+    ("Package.zip/0100-00001/PCB-0110-00011.zip/top.gbr", "u1", ["o1"]),  # assembly folder and its board agree
+])
+def test_a_board_named_on_exactly_one_assembly_bom_is_a_board_clue(path, assembly, lines):
+    items, paths = _items([path])
+    found = match_names(items, paths, ASSEMBLIES, OCCURRENCES)
+    assert (found["e0"]["assembly"], found["e0"]["rule"], found["e0"]["occurrenceIds"]) == (assembly, "bom_line", lines)
+
+
+def test_an_ambiguous_board_goes_to_a_person():
+    items, paths = _items([
+        "Boards/PCB-0110-00099.zip/top.gbr",            # the board is on both assemblies' BOMs
+        "Package.zip/0100-00002/0110-00011/top.gbr",    # assembly folder of u2 holding a board of u1
+        "Boards/0110-00011 and 0110-00012/top.gbr"])    # one folder naming boards of both
+    assert match_names(items, paths, ASSEMBLIES, OCCURRENCES) == {}
+
+
+def test_short_or_unrelated_line_part_numbers_are_never_board_clues():
+    occurrences = OCCURRENCES + [{"assemblyUuid": "u1", "partNumber": "1", "occurrenceId": "o5"},
+                                 {"assemblyUuid": "u2", "partNumber": "PCB", "occurrenceId": "o6"}]
+    items, paths = _items(["Package.zip/1/PCB/top.gbr", "Package.zip/0110-00013/top.gbr"])
+    assert match_names(items, paths, ASSEMBLIES, occurrences) == {}
+
+
+def test_a_board_clue_reaches_the_model_view_with_its_lines():
+    from compact_evidence_fixtures import package
+    args = package([("ASM-100200", None), ("ASM-100300", None)], lines=5,
+                   extra_files=[("Boards.zip", archive([("PCB-555001/top.gbr", b"G04 synthetic board*\nM02*\n")]))])
+    context, roots, books = args
+    from compact_evidence_fixtures import bom
+    books[uuid(2, 1)] = bom(5, pcb="PCB-555001")
+    context["assemblies"][0]["canonicalBom"].update(sha256=digest(books[uuid(2, 1)]), sizeBytes=len(books[uuid(2, 1)]))
+    plan = _plan((context, roots, books))
+    board = next(identity for identity, path in plan.paths.items() if path.endswith("top.gbr") and "Boards.zip" in path)
+    assert plan.views[board]["survey"] == {"assembly": "A1", "link": "unconfirmed", "kind": "name rule bom_line"}
+    assert board not in plan.rule_links
+
+
+def test_package_family_rules_outrank_the_path_clue_on_the_same_path():
+    items, paths = _items(["AMT0100-00001-TK.zip/AMT0100-00001-TK/0100-00001 notes.txt",
+                           "AMT0110-00011.zip/0100-00001 fab.pdf"])
+    found = match_names(items, paths, ASSEMBLIES, OCCURRENCES)
+    assert (found["e0"]["rule"], found["e0"]["assembly"]) == ("kit", "u1")
+    assert (found["e1"]["rule"], found["e1"]["assembly"], found["e1"]["occurrenceIds"]) == ("board", "u1", ["o1"])
+
+
+PDF = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\nbinary assembly drawing bytes\n"
+
+
+def folder_pdf_package():
+    """Two assemblies; a drawing without text sits in a zip named for the first ("<PN> Rev A")."""
+    from compact_evidence_fixtures import package
+    return package([("ASM-100200", "PCB-555001"), ("ASM-100300", None)], lines=5,
+                   extra_files=[("ASM-100200 Rev A.zip", archive([("Drawings/drawing.pdf", PDF)]))])
+
+
+def _plan(args, survey_files=None):
+    from bom_processor.package_evidence_compact import _Plan
+    from compact_evidence_fixtures import source_proof
+    context, roots, books = args
+    prepared = prepare(context, roots, books, producer="p", model_name="m", policy_version=V6,
+                       prompt_sha256="d" * 64, run_id="r", include_classification=True,
+                       include_manufacturing=True, retained_bom_sources=source_proof(roots))
+    return _Plan(prepared, roots, 10**9, survey_files)
+
+
+def _pdf(plan):
+    return next(identity for identity, path in plan.paths.items() if path.endswith(".pdf"))
+
+
+def test_a_path_clue_reaches_the_model_view_and_never_replaces_a_survey_reading():
+    plan = _plan(folder_pdf_package())
+    pdf = _pdf(plan)
+    assert plan.paths[pdf] == "ASM-100200 Rev A.zip/Drawings/drawing.pdf"
+    assert plan.views[pdf]["survey"] == {"assembly": "A1", "link": "unconfirmed", "kind": "name rule path"}
+    assert pdf not in plan.rule_links   # a clue only: the model and a person decide
+    for index, link in ((1, "confirmed"), (2, "unconfirmed")):
+        record = {"path": plan.paths[pdf], "sha256": digest(PDF), "kind": "pdf",
+                  "requested_assembly": {"assembly_id": uuid(1, index), "link": link}}
+        surveyed = _plan(folder_pdf_package(), [record])
+        assert surveyed.views[pdf]["survey"] == {"assembly": f"A{index}", "link": link, "kind": "pdf"}
+
+
+def test_a_file_without_text_in_an_assembly_folder_is_linked_for_a_person_to_confirm():
+    from test_package_evidence_survey_clues import PdfLinkingModel
+    result = produce(folder_pdf_package(), model=PdfLinkingModel())
+    proposal, assessment = result["proposal"], result["manufacturingAssessment"]
+    association = next(a for a in proposal["associations"] if a["citations"])
+    assert association["assemblyUuids"] == [uuid(1, 1)]
+    assert association["citations"][0]["locator"] == "package name rule"
+    assert "(path rule)" in association["citations"][0]["observation"]
+    relation = next(r for r in assessment["relationships"] if r["associationId"] == association["associationId"])
+    assert relation["conflicts"] == [LINK_NOT_TEXT_VERIFIED]
 
 
 # ------------------------------------------------------------------ budget-aware inventory

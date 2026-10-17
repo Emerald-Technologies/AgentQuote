@@ -5,6 +5,9 @@ Output: verified per-file records and code findings. Roles and assemblies are th
 agent's judgment; code proves every cited cell was shown with that value, every
 cited path text is in the file's path (letter case and spacing aside, recorded as
 written in the source), and every file has exactly one record.
+Role evidence is checked one citation at a time (QQ #182): a refused citation is
+dropped and listed with a warning, and the file is refused only when no checked
+citation is left for a role that needs one.
 No I/O or model calls. Run python -m pytest tests/test_package_survey.py.
 """
 from __future__ import annotations
@@ -14,7 +17,7 @@ from typing import Any
 
 from .assembly_core import find_assembly, revision_contradicts
 from .document_role import ROLES
-from .package_survey import SurveyBatch, SurveyError, SurveyView, cell_text
+from .package_survey import MEMBER_LIMIT_CODES, SurveyBatch, SurveyError, SurveyView, cell_text
 from .semantic import AssemblyIdentity
 
 REPLY_VERSION = "package-survey-reply.v1"
@@ -54,8 +57,25 @@ def _match(value: str, text: str) -> str | None:
     return found.group(0) if found else None
 
 
-def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
-    """One cited item, checked against the original value (never the shortened display)."""
+def _shortened(value: str, text: str) -> str | None:
+    """A long cell cited as the view showed it, cut short and ending in '…' (QQ #182, run 003bf2c0).
+
+    The text before the mark must start the original cell exactly; the record keeps that source text
+    without the mark, so it never holds text the agent was not shown.
+    """
+    for mark in ("…", "..."):
+        if value.endswith(mark):
+            prefix = value[:-len(mark)].rstrip()
+            return prefix if prefix and text.strip().startswith(prefix) else None
+    return None
+
+
+def _evidence(view: SurveyView, file_id: str, item: Any, *, shortened: bool = False) -> dict[str, Any]:
+    """One cited item, checked against the original value (never the shortened display).
+
+    shortened: also accept a cell's leading text cited with the view's '…' mark. Only role evidence
+    allows it; an assembly name or link cut mid-word could name the wrong assembly.
+    """
     if not isinstance(item, dict):
         raise SurveyError("SURVEY_EVIDENCE_RECORD_INVALID")
     if item.get("source") not in ("cell", "path"):
@@ -89,6 +109,8 @@ def _evidence(view: SurveyView, file_id: str, item: Any) -> dict[str, Any]:
         raise SurveyError("SURVEY_EVIDENCE_CELL_NOT_SHOWN", rejected={"source": "cell", "value": value, "cell": locator})
     text = cell_text(actual)
     found = value if text.strip() == value else _match(value, text)
+    if found is None and shortened:
+        found = _shortened(value, text)
     if found is None:
         raise SurveyError("SURVEY_EVIDENCE_VALUE_CHANGED", rejected={"source": "cell", "value": value, "cell": locator})
     return {"source": "cell", "value": found,
@@ -200,10 +222,10 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
             or not _text(proposal["rationale"], 1000)
             or not isinstance(proposal["evidence"], list) or len(proposal["evidence"]) > MAX_EVIDENCE):
         raise SurveyError("SURVEY_RECORD_INVALID")
-    evidence = _field("evidence", lambda: [_evidence(view, file_id, item) for item in proposal["evidence"]])
-    if proposal["role"] != "other" and not evidence:
+    if proposal["role"] != "other" and not proposal["evidence"]:
         raise SurveyError("SURVEY_ROLE_EVIDENCE_REQUIRED", rejected={"field": "evidence"})
-    refused: list[dict[str, Any]] = []
+    evidence, refused = _role_evidence(view, file_id, proposal["role"], proposal["evidence"])
+    evidence_refused = bool(refused)
     link = None
     if view.requested:
         # Round 3 (A036): with requested assemblies the provisional assembly and the link decide no
@@ -245,7 +267,11 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
             ("unreadable", "SURVEY_FILE_UNREADABLE", "The file could not be opened; its role rests on its name and type.")):
         if entry.get(flag):
             findings.append(_code_finding(code, "information", text))
-    if refused:
+    if evidence_refused:
+        findings.append(_code_finding("SURVEY_EVIDENCE_CITATION_REFUSED", "warning",
+                                      "A cited value for the file's role did not match the file; that citation was "
+                                      "dropped and the file keeps its classification on the citations that matched."))
+    if any(item["field"] != "evidence" for item in refused):
         findings.append(_code_finding("SURVEY_LINK_CITATION_REFUSED", "warning",
                                       "A citation for the file's assembly or requested-assembly link was refused; "
                                       "only that part was dropped and the file keeps its classification."))
@@ -265,7 +291,29 @@ def _record(view: SurveyView, file_id: str, proposal: Any) -> dict[str, Any]:
     if view.requested:
         record["requested_assembly"] = link
         record["refused_citations"] = refused
+    elif refused:
+        record["refused_citations"] = refused
     return record
+
+
+def _role_evidence(view: SurveyView, file_id: str, role: str,
+                   items: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Role citations checked one at a time: those that match, and the refused ones (QQ #182).
+
+    A refused citation (a sheet name cited as a cell's text, a changed value, a cell not shown) is
+    dropped. A role other than 'other' with no matching citation left is refused with the first
+    citation's own code, as before, so the retry tells the agent what was wrong.
+    """
+    evidence, refused, first = [], [], None
+    for item in items:
+        try:
+            evidence.append(_evidence(view, file_id, item, shortened=True))
+        except SurveyError as exc:
+            first = first or exc
+            refused.append({"field": "evidence", **_refusal(exc)})
+    if role != "other" and not evidence:
+        raise SurveyError(str(first), first.file_id, {**(first.rejected or {}), "field": "evidence"})
+    return evidence, refused
 
 
 def verify_batch(view: SurveyView, batch: SurveyBatch, reply: Any) -> tuple[list[dict], list[dict]]:
@@ -313,6 +361,13 @@ def assemble(view: SurveyView, records: list[dict], package_findings: list[dict]
     if len(by_id) != len(records) or set(by_id) != set(view.ids):
         raise SurveyError("SURVEY_COVERAGE_INVALID")
     findings = list(package_findings)
+    # QQ #99 blocker 5: a member over a per-member limit is listed, not read; the rest of its archive was.
+    not_read = [file_id for file_id in view.ids if view.files[file_id].unreadable in MEMBER_LIMIT_CODES]
+    if not_read:
+        findings.append({**_code_finding(
+            "SURVEY_FILES_NOT_READ", "warning",
+            "These files are over the per-file size or compression limit, so they are listed by name, size and "
+            "hash but were not read; the other files of their archives were surveyed."), "file_ids": not_read})
     if view.package.get("folders_not_listed"):
         findings.append(_code_finding("SURVEY_FOLDERS_NOT_LISTED", "information",
                                       "Some folders did not fit the package summary; every file was still classified."))

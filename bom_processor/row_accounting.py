@@ -46,6 +46,7 @@ from hashlib import sha256
 from typing import Any
 
 from .canonical_format import canonical_columns, canonical_pair_count
+from .text_encoding import csv_encoding
 from .interpretation_inventory import MAX_BYTES, MAX_CELLS, MAX_COLUMNS, MAX_ROWS, SourceInventory, extract_inventory
 
 VERSION_V1 = "bom-row-map.v1"
@@ -195,7 +196,8 @@ def source_inventory(source: bytes, extension: str) -> SourceInventory:
         return extract_inventory(source, extension)
     _require(isinstance(source, bytes) and 0 < len(source) <= MAX_BYTES, "SOURCE_SIZE_LIMIT")
     try:
-        text = source.decode("utf-8-sig")
+        # A UTF-16 byte-order mark selects UTF-16; anything else is UTF-8 (text_encoding.csv_encoding).
+        text = source.decode(csv_encoding(source))
     except UnicodeDecodeError:
         raise RowMapError("SOURCE_CSV_ENCODING") from None
     cells: dict[tuple[str, int, int], Any] = {}
