@@ -16,11 +16,12 @@ from typing import Any, Callable
 
 from .core import (CONTRACT_VERSION, OUTPUT_CONTENT_TYPE, BlobConflictError,
                    BlobNotFoundError, ProcessingError, ProcessingRequest,
-                   Storage, _json_bytes, _sha256, _validate_xlsx)
+                   Storage, _json_bytes, _sha256, _validate_xlsx, checked_source_format)
 from .job_orchestrator import JobOrchestrator, WorkItem
 from .blob_registry import BlobRegistryReader
 from .master_registry import RegistryError
 from .master_registry import profile_bytes
+from .source_format import staged_input_name
 from .candidates import (AggregateCandidateRequiredError, CandidateRequiredError,
                          persist_candidate)
 from .row_accounting import (MAX_ROW_MAP_BYTES, RESULT_VERSION as ROW_ACCOUNTING_RESULT_VERSION,
@@ -104,16 +105,20 @@ class RemoteBomProcessor:
                 source = self.storage.download_source(document.blob_path, self.max_source_bytes)
                 if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                     raise ProcessingError("source integrity check failed")
+                checked_source_format(document.blob_path, source)
                 verified_sources[document.document_id] = source
             self._require_candidate(request, verified_sources, ProcessingError("replacement requested"), kept)
         existing = self.storage.download_output(manifest_path, self.max_output_bytes)
         if existing is not None:
             return self._validate_manifest(existing, request, fingerprint)
         verified_sources: dict[str, bytes] = {}
+        source_formats: dict[str, dict[str, Any] | None] = {}
         for document in kept:
             source = self.storage.download_source(document.blob_path, self.max_source_bytes)
             if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                 raise ProcessingError("source integrity check failed")
+            # Fail closed on a .xlsm openpyxl cannot read, before any parser runs; macros are only flagged.
+            source_formats[document.document_id] = checked_source_format(document.blob_path, source)
             verified_sources[document.document_id] = source
         selections: dict[str, Any] = {}
         legacy_parser: bytes | None = None
@@ -224,6 +229,8 @@ class RemoteBomProcessor:
                 source = self.storage.download_source(document.blob_path, self.max_source_bytes)
             if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                 raise ProcessingError("source integrity check failed")
+            source_format = (source_formats[document.document_id] if document.document_id in source_formats
+                             else checked_source_format(document.blob_path, source))
             worker_job_id = f"{request.job_id}-{document.document_id}"
             selected = selections.get(document.document_id)
             worker_prefix = f"{prefix}/worker/{worker_job_id}"
@@ -233,7 +240,7 @@ class RemoteBomProcessor:
             item = WorkItem(worker_job_id, "boms", "parsers", "boms", document.blob_path,
                             selected.variant.code_path if selected else f"{request.parser_key}/parse.py", document.sha256.lower(), document.size_bytes,
                             _sha256(selected.code) if selected else _sha256(legacy_parser), len(selected.code) if selected else len(legacy_parser), worker_prefix,
-                            f"input{PurePosixPath(document.blob_path).suffix.lower()}",
+                            staged_input_name(document.blob_path),
                             "output.xlsx", "result.json", row_map_name=ROW_MAP_NAME if row_checked else None)
             try:
                 started = self.orchestrator.start(item)
@@ -255,6 +262,9 @@ class RemoteBomProcessor:
                          "size_bytes": document.size_bytes, "sha256": document.sha256.lower()},
                          "output": {"blob_path": final_path, "size_bytes": len(worker_bytes),
                                     "sha256": _sha256(worker_bytes), "content_type": OUTPUT_CONTENT_TYPE}}
+            if source_format is not None:
+                # Only for a .xlsm: how it was read (values only, macros never loaded). Beside "source".
+                result["source_format"] = source_format
             if selected is not None:
                 result["parser"] = self._result_parser_provenance(request.parser_key, selected)
                 # Beside, never inside, "parser": package_resolution checks those keys exactly.

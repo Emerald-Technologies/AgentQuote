@@ -26,7 +26,7 @@ def validate_retained_sources(value, roots):
         root = by_id.get(identity)
         require(identity not in seen and root is not None
                 and all(root[k] == source[k] for k in ("sha256", "sizeBytes"))
-                and re.search(r"\.(?:xlsx?|csv)$", root["fileName"], re.I), "RETAINED_BOM_SOURCE_BINDING")
+                and re.search(r"\.(?:xls[xm]?|csv)$", root["fileName"], re.I), "RETAINED_BOM_SOURCE_BINDING")
         seen.add(identity)
     require([s["documentId"] for s in sources] == sorted(seen), "RETAINED_BOM_SOURCE_ORDER")
     return seen

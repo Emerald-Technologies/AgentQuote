@@ -21,6 +21,7 @@ from .semantic_facts import facts_from_rows
 from .document_roles import POLICY_VERSION as DOCUMENT_ROLE_POLICY, check_document_roles
 from .candidate_authoring import ASSOCIATION_AUTHORING_VERSION, ROW_MAP_AUTHORING_VERSIONS
 from .row_accounting import MAX_ROW_MAP_BYTES, ROW_MAP_NAME, RowMapError, verify_row_map
+from .source_format import staged_input_name
 
 VALIDATION_VERSION = "candidate-validation.v3"
 # Plan 8.8 step 4b (Nick 2026-10-09): up to 50 failed rows per round, 2 rounds, then a person.
@@ -452,7 +453,7 @@ class CandidateValidationService:
             f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
             source_evidence["sha256"].lower(), source_evidence["size_bytes"],
             manifest["code_sha256"], len(code), worker_prefix,
-            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}",
+            staged_input_name(source_evidence['blob_path']),
             "output.xlsx", "result.json",
             row_map_name=ROW_MAP_NAME if self.row_map_required else None,
         )
@@ -608,7 +609,7 @@ class CandidateValidationService:
                             f"candidates/{self.request_id}/{self.candidate_id}/parse.py",
                             source_evidence["sha256"].lower(), source_evidence["size_bytes"],
                             manifest["code_sha256"], len(code), f"{base}/worker/attempt-{int(time.time()*1000)}-{index}/{job_id}",
-                            f"input{PurePosixPath(source_evidence['blob_path']).suffix.lower()}", "output.xlsx", "result.json",
+                            staged_input_name(source_evidence['blob_path']), "output.xlsx", "result.json",
                             row_map_name=ROW_MAP_NAME if self.row_map_required else None)
             record = {"fixture_sha256": source_evidence["sha256"].lower(), "document_id": source_evidence["document_id"],
                       "source_aliases": source_evidence.get("source_aliases", []), "status": "failed"}

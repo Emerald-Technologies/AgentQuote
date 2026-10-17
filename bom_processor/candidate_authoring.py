@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from .core import BlobConflictError, CANONICAL_COLUMNS
 from .candidates import unique_fixtures
 from .author_failure import AuthorFailure, diagnostic_fields, failure_stage
+from .source_format import reading_extension
 
 MAX_CODE_BYTES = 1_000_000
 MAX_SOURCE_BYTES = 50_000_000
@@ -407,7 +408,9 @@ class CandidateAuthoringService:
             raise AuthoringError("SOURCE_UNAVAILABLE") from None
         if len(source) != evidence["size_bytes"] or hashlib.sha256(source).hexdigest() != evidence["sha256"].lower():
             raise AuthoringError("SOURCE_INTEGRITY")
-        analysis = SourceAnalysis(len(source), hashlib.sha256(source).hexdigest(), evidence["blob_path"].rsplit(".", 1)[-1].lower())
+        # The format the parser receives: a .xlsm is staged as input.xlsx (source_format.py).
+        analysis = SourceAnalysis(len(source), hashlib.sha256(source).hexdigest(),
+                                  reading_extension(evidence["blob_path"]).lstrip("."))
         rules = CANONICAL_OUTPUT_RULES
         if request["profile"].get("source_subtype") == "html_table_xls":
             rules += HTML_XLS_RULES

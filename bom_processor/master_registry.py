@@ -22,6 +22,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 from xml.etree import ElementTree
 
+from .source_format import reading_extension
+
 MAX_PROFILE_BYTES = 32 * 1024 * 1024
 MAX_CANDIDATE_BYTES = 8 * 1024 * 1024
 MAX_ZIP_ENTRIES = 256
@@ -421,7 +423,8 @@ def _xlsx_profile(data: bytes):
 def profile_bytes(data: bytes, extension: str) -> StructuralProfile:
     if not isinstance(data, bytes) or len(data) > MAX_PROFILE_BYTES: raise RegistryError("PARSER_FORMAT_NOT_RECOGNIZED", {"reason": "profile_size_limit"})
     from .layout_heading import READ_ROWS, build_layout
-    normalized = extension.lower() if extension.startswith(".") else "." + extension.lower()
+    # A .xlsm profiles as the .xlsx it is, so it matches the same approved layouts (source_format.py).
+    normalized = reading_extension(extension)
     if normalized == ".csv": sheets, headers, numbered = _csv_profile(data)
     elif normalized == ".xlsx": sheets, headers, numbered = _xlsx_profile(data)
     elif normalized == ".xls":

@@ -135,8 +135,10 @@ def test_inventory_includes_every_sheet_and_never_evaluates_formula():
     # openpyxl writes no stored result, so the value is unknowable without evaluation.
     with pytest.raises(InventoryError, match="SOURCE_FORMULA_RESULT_MISSING"):
         extract_inventory(xlsx([["=1+1"]]), ".xlsx")
+    # A macro-free .xlsm is read as the .xlsx it is (2026-10-14); other formats are still refused.
+    assert extract_inventory(source, ".xlsm").cells == inventory.cells
     with pytest.raises(InventoryError, match="SOURCE_FORMAT_UNSUPPORTED"):
-        extract_inventory(source, ".xlsm")
+        extract_inventory(source, ".xlsb")
 
 
 def test_html_xls_is_inert_and_merged_anchors_not_filled_down():

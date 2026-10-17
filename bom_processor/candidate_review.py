@@ -13,6 +13,7 @@ from .remote import _validate_xlsx_bytes
 from .arena_policy import verify_evidence
 from .semantic import AssemblyIdentity, compare_boms, normalize_bom
 from .semantic_facts import facts_from_rows
+from .source_format import reading_extension
 
 MAX_METADATA_BYTES = 1_000_000
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -57,6 +58,7 @@ def _norm(value: Any) -> str:
 def _source_frames(data: bytes, suffix: str) -> dict[str, Any]:
     import pandas as pd
     stream = io.BytesIO(data)
+    suffix = reading_extension(suffix)  # a .xlsm is read as the .xlsx it is
     if suffix == ".csv":
         return {"CSV": pd.read_csv(stream, header=None, dtype=object, keep_default_na=False)}
     if suffix in {".xls", ".xlsx"}:
