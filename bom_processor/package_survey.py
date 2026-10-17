@@ -22,6 +22,7 @@ from typing import Any
 
 from .document_role import ROLE_DEFINITIONS
 from .foundry_author import _SECRET
+from .text_encoding import csv_encoding
 
 # File and folder names are evidence the survey must see and cite exactly. The shared rule would
 # hide any 32+ run of letters, digits, "-", "_" and "/", which is an ordinary file path; for
@@ -46,6 +47,8 @@ OOXML_XML_ENTRY_BYTES = 32 * 1024 * 1024
 OOXML_XML_TOTAL_BYTES = 64 * 1024 * 1024
 OOXML_RATIO_LIMIT = 200
 CSV_PREFIX_BYTES = 1024 * 1024
+# Codes of an archive member listed, not read, because it is over a per-member limit (QQ #99 blocker 5).
+MEMBER_LIMIT_CODES = frozenset({"ARCHIVE_BYTE_LIMIT", "ARCHIVE_RATIO_LIMIT"})
 _OLE2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 SPREADSHEET_KINDS = frozenset({"spreadsheet_ooxml", "spreadsheet_xls", "spreadsheet_html_xls",
                                "spreadsheet_csv"})
@@ -77,7 +80,8 @@ class PackageFile:
     sha256: str
     size_bytes: int
     data: bytes = field(repr=False)
-    # Stable code when an archive could not be opened; its contents are then unknown.
+    # Stable code when an archive could not be opened, or a member over a per-member limit was listed,
+    # not read (QQ #99 blocker 5; data is then empty, sha256 and size are the member's own).
     unreadable: str | None = None
 
     @property
@@ -130,12 +134,16 @@ class SurveyBatch:
 def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[PackageFile]:
     """Unpack nested archives with the package-evidence limits; every leaf file is kept.
 
-    An archive that cannot be opened is kept as one unreadable file, never dropped.
+    An archive that cannot be opened is kept as one unreadable file, never dropped. A member over the
+    per-member byte or ratio limit is listed, not read (QQ #99 blocker 5): it is kept with its true
+    SHA-256 and size and its limit code, and the rest of its archive is still surveyed.
     """
     from .package_evidence_contracts import PackageEvidenceError
-    from .package_evidence_inventory import ArchiveBudget, InventoryLimits, read_zip
+    from .package_evidence_inventory import ArchiveBudget, InventoryLimits, read_zip_listing
     limits = limits or InventoryLimits()
     budget = ArchiveBudget(limits)
+    # Bytes streamed only to hash members listed, not read; never held (bounded like the aggregate).
+    hash_room = [limits.aggregate_bytes]
     files: list[PackageFile] = []
     names: set[str] = set()
 
@@ -146,12 +154,15 @@ def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[P
                 unreadable = "ARCHIVE_DEPTH_LIMIT"
             else:
                 try:
-                    members = read_zip(data, budget)
+                    members = read_zip_listing(data, budget, hash_room)
                 except PackageEvidenceError as exc:
                     unreadable = str(exc) if re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", str(exc)) else "ARCHIVE_INVALID"
                 else:
-                    for member, payload in members:
-                        visit((*chain, member), payload)
+                    for member, payload, digest, size, code in members:
+                        if payload is None:
+                            files.append(PackageFile((*chain, member), digest, size, b"", code))
+                        else:
+                            visit((*chain, member), payload)
                     return
         files.append(PackageFile(chain, sha256(data).hexdigest(), len(data), data, unreadable))
 
@@ -170,19 +181,6 @@ def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[P
     for name, data in roots:
         visit((name,), data)
     return sorted(files, key=lambda item: (item.path.casefold(), item.path))
-
-
-def csv_encoding(data: bytes) -> str:
-    """How a CSV's bytes are decoded: by a UTF-16 LE or BE byte-order mark, else as UTF-8.
-
-    'utf-8-sig' also drops a UTF-8 byte-order mark. A UTF-32 mark (which begins like the UTF-16 LE
-    one) is not taken for UTF-16; such a file fails UTF-8 decoding and is listed as unreadable.
-    """
-    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
-        return "utf-8-sig"
-    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return "utf-16"
-    return "utf-8-sig"
 
 
 def _utf16_text(data: bytes) -> bool:
@@ -431,7 +429,11 @@ def _compact(value: Any) -> str:
 
 
 def _entry(file_id: str, item: PackageFile, same: list[str]) -> tuple[dict[str, Any], dict]:
-    kind = "archive_unreadable" if item.unreadable else file_kind(item.chain[-1], item.data)
+    if item.unreadable:
+        # An archive that could not be opened, or any other member listed but not read (blocker 5).
+        kind = "archive_unreadable" if item.chain[-1].casefold().endswith(".zip") else "not_read"
+    else:
+        kind = file_kind(item.chain[-1], item.data)
     entry: dict[str, Any] = {"id": file_id, "path": _PATH_SECRET.sub("[REDACTED]", item.path),
                              "size": item.size_bytes, "kind": kind}
     if same:

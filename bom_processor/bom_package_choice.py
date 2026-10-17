@@ -187,9 +187,13 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                         if (records[file_id].get("requested_assembly") or {}).get("link") == "confirmed"})
         decision, reason, disposition = "process", "only_bom", None
         if not file_ids:
-            reason = "not_in_package"
+            # QQ #99 blocker 5: the survey never saw this document, so nothing says it is a BOM (it could
+            # be a pick-and-place or test export). It is held for a person, never parsed unseen; review
+            # shows it set aside as not in package, and a person can bring it back.
+            decision, reason = "excluded", "not_in_package"
             findings.append({"code": "CHOICE_DOCUMENT_NOT_IN_PACKAGE", "severity": "warning",
-                             "rationale": "A BOM document of the request is not among the package files; it is processed.",
+                             "rationale": "A BOM document of the request is not among the surveyed package files; "
+                                          "it is held for review and not processed unless a person brings it back.",
                              "document_id": document["document_id"], "raised_by": "code"})
         elif survey["has_blocking_findings"]:
             reason = "survey_blocking"
@@ -488,7 +492,8 @@ def apply_reopen(state: dict[str, Any], reopen: tuple[str, ...] | list[str] | No
     # A document the survey did not survey or could not examine (QQ #99) can be brought back like a set-aside BOM.
     if not reopen or any(document_id not in documents or documents[document_id]["decision"] != "excluded"
                          or not ("bom" in documents[document_id]["roles"]
-                                 or documents[document_id]["reason"] in UNREAD_ROLES)
+                                 or documents[document_id]["reason"] in UNREAD_ROLES
+                                 or documents[document_id]["reason"] == "not_in_package")
                          for document_id in reopen):
         raise PackageChoiceError("PACKAGE_CHOICE_REOPEN_INVALID")
     changed = [dict(item, decision="process", reason="reopened") if item["document_id"] in reopen else item

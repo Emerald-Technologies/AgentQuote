@@ -17,7 +17,7 @@ from typing import Any
 
 from .assembly_core import find_assembly, revision_contradicts
 from .document_role import ROLES
-from .package_survey import SurveyBatch, SurveyError, SurveyView, cell_text
+from .package_survey import MEMBER_LIMIT_CODES, SurveyBatch, SurveyError, SurveyView, cell_text
 from .semantic import AssemblyIdentity
 
 REPLY_VERSION = "package-survey-reply.v1"
@@ -361,6 +361,13 @@ def assemble(view: SurveyView, records: list[dict], package_findings: list[dict]
     if len(by_id) != len(records) or set(by_id) != set(view.ids):
         raise SurveyError("SURVEY_COVERAGE_INVALID")
     findings = list(package_findings)
+    # QQ #99 blocker 5: a member over a per-member limit is listed, not read; the rest of its archive was.
+    not_read = [file_id for file_id in view.ids if view.files[file_id].unreadable in MEMBER_LIMIT_CODES]
+    if not_read:
+        findings.append({**_code_finding(
+            "SURVEY_FILES_NOT_READ", "warning",
+            "These files are over the per-file size or compression limit, so they are listed by name, size and "
+            "hash but were not read; the other files of their archives were surveyed."), "file_ids": not_read})
     if view.package.get("folders_not_listed"):
         findings.append(_code_finding("SURVEY_FOLDERS_NOT_LISTED", "information",
                                       "Some folders did not fit the package summary; every file was still classified."))

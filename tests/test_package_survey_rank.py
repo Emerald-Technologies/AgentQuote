@@ -473,3 +473,74 @@ def test_csv_kind_follows_the_byte_order_mark(data, kind):
 def test_nothing_to_read_is_decided_from_the_whole_file(name, data, expected):
     from bom_processor.package_survey import nothing_to_read
     assert nothing_to_read(_view_of(name, data), "F1") is expected
+
+
+# --- QQ #99 blocker 5: one member over the limit no longer hides its whole archive ------------------
+
+BIG_STEP = b"\0" * 60_000_000  # 60 MB, over the 50 MB per-member limit (synthetic; compresses to ~60 KB)
+PCB_1_BIG = archive({"XYZ0100-11111/fab/top.gbr": GERBER, "XYZ0100-11111/assy/pick.csv": PICK,
+                     "XYZ0100-11111/cad/board.step": BIG_STEP})
+BIG_PATH = "XYZ0100-11111-TK.zip/XYZ0100-11111/cad/board.step"
+
+
+def test_one_60_mb_member_is_listed_not_read_and_the_rest_of_its_board_zip_is_surveyed():
+    model = Surveyor()
+    result = run(model, **{"BOM 0100-22222 REV 03.xlsx": None, "XYZ0100-11111-TK.zip": PCB_1_BIG})
+    survey = result["survey"]
+    by_path = records(survey)
+    # The other members of the same zip were surveyed (before, the whole zip was one unreadable file).
+    assert {PICK_PATH, "XYZ0100-11111-TK.zip/XYZ0100-11111/fab/top.gbr"} <= set(by_path)
+    assert PICK_PATH in [path for batch in model.batches for path in batch]
+    big = by_path[BIG_PATH]
+    assert (big["kind"], big["size_bytes"], big["sha256"]) == (
+        "not_read", len(BIG_STEP), hashlib.sha256(BIG_STEP).hexdigest())
+    assert "XYZ0100-11111-TK.zip" not in by_path
+    note = next(item for item in survey["findings"] if item["code"] == "SURVEY_FILES_NOT_READ")
+    assert note["severity"] == "warning" and note["file_ids"] == [big["file_id"]]
+    assert not survey["has_blocking_findings"]
+    assert decisions(result)["doc-1"] == decisions(result)["doc-deep-2"] == ("process", "only_bom")
+    assert decisions(result)["doc-pick"][0] == "excluded"
+
+
+def test_a_member_over_the_ratio_limit_is_listed_not_read():
+    from bom_processor.package_evidence_inventory import InventoryLimits
+    from bom_processor.package_survey import expand_package
+    dense = b"A" * 2_000_000  # compresses far past 200:1
+    files = {item.path: item for item in expand_package([("pcb.zip", archive({"a/notes.txt": dense, "a/pick.csv": PICK}))])}
+    assert files["pcb.zip/a/notes.txt"].unreadable == "ARCHIVE_RATIO_LIMIT"
+    assert files["pcb.zip/a/notes.txt"].sha256 == hashlib.sha256(dense).hexdigest()
+    assert files["pcb.zip/a/pick.csv"].unreadable is None and files["pcb.zip/a/pick.csv"].data == PICK
+    assert InventoryLimits().ratio == 200
+
+
+def test_members_listed_not_read_are_bounded_and_past_the_bound_the_archive_fails_as_before():
+    from bom_processor.package_evidence_inventory import InventoryLimits
+    from bom_processor.package_survey import expand_package
+    limits = InventoryLimits(member_bytes=1_000, aggregate_bytes=5_000)
+    small = expand_package([("pcb.zip", archive({"big.bin": b"x" * 4_000, "pick.csv": PICK}))], limits)
+    assert {item.path: item.unreadable for item in small} == {"pcb.zip/big.bin": "ARCHIVE_BYTE_LIMIT",
+                                                              "pcb.zip/pick.csv": None}
+    # Hashing a member listed, not read, streams its bytes; past the package bound the archive is unread.
+    large = expand_package([("pcb.zip", archive({"big.bin": b"x" * 6_000, "pick.csv": PICK}))], limits)
+    assert [(item.path, item.unreadable) for item in large] == [("pcb.zip", "ARCHIVE_BYTE_LIMIT")]
+
+
+def test_a_pick_and_place_csv_the_survey_never_saw_is_held_not_parsed():
+    # QuickQuote's discovery opened an archive the survey could not (here: nested past depth 5), so
+    # the request carries a pick-and-place CSV the survey never saw. It is held for a person.
+    unseen = b"Designator,Mid X,Mid Y,Rotation\r\nR9,5,6,90\r\n"
+    deep = unseen
+    for level in range(6):
+        deep = archive({f"level{level}.zip" if level else "pick.csv": deep})
+    files = roots(**{"deep.zip": deep})
+    value = request(files)
+    value["documents"].append({"document_id": "doc-unseen", "blob_path": "src/doc-unseen", "size_bytes": len(unseen),
+                               "sha256": hashlib.sha256(unseen).hexdigest()})
+    result = decide(value, files, Surveyor())
+    assert decisions(result)["doc-unseen"] == ("excluded", "not_in_package")
+    assert any(item.unreadable == "ARCHIVE_DEPTH_LIMIT" for item in expand_package(files))
+    assert decisions(result)["doc-1"] == decisions(result)["doc-2"] == ("process", "only_bom")
+    held = [item for item in result["findings"] if item.get("document_id") == "doc-unseen"]
+    assert [item["code"] for item in held] == ["CHOICE_DOCUMENT_NOT_IN_PACKAGE"]
+    # Not a package-choice finding QuickQuote validates; review shows the set-aside document instead.
+    assert "CHOICE_DOCUMENT_NOT_IN_PACKAGE" not in PACKAGE_CHOICE_FINDING_CODES
