@@ -158,6 +158,11 @@ class SystemPackageService(ParentPackageService):
         ready = []
         for group in review["groups"]:
             if group.get("status") == "excluded" and group.get("kind") == "excluded":
+                if group.get("reason") == "not_in_package":
+                    # QQ #99 blocker 5: held because the survey never saw it; a person decides.
+                    if _guard is not None:
+                        _guard.reject(PackageResolutionError("SYSTEM_REVIEW_NOT_QUALIFIED"))
+                    raise PackageResolutionError("SYSTEM_REVIEW_NOT_QUALIFIED")
                 # Set aside by a completed package choice that code cross-checked.
                 covered.extend(group["document_ids"])
                 continue

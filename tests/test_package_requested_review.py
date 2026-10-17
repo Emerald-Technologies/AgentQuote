@@ -165,6 +165,28 @@ def test_no_obvious_link_means_a_person_binds(requested, options):
         accept(service, plan, review, identities)
 
 
+def test_a_document_held_as_not_in_package_stops_automatic_acceptance():
+    # QQ #99 blocker 5: a set-aside group whose reason is not_in_package was never seen by the survey;
+    # a person decides. The review is otherwise qualified (it accepts with the reason it really has).
+    service, plan = linked_package(ONE_ENE)
+    original = service.review
+
+    def held_review(plan_id):
+        review = original(plan_id)
+        for group in review["groups"]:
+            if group.get("status") == "excluded":
+                group["reason"] = "not_in_package"
+        return review
+
+    service.review = held_review
+    review = service.review(plan["plan_id"])
+    assert any(group.get("reason") == "not_in_package" for group in review["groups"])
+    with pytest.raises(PackageResolutionError, match="SYSTEM_REVIEW_NOT_QUALIFIED"):
+        accept(service, plan, review)
+    service.review = original
+    assert accept(service, plan, service.review(plan["plan_id"]))["approval_id"]
+
+
 def test_any_package_choice_warning_stops_automatic_acceptance():
     warning = {"code": "SURVEY_BOM_NOT_MAPPED", "severity": "warning", "raised_by": "code", "rationale": "x",
                "document_ids": [], "assemblies": [], "file_paths": ["package.zip/other.xlsx"]}
