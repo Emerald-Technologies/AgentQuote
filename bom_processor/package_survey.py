@@ -22,6 +22,7 @@ from typing import Any
 
 from .document_role import ROLE_DEFINITIONS
 from .foundry_author import _SECRET
+from .text_encoding import csv_encoding
 
 # File and folder names are evidence the survey must see and cite exactly. The shared rule would
 # hide any 32+ run of letters, digits, "-", "_" and "/", which is an ordinary file path; for
@@ -170,19 +171,6 @@ def expand_package(roots: list[tuple[str, bytes]], limits: Any = None) -> list[P
     for name, data in roots:
         visit((name,), data)
     return sorted(files, key=lambda item: (item.path.casefold(), item.path))
-
-
-def csv_encoding(data: bytes) -> str:
-    """How a CSV's bytes are decoded: by a UTF-16 LE or BE byte-order mark, else as UTF-8.
-
-    'utf-8-sig' also drops a UTF-8 byte-order mark. A UTF-32 mark (which begins like the UTF-16 LE
-    one) is not taken for UTF-16; such a file fails UTF-8 decoding and is listed as unreadable.
-    """
-    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
-        return "utf-8-sig"
-    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return "utf-16"
-    return "utf-8-sig"
 
 
 def _utf16_text(data: bytes) -> bool:
