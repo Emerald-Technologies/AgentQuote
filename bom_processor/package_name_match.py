@@ -15,13 +15,15 @@ model call, and only when the clue is unambiguous. Clues, not rules:
 - Placement, test and fab data (package_survey_rank clues: pick and place, ICT, Gerber, ...) is
   never this pass's BOM unless its name or headings read like a BOM.
 - Shallow beats deep: for each assembly only its shallowest candidates count; a deeper file
-  naming it is ranked lower and listed. At that depth one candidate wins; of several, the only
-  one whose name or headings read like a BOM wins; otherwise the survey runs.
+  naming it is ranked lower and listed. At that depth one candidate wins; of several, those whose
+  name or headings read like a BOM are all linked as candidates (a customer BOM and a modified
+  BOM, #99 blocker 7) and the package choice step picks the primary, as after a survey; when none
+  reads like a BOM, the survey runs.
 - A spreadsheet naming no requested assembly no longer cancels the pass by itself; it is listed
   as not matched. It still cancels when it looks like a BOM (name, headings, or cells naming a
   requested assembly) and is no deeper than a matched BOM: it may be a sub-assembly's or a
   combined BOM, which the survey and a person decide. A conflicting file cancels the same way.
-- Each matched file is one of the request's BOM documents, with bytes unlike the other
+- Each linked file is one of the request's BOM documents, with bytes unlike the other
   assemblies' (identical copies count once; the shallowest copy is linked).
 - Empty or header-only spreadsheets are passed over (QQ #99 D5); an unreadable one counts as a
   doubt only when it names a requested assembly or is named like a BOM.
@@ -141,10 +143,12 @@ def _mapping(view: SurveyView, document_hashes: set[str]) -> dict[str, PathMatch
         choices = list(level.values())
         if len(choices) > 1:
             choices = [candidate for candidate in choices if candidate[2]]
-        if len(choices) != 1:
-            return None  # Several files for one assembly at the same depth: the survey and a person decide.
-        file_id, match, _ = choices[0]
-        mapped[file_id] = match
+        if not choices:
+            return None  # Several files, none reading like a BOM: the survey and a person decide.
+        # Several BOM-like files (a customer BOM and a modified BOM): all are linked as candidates,
+        # and the package choice step picks the primary as it does after a survey (#99 blocker 7).
+        for file_id, match, _ in choices:
+            mapped[file_id] = match
     deepest = max(_depth(view.files[file_id].path) for file_id in mapped)
     if any(_depth(view.files[file_id].path) <= deepest for file_id in doubtful):
         return None  # A doubt no deeper than a matched BOM: a person would stop and look.
@@ -168,8 +172,8 @@ def name_match_survey(view: SurveyView, document_hashes: set[str]) -> dict[str, 
         if file_id not in mapped:
             records.append({**base, "role": NOT_SURVEYED, "classification_status": NOT_SURVEYED,
                             "assembly": None, "assembly_evidence": None, "requested_assembly": None,
-                            "rationale": "Not needed for BOM choice: each requested assembly is named by one "
-                                         "spreadsheet's name or folder, so this file was listed but not surveyed.",
+                            "rationale": "Not needed for BOM choice: each requested assembly is named by its "
+                                         "spreadsheets' names or folders, so this file was listed but not surveyed.",
                             "evidence": [], "findings": []})
             continue
         requested, found, revision, _ = mapped[file_id]
@@ -192,8 +196,9 @@ def name_match_survey(view: SurveyView, document_hashes: set[str]) -> dict[str, 
     linked = sorted(mapped, key=lambda value: int(value[1:]))
     others = [file_id for file_id in view.ids if file_id not in mapped]
     findings = [_finding("SURVEY_NAME_MATCH", "information",
-                         "Each requested assembly is named by one spreadsheet's file or folder name; those files were "
-                         "mapped from their paths and the model survey was not run.", linked)]
+                         "Each requested assembly is named by its spreadsheets' file or folder names; those files were "
+                         "mapped from their paths and the model survey was not run. Where an assembly has "
+                         "several, the package choice step picks its primary BOM.", linked)]
     if others:
         findings.append(_finding("SURVEY_FILES_NOT_SURVEYED", "information",
                                  "These files are not needed for BOM choice; they are listed and were not surveyed.",

@@ -5,6 +5,7 @@ each requested assembly is mapped from its file name with no model call. Any dou
 the model survey unchanged.
 """
 import hashlib
+import json
 
 import pytest
 
@@ -133,7 +134,7 @@ def test_files_inside_an_archive_are_ignored_by_the_pre_pass():
     {"BOM 0100-11111 and 0100-22222.xlsx": xlsx({"BOM": [HEADER] + lines(1, start=40)})},
     # A top-level spreadsheet that names no requested assembly could be anything.
     {"Quote request.xlsx": xlsx({"BOM": [HEADER] + lines(1, start=50)})},
-    # Two files for one assembly.
+    # A second BOM-like file for one assembly that is not one of the request's BOM documents.
     {"0100-11111 BOM modified.csv": b"Item,Part Number\n1,P-1\n"},
 ])
 def test_any_doubt_falls_back_to_the_survey(extra):
@@ -339,9 +340,64 @@ def test_a_conflict_deeper_than_every_matched_bom_is_ranked_lower():
     assert sorted(links(prepass(files)).values()) == [B1, B2]
 
 
-def test_one_assembly_with_two_bom_files_at_the_same_depth_goes_to_the_survey():
-    files = {"Package.zip": archive({"0100-11111/bom.xlsx": BOM_1, "0100-11111/BOM modified.xlsx": xlsx(
-        {"BOM": [HEADER] + lines(4, start=30)}), "0100-22222/bom.xlsx": BOM_2})}
+MOD_1 = xlsx({"BOM": [HEADER] + lines(5)})   # the customer BOM's lines plus one: a modified BOM
+
+
+class ChoiceOnly:
+    """Stub model for the package choice step only: a survey call fails the test."""
+
+    def __init__(self, primary):
+        self.primary, self.calls = primary, 0
+
+    def __call__(self, instructions, text):
+        from test_bom_package_choice import CHOICE_VERSION, cell
+        body, _ = json.JSONDecoder().raw_decode(text)
+        assert "classify" not in body, "the model survey must not run"
+        self.calls += 1
+        files, primary = [], None
+        for entry in body["files"]:
+            disposition = "primary" if entry["path"].endswith(self.primary) else "redundant"
+            primary = entry["id"] if disposition == "primary" else primary
+            files.append({"file_id": entry["id"], "disposition": disposition, "rationale": "Stub.",
+                          "evidence": [cell("BOM", 1, 2, "Part Number")],
+                          "columns": {"sheet": "BOM", "identity_column": 2, "quantity_column": 5,
+                                      "first_row": 2, "last_row": None}})
+        return {"version": CHOICE_VERSION, "primary": primary, "files": files, "rationale": "Stub choice.",
+                "findings": []}
+
+
+def two_bom_package(customer="customer bom.xlsx", modified="modified bom.xlsm"):
+    """Each assembly zip holds a customer BOM and a modified BOM at the same depth (#99 blocker 7)."""
+    return {"XYZ0100-11111-TK.zip": archive({f"BOM/{customer}": BOM_1, f"BOM/{modified}": MOD_1,
+                                             "Gerbers/top.gbr": GERBER}),
+            "XYZ0100-22222-TK.zip": archive({"BOM/bom.xlsx": BOM_2, "Gerbers/top.gbr": GERBER})}
+
+
+def test_two_bom_like_files_for_one_assembly_are_both_linked_as_candidates():
+    survey = prepass(two_bom_package(), documents=[BOM_1, MOD_1, BOM_2])
+    assert survey is not None and survey["model_calls"] == 0
+    assert sorted(links(survey).values()) == [B1, B1, B2]
+    group = next(item for item in survey["requested_assemblies"] if item["assembly_id"] == B1)
+    assert len(group["files"]["bom"]) == 2
+    # Two BOM-like files that are not both request documents still go to the survey.
+    assert prepass(two_bom_package()) is None
+
+
+def test_the_choice_step_picks_between_the_candidates_without_the_survey():
+    value = {**request({"doc-1": BOM_1, "doc-1-mod": MOD_1, "doc-2": BOM_2}),
+             "requested_assemblies": [dict(item) for item in REQUESTED_B]}
+    model = ChoiceOnly(primary="modified bom.xlsm")
+    result = decide(value, list(two_bom_package().items()), model)
+    assert model.calls == 1 and result["model_calls"] == 1 and result["survey"]["model_calls"] == 0
+    found = decisions(result)
+    assert found["doc-1-mod"][0] == "process" and found["doc-1-mod"][2] == [B1]
+    assert found["doc-1"][0] == "excluded"
+    assert found["doc-2"] == ("process", "only_bom", [B2])
+
+
+def test_several_same_depth_files_none_reading_like_a_bom_go_to_the_survey():
+    files = {"Package.zip": archive({"0100-11111/notes.xlsx": NOTES, "0100-11111/request.xlsx": xlsx(
+        {"Request": [["Contact", "Phone"], ["Example", "555"]]}), "0100-22222/bom.xlsx": BOM_2})}
     assert prepass(files) is None
 
 
