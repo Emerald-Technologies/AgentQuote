@@ -12,7 +12,7 @@ from bom_processor.core import CANONICAL_COLUMNS
 from bom_processor.package_evidence_compact import review_compact
 from bom_processor.package_evidence_contracts import LINK_NOT_TEXT_VERIFIED, PackageEvidenceError, digest
 from bom_processor.package_evidence_inventory import (
-    NOT_INVENTORIED_FORMAT, InventoryLimits, build_inventory, select_archives)
+    NOT_INVENTORIED_FORMAT, NOT_READ_FORMAT, InventoryLimits, build_inventory, select_archives)
 from bom_processor.package_evidence_name_rules import match_names
 from bom_processor.package_evidence_occurrences import read_occurrences
 from bom_processor.package_evidence_proposal import prepare
@@ -108,8 +108,9 @@ def test_archive_over_budget_is_kept_whole_order_independently_and_bombs_still_r
     bomb = archive([("bomb.bin", b"\0" * 1_000_000)])
     with pytest.raises(PackageEvidenceError, match="ARCHIVE_RATIO_LIMIT"):
         build_inventory([text_root(bomb, "bomb.zip", 1)], limits=InventoryLimits(aggregate_bytes=len(bomb) + 10))
-    with pytest.raises(PackageEvidenceError, match="ARCHIVE_BYTE_LIMIT"):
-        build_inventory([text_root(large, "large.zip", 1)], limits=InventoryLimits(member_bytes=899))
+    # QuickQuote #99: a member over the per-file limit is listed, not read, instead of stopping the package.
+    listed = build_inventory([text_root(large, "large.zip", 1)], limits=InventoryLimits(member_bytes=899))
+    assert [item["format"] for item in listed if item["archiveChain"]] == [NOT_READ_FORMAT]
 
 
 # ------------------------------------------------------------------ canonical workbook cells
@@ -245,6 +246,28 @@ def test_set_aside_archive_without_a_rule_is_left_for_a_person_never_excluded():
     for identity in set_aside:
         disposition = next(d for d in graph["dispositions"] if d["evidenceId"] == identity)
         assert disposition["state"] == "unresolved" and "not unpacked" in disposition["rationale"]
+
+
+def test_member_too_large_to_read_is_listed_and_left_for_a_person_never_excluded():
+    # QuickQuote #99 (D2): a member over the per-file limit is listed, not read, and never an unseen exclusion.
+    context, roots, books = kit_board_package()
+    for root in roots:  # paths no name rule recognises, so only the model's (excluding) answer is left
+        if not root["fileName"].lower().endswith(".zip"):
+            continue
+        with zipfile.ZipFile(io.BytesIO(root["data"])) as source:
+            members = [(f"misc/{info.filename.split('/')[-1]}", source.read(info)) for info in source.infolist()]
+        root["fileName"] = "misc-" + root["documentId"][-4:] + ".zip"
+        root["data"] = archive(members)
+        root["sha256"], root["sizeBytes"] = digest(root["data"]), len(root["data"])
+    limits = InventoryLimits(member_bytes=14)  # every synthetic member over 14 bytes is listed, not read
+    graph = produce((context, roots, books), ExcludingModel(), inventory_limits=limits)["proposal"]
+    not_read = [e["evidenceId"] for e in graph["evidenceObjects"] if e["category"] == NOT_READ_FORMAT]
+    assert not_read
+    for identity in not_read:
+        # The model said unrelated without seeing the file: only an included link may stand, so a person decides.
+        disposition = next(d for d in graph["dispositions"] if d["evidenceId"] == identity)
+        assert disposition["state"] == "unresolved"
+        assert disposition["rationale"].startswith(("Too large to read", "Fab data too large to read"))
 
 
 def test_other_packages_are_unchanged_by_the_name_rules():

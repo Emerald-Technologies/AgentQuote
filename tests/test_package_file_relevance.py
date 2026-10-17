@@ -73,7 +73,7 @@ GERBERS = _zip([("bottom.gbl", b"G04 bottom*" + bytes(range(256)) * 3)])
 def test_inventory_does_not_count_unused_bytes_and_lists_them_with_their_reason():
     roots = [_root(BOARD, "Board-1.zip", U), _root(GERBERS, "Board-2.zip", V)]
     used = 520 + 779  # the two Gerber files; ODB++, design source and 3D model are not counted
-    limits = InventoryLimits(aggregate_bytes=len(BOARD) + len(GERBERS) + used)
+    limits = InventoryLimits(aggregate_bytes=used)  # QuickQuote #99: files count once, archives not at all
     inventory = build_inventory(roots, limits=limits)
     paths = {"/".join(step["memberPath"] for step in item["archiveChain"]): item["category"] for item in inventory}
     assert paths["ODB/matrix/matrix"] == "not_used_odbpp"
@@ -81,7 +81,7 @@ def test_inventory_does_not_count_unused_bytes_and_lists_them_with_their_reason(
     assert paths["Board.step"] == "not_used_3d_model"
     assert paths["Gerber/top.gtl"] != "not_used_odbpp" and "bottom.gbl" in paths
     # One byte less and one archive no longer fits: it is kept whole, never failing the package.
-    smaller = build_inventory(roots, limits=InventoryLimits(aggregate_bytes=len(BOARD) + len(GERBERS) + used - 1))
+    smaller = build_inventory(roots, limits=InventoryLimits(aggregate_bytes=used - 1))
     assert len({item["documentId"] for item in smaller if item["archiveChain"]}) == 1
 
 

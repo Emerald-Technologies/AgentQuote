@@ -12,7 +12,7 @@ from .package_evidence_contracts import (
     PackageEvidenceError, assemblies_metadata, association_id, detached, hash_value,
     integer, json_bytes, object_hash, require, strict, text, utf16_units, uuid_value,
 )
-from .package_evidence_inventory import InventoryLimits, build_inventory
+from .package_evidence_inventory import InventoryLimits, build_inventory_report
 from .package_evidence_occurrences import read_occurrences
 
 
@@ -261,6 +261,8 @@ def prepare(context: dict, roots: list[dict], workbooks: dict[str, bytes], *, pr
     retained = 0
     def observe(identity, payload, file_name):
         nonlocal retained
+        if payload is None:  # listed, not read (QuickQuote #99): no text to keep
+            return
         from .package_manufacturing_assessment import complete_source
         source = complete_source(identity, payload, file_name)
         if source is not None:
@@ -270,7 +272,10 @@ def prepare(context: dict, roots: list[dict], workbooks: dict[str, bytes], *, pr
                 largest = max(kept, key=lambda key: (kept[key][0], key))
                 retained -= kept.pop(largest)[0]
     require(not include_manufacturing or include_classification, "ASSESSMENT_CLASSIFICATION_REQUIRED")
-    inventory = build_inventory(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
+    report = build_inventory_report(roots, limits=inventory_limits, observe=observe if include_manufacturing else None)
+    inventory = report["inventory"]
+    # Members over the per-file limit, listed and hash-pinned but not read (#99): evidenceId -> warning.
+    not_read = {finding["evidenceId"]: finding for finding in report["notRead"]}
     sources = [kept[key][1] for key in sorted(kept)]
     from .package_evidence_contracts import RETAINED_POLICIES
     require((policy_version in RETAINED_POLICIES) == (retained_bom_sources is not None), "RETENTION_POLICY_BINDING")
@@ -286,7 +291,7 @@ def prepare(context: dict, roots: list[dict], workbooks: dict[str, bytes], *, pr
             require(root_metadata[bom["documentId"]] == bom, "CONFLICTING_SOURCE_BOM_IDENTITY")
     rows = read_occurrences(context["assemblies"], workbooks)
     return {"context": context, "provenance": provenance, "inventory": inventory, "rows": rows,
-            "sources": sources, "retained": retained_objects,
+            "sources": sources, "retained": retained_objects, "not_read": not_read,
             "retained_bom_sources": retained_bom_sources,
             "include_classification": include_classification,
             "include_manufacturing": include_manufacturing}
@@ -315,7 +320,7 @@ def finish(prepared: dict, hints, classifications, manufacturing, *, review_inpu
     # Root archives not unpacked (aggregate size budget) keep a code-owned category. Their contents
     # were never seen, so only an included link (for example a package name rule) may stand; any
     # other answer is left for a person, never an unseen exclusion.
-    from .package_evidence_inventory import NOT_INVENTORIED_FORMAT
+    from .package_evidence_inventory import NOT_INVENTORIED_FORMAT, NOT_READ_FORMAT
     set_aside = {item["evidenceId"] for item in inventory
                  if not item["archiveChain"] and item["format"] == NOT_INVENTORIED_FORMAT}
     for identity in set_aside:
@@ -324,6 +329,16 @@ def finish(prepared: dict, hints, classifications, manufacturing, *, review_inpu
                     {"evidenceId": item["evidenceId"], "state": "unresolved", "replacementEvidenceId": None,
                      "rationale": "Archive not unpacked: the package is over the 500 MB evidence size limit, so its "
                                   "contents were not checked. Open it and map it by hand.", "citations": []}
+                    for item in dispositions]
+    # Members over the per-file limit (QuickQuote #99, D2) were listed, not read: the same rule. A code-owned
+    # category, and only an included link may stand; otherwise a person decides, with the named warning as rationale
+    # (louder when the file looks like the board's only fab data). Never a stop for the package.
+    not_read = prepared.get("not_read", {})
+    for identity in not_read:
+        categories[identity] = NOT_READ_FORMAT
+    dispositions = [item if item["evidenceId"] not in not_read or item["state"] == "included" else
+                    {"evidenceId": item["evidenceId"], "state": "unresolved", "replacementEvidenceId": None,
+                     "rationale": not_read[item["evidenceId"]]["message"], "citations": []}
                     for item in dispositions]
     # Known-unused files (QuickQuote #134) carry their reason code as category only while they are
     # not needed; a file the producer still links keeps a plain format category.
