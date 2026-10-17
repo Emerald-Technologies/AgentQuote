@@ -23,8 +23,25 @@ REQUESTED = [{"assembly_id": A1, "part_number": "XYZ0100-11111-TK", "revision": 
 BOM_1 = xlsx({"BOM": [HEADER] + lines(4)})
 BOM_2 = xlsx({"BOM": [HEADER] + lines(5, start=20)})
 BOM_2_MOD = xlsx({"BOM": [HEADER] + lines(6, start=20)})
-# A root workbook that names no requested assembly: the name-match pre-pass does not apply.
+# A root workbook that names no requested assembly. Since D7 (2026-10-17) it no longer stops the
+# name-match pre-pass, so these packages would be mapped from their names; survey_without_pre_pass
+# below turns the pre-pass off so the ranked survey itself is tested.
 QUOTE = xlsx({"Request": [["Customer", "Date"], ["Synthetic customer", "2026-10-14"]]})
+
+
+@pytest.fixture(autouse=True)
+def survey_without_pre_pass(request, monkeypatch):
+    """Every test here runs the model survey, except the one about the pre-pass's own record."""
+    if "pre_pass" not in request.node.name:
+        monkeypatch.setattr("bom_processor.package_name_match.name_match_survey", lambda view, hashes: None)
+
+
+def test_the_d7_pre_pass_maps_these_packages_from_their_names(monkeypatch):
+    """The packages above, with the pre-pass on: the quote workbook and the deep CSV no longer stop it."""
+    from test_package_name_match import no_model
+    result = run(no_model)
+    assert result["model_calls"] == 0 and result["survey"]["basis"] == "name_match_prepass"
+    assert decisions(result)["doc-quote"] == ("excluded", "not_surveyed")
 PICK = b"Ref,X,Y\nC1,1,2\n"
 GERBER = b"G04 synthetic*\n%FSLAX24Y24*%\nM02*\n"
 DEEP_BOM_2 = ("Item,Part Number,Manufacturer,MPN,Qty\n" + "".join(
