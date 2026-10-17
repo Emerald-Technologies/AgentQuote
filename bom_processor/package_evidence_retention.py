@@ -36,10 +36,14 @@ def retained_inventory(inventory, roots, source_proof):
     originals = validate_retained_sources(source_proof, roots)
     names = {r["documentId"]: r["fileName"] for r in roots}
     retained = {}
+    # A root archive with no inventoried members was not unpacked (size budget, or empty): it is
+    # the only record of its contents, never retained provenance (mirrors QuickQuote).
+    unpacked_roots = {item["documentId"] for item in inventory if item["archiveChain"]}
     for item in inventory:
         name = item["archiveChain"][-1]["memberPath"] if item["archiveChain"] else names[item["documentId"]]
         if re.search(r"\.zip$", name, re.I):
-            retained[item["evidenceId"]] = "archive_container"
+            if item["archiveChain"] or item["documentId"] in unpacked_roots:
+                retained[item["evidenceId"]] = "archive_container"
         elif not item["archiveChain"] and item["documentId"] in originals:
             retained[item["evidenceId"]] = "original_bom_input"
     return retained

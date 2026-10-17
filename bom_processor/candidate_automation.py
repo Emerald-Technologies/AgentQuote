@@ -179,6 +179,12 @@ class CandidateAutomationService:
             return self._request_policy(request_id)._start_author_locked(request_id)
 
     def _start_author_locked(self, request_id: str) -> str | None:
+        # An approved parser in the customer's registry that every source matches is used before
+        # any model or budget start (registry_reuse); otherwise today's path continues.
+        if not any(path.endswith("/candidate-manifest.json") for path in self._paths(f"candidates/{request_id}/")):
+            from .registry_reuse import reuse
+            if reuse(self.storage, request_id) is not None:
+                return "registry_reused"
         if self._budget_required(request_id):
             from .author_budget import Budget
             budget = Budget(self.storage, request_id, clock=self.budget_clock)
