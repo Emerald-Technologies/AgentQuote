@@ -182,3 +182,190 @@ def test_an_empty_or_header_only_top_level_spreadsheet_does_not_stop_the_pre_pas
     assert record["role"] == "not_surveyed" and not result["survey"]["has_blocking_findings"]
     assert decisions(result)["doc-1"] == ("process", "only_bom", [A1])
     assert decisions(result)["doc-2"] == ("process", "only_bom", [A2])
+
+
+# --- QQ #99 D7: folder and zip path as a clue, at any depth -----------------------------------------
+
+from bom_processor.package_name_match import name_match_survey, path_names  # noqa: E402
+from bom_processor.package_survey import build_view, expand_package  # noqa: E402
+
+B1 = "33333333-cccc-4ccc-8ccc-333333333333"
+B2 = "44444444-dddd-4ddd-8ddd-444444444444"
+REQUESTED_B = [{"assembly_id": B1, "part_number": "XYZ0100-11111-TK", "revision": "B"},
+               {"assembly_id": B2, "part_number": "XYZ0100-22222-TK", "revision": "B"}]
+PICK = b"Designator,X,Y,Rotation,Side\nC1,1.0,2.0,90,Top\n"
+NOTES = xlsx({"Notes": [["Customer", "Due date"], ["Example Co", "2026-11-01"]]})
+
+
+def prepass(files, requested=REQUESTED_B, documents=None):
+    """The pre-pass alone (no survey, no model): the survey record, or None when it falls back."""
+    view = build_view(expand_package(list(files.items())), [dict(item) for item in requested])
+    documents = documents if documents is not None else [BOM_1, BOM_2]
+    return name_match_survey(view, {hashlib.sha256(data).hexdigest() for data in documents})
+
+
+def links(survey):
+    """path -> requested assembly id of each linked file."""
+    return {record["path"]: record["requested_assembly"]["assembly_id"] for record in survey["files"]
+            if record["role"] == "bom"}
+
+
+def board(folder, bom, extra=None):
+    """One assembly's folder: its BOM under BOM/, Gerbers and a pick-and-place file beside it."""
+    members = {f"{folder}/BOM/{bom[0]}": bom[1], f"{folder}/Gerbers/top.gbr": GERBER,
+               f"{folder}/Assembly/pick and place.csv": PICK}
+    members.update(extra or {})
+    return members
+
+
+# Folder names a person reads as the assembly: "<PN>", "<PN> Rev B", "<PN>_RevB", "ASSY <PN>".
+LAYOUTS = {
+    # Depth 1: each assembly's zip is named for it; the BOM is loose inside.
+    "zip_name": lambda: {"XYZ0100-11111.zip": archive({"bom.xlsx": BOM_1, "top.gbr": GERBER}),
+                         "0100-22222 Rev B.zip": archive({"bom.xlsx": BOM_2, "top.gbr": GERBER})},
+    # Depth 3: one package zip, "<PN>" and "<PN> Rev B" folders, BOMs under BOM/.
+    "folders": lambda: {"Package.zip": archive({**board("0100-11111", ("bom.xlsx", BOM_1)),
+                                                **board("0100-22222 Rev B", ("bill of materials.xlsx", BOM_2))})},
+    # Depth 3: "<PN>_RevB" and "ASSY <PN>" folders.
+    "separators": lambda: {"Package.zip": archive({**board("0100-11111_RevB", ("bom.xlsx", BOM_1)),
+                                                   **board("ASSY 0100-22222", ("parts.xlsx", BOM_2))})},
+    # Depth 4 and 5: nested zips; the clue is the inner zip name for one and a folder for the other.
+    "nested_zips": lambda: {"Package.zip": archive({
+        "Boards/XYZ0100-11111-TK.zip": archive({"BOM/bom.xlsx": BOM_1, "Gerbers/top.gbr": GERBER}),
+        "Boards/Board B.zip": archive({"Docs/0100-22222/bom.xlsx": BOM_2, "pick and place.csv": PICK})})},
+}
+
+
+@pytest.mark.parametrize("layout", sorted(LAYOUTS))
+def test_boms_in_folders_and_nested_zips_are_matched_without_the_survey(layout):
+    survey = prepass(LAYOUTS[layout]())
+    assert survey is not None and survey["model_calls"] == 0 and survey["basis"] == BASIS
+    linked = links(survey)
+    assert sorted(linked.values()) == [B1, B2]
+    assert {link["matched_in"] for link in survey["prepass"]["links"]} <= {"file_name", "folder"}
+    records = {record["path"]: record for record in survey["files"]}
+    assert all(records[path]["role"] == "not_surveyed" for path in records if path not in linked)
+    assert not survey["has_blocking_findings"]
+
+
+def test_bom_depths_one_to_four_end_to_end_without_a_model_call():
+    files = {"XYZ0100-11111-TK.zip": archive({"BOM/Rev B/bom.xlsx": BOM_1}),
+             "Package.zip": archive({"Inner.zip": archive({"ASSY 0100-22222/bom.xlsx": BOM_2})})}
+    value = {**request(), "requested_assemblies": [dict(item) for item in REQUESTED_B]}
+    result = decide(value, list(files.items()), no_model)
+    assert result["model_calls"] == 0
+    assert decisions(result)["doc-1"] == ("process", "only_bom", [B1])
+    assert decisions(result)["doc-2"] == ("process", "only_bom", [B2])
+    for depth, files in enumerate([{"0100-11111.zip": archive({"a.xlsx": BOM_1})},
+                                   {"P.zip": archive({"0100-11111/a.xlsx": BOM_1})},
+                                   {"P.zip": archive({"0100-11111/x/a.xlsx": BOM_1})},
+                                   {"P.zip": archive({"0100-11111/x/y/a.xlsx": BOM_1})}], 1):
+        files["0100-22222 BOM.xlsx"] = BOM_2
+        survey = prepass(files)
+        assert survey is not None, depth
+        assert sorted(path.count("/") for path in links(survey)) == [0, depth]
+
+
+@pytest.mark.parametrize("folder", ["0100-11111", "XYZ0100-11111-TK", "0100-11111 Rev B", "0100-11111_RevB",
+                                    "0100_11111-RevB", "ASSY 0100-11111", "ASSY XYZ0100-11111 REV B",
+                                    "0100 11111 rev b.zip"])
+def test_path_names_reads_common_folder_names(folder):
+    matches, conflict = path_names(REQUESTED_B, f"Package.zip/{folder}/BOM/bom.xlsx")
+    assert not conflict and [match.requested["assembly_id"] for match in matches] == [B1]
+    assert matches[0].matched_in == "folder"
+
+
+@pytest.mark.parametrize("path", [
+    "Package.zip/0100-11111-02/bom.xlsx",            # a sibling dash number is another part
+    "Package.zip/0100-111112/bom.xlsx",              # a longer number is another part
+    "Package.zip/BOM/bom.xlsx"])
+def test_path_names_ignores_paths_that_do_not_name_the_assembly(path):
+    assert path_names(REQUESTED_B, path) == ([], False)
+
+
+def test_path_names_reports_conflicts():
+    # Two assemblies on one path: by folder and file name, nested folders, or one folder naming both.
+    assert path_names(REQUESTED_B, "P.zip/0100-11111/0100-22222/bom.xlsx")[1]
+    assert path_names(REQUESTED_B, "P.zip/0100-11111/0100-22222 BOM.xlsx")[1]
+    assert path_names(REQUESTED_B, "P.zip/0100-11111 and 0100-22222/bom.xlsx")[1]
+    # A written revision that contradicts the requested one.
+    assert path_names(REQUESTED_B, "P.zip/0100-11111 Rev C/bom.xlsx")[1]
+    matches, conflict = path_names(REQUESTED_B, "P.zip/0100-11111 Rev B/BOM 0100-11111.xlsx")
+    assert not conflict and matches[0].matched_in == "file_name" and matches[0].revision == "B"
+
+
+def test_a_top_level_spreadsheet_that_names_no_assembly_no_longer_cancels_the_fast_match():
+    files = dict(roots())
+    files["Quote request.xlsx"] = NOTES
+    result = decide(request({"doc-1": BOM_1, "doc-2": BOM_2, "doc-notes": NOTES}), list(files.items()), no_model)
+    assert result["model_calls"] == 0
+    assert decisions(result)["doc-notes"] == ("excluded", "not_surveyed", [])
+    assert decisions(result)["doc-1"] == ("process", "only_bom", [A1])
+    record = next(item for item in result["survey"]["files"] if item["path"] == "Quote request.xlsx")
+    assert record["role"] == "not_surveyed"
+
+
+def test_an_unnamed_spreadsheet_that_looks_like_a_bom_still_needs_the_survey_when_shallow():
+    # It may be a sub-assembly or a combined BOM: the survey and a person decide.
+    other = xlsx({"BOM": [HEADER] + lines(2, start=90)})
+    files = {"Package.zip": archive({**board("0100-11111", ("bom.xlsx", BOM_1)),
+                                     **board("0100-22222 Rev B", ("bom.xlsx", BOM_2)),
+                                     "Other/BOM.xlsx": other})}
+    assert prepass(files) is None
+    # Deeper than every matched BOM, it is ranked lower and listed.
+    files = {"Package.zip": archive({**board("0100-11111", ("bom.xlsx", BOM_1)),
+                                     **board("0100-22222 Rev B", ("bom.xlsx", BOM_2)),
+                                     "Other/CAD/Outputs/BOM.xlsx": other})}
+    assert prepass(files) is not None
+
+
+def test_two_assemblies_on_one_path_go_to_the_survey():
+    # The second assembly's only BOM sits in the first one's folder: no path names it alone.
+    nested = {"Package.zip": archive({"0100-11111/BOM/bom.xlsx": BOM_1,
+                                      "0100-11111/0100-22222/bom.xlsx": BOM_2})}
+    assert prepass(nested) is None
+    # The same BOM bytes in both assemblies' folders: one file is not two assemblies' BOM here.
+    shared = {"Package.zip": archive({"0100-11111/bom.xlsx": BOM_1, "0100-22222/bom.xlsx": BOM_1})}
+    assert prepass(shared, documents=[BOM_1]) is None
+    # A folder naming both assemblies, as shallow as the matched BOMs.
+    both = {"Package.zip": archive({"0100-11111/bom.xlsx": BOM_1, "0100-22222/bom.xlsx": BOM_2,
+                                    "0100-11111 and 0100-22222/bom.xlsx": xlsx({"BOM": [HEADER] + lines(1)})})}
+    assert prepass(both) is None
+
+
+def test_a_conflict_deeper_than_every_matched_bom_is_ranked_lower():
+    files = {"Package.zip": archive({"0100-11111/bom.xlsx": BOM_1, "0100-22222/bom.xlsx": BOM_2,
+                                     "0100-11111/old/0100-22222/bom.xlsx": xlsx({"BOM": [HEADER] + lines(1)})})}
+    assert sorted(links(prepass(files)).values()) == [B1, B2]
+
+
+def test_one_assembly_with_two_bom_files_at_the_same_depth_goes_to_the_survey():
+    files = {"Package.zip": archive({"0100-11111/bom.xlsx": BOM_1, "0100-11111/BOM modified.xlsx": xlsx(
+        {"BOM": [HEADER] + lines(4, start=30)}), "0100-22222/bom.xlsx": BOM_2})}
+    assert prepass(files) is None
+
+
+def test_the_bom_like_file_wins_over_other_spreadsheets_in_the_assembly_folder():
+    files = {"Package.zip": archive({**board("0100-11111", ("bom.xlsx", BOM_1), {"0100-11111/BOM/notes.xlsx": NOTES}),
+                                     **board("0100-22222", ("bom.xlsx", BOM_2))})}
+    assert set(links(prepass(files))) == {"Package.zip/0100-11111/BOM/bom.xlsx", "Package.zip/0100-22222/BOM/bom.xlsx"}
+
+
+def test_a_folder_revision_that_contradicts_the_request_goes_to_the_survey():
+    files = {"Package.zip": archive({"0100-11111 Rev A/bom.xlsx": BOM_1, "0100-22222 Rev B/bom.xlsx": BOM_2})}
+    assert prepass(files) is None
+    # The requested revision written in the folder is kept as the written revision.
+    files = {"Package.zip": archive({"0100-11111 Rev B/bom.xlsx": BOM_1, "0100-22222 Rev B/bom.xlsx": BOM_2})}
+    assert {link["file_name_revision"] for link in prepass(files)["prepass"]["links"]} == {"B"}
+
+
+def test_shallow_beats_deep_and_identical_copies_count_once():
+    # A loose BOM, its identical copy and an older BOM inside the board zip: the loose one is linked.
+    files = {"BOM 0100-11111 REV B.xlsx": BOM_1, "0100-22222.xlsx": BOM_2,
+             "XYZ0100-11111-TK.zip": archive({"BOM/bom.xlsx": BOM_1, "BOM/older bom.xlsx": xlsx(
+                 {"BOM": [HEADER] + lines(3, start=60)})})}
+    assert set(links(prepass(files))) == {"BOM 0100-11111 REV B.xlsx", "0100-22222.xlsx"}
+    # Identical copies at one depth are one candidate; the first by path is linked.
+    files = {"Package.zip": archive({"0100-11111/bom.xlsx": BOM_1, "0100-11111/bom (copy).xlsx": BOM_1,
+                                     "0100-11111/copy/bom.xlsx": BOM_1, "0100-22222/bom.xlsx": BOM_2})}
+    assert set(links(prepass(files))) == {"Package.zip/0100-11111/bom (copy).xlsx", "Package.zip/0100-22222/bom.xlsx"}
