@@ -16,7 +16,7 @@ from hashlib import sha256
 from typing import Any
 
 from .master_registry import html_table_raw_rows, RegistryError
-from .source_format import reading_extension
+from .source_format import is_macro_enabled, reading_extension
 
 # v2: formula cells carry their stored (cached) result and are listed in
 # formula_cells; v1 refused every workbook containing a formula.
@@ -46,7 +46,10 @@ class SourceInventory:
     formula_cells_known: bool = True
 
 
-def _zip_guard(data: bytes) -> None:
+def _zip_guard(data: bytes, *, macros_ignored: bool = False) -> None:
+    """Bound the package before openpyxl reads it. VBA parts are refused, except in a .xlsm
+    (macros_ignored), where they are left unread: openpyxl never loads them (keep_vba=False).
+    External link parts are always refused."""
     from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
     traversal_budget = 0
     try:
@@ -57,7 +60,8 @@ def _zip_guard(data: bytes) -> None:
                     or sum(entry.file_size for entry in entries) > MAX_BYTES
                     or any(entry.file_size > 8 * 1024 * 1024 or entry.flag_bits & 1 for entry in entries)):
                 raise InventoryError("SOURCE_ZIP_LIMIT")
-            if any("vba" in name.casefold() or "externallinks/" in name.casefold() for name in names):
+            if any(("vba" in name.casefold() and not macros_ignored) or "externallinks/" in name.casefold()
+                   for name in names):
                 raise InventoryError("SOURCE_ACTIVE_OR_EXTERNAL_CONTENT")
             for entry in entries:
                 if entry.filename.endswith(".xml"):
@@ -152,17 +156,19 @@ def extract_inventory(data: bytes, extension: str) -> SourceInventory:
                     raise InventoryError("SOURCE_CELL_LIMIT")
                 cells[(name, row_index, column)] = value
 
-    # A macro-free .xlsm is the same OOXML package and is read as .xlsx; _zip_guard still refuses
-    # any VBA part, and openpyxl never loads one (keep_vba is off).
+    # A .xlsm is the same OOXML package and is read as .xlsx. Its macros are ignored (QQ #99 D1):
+    # _zip_guard lets its VBA part through unread and openpyxl never loads it (keep_vba=False).
+    # Any other workbook with a VBA part, and any workbook with external links, is still refused.
+    macros_ignored = is_macro_enabled(extension)
     extension = reading_extension(extension)
     if extension == ".xlsx":
         from openpyxl import load_workbook
-        _zip_guard(data)
+        _zip_guard(data, macros_ignored=macros_ignored)
         # ZIP/dimension bounds precede cell traversal; merged anchors remain
         # explicit, never silently filled into other cells.
-        book = load_workbook(io.BytesIO(data), data_only=False, keep_links=False)
+        book = load_workbook(io.BytesIO(data), data_only=False, keep_links=False, keep_vba=False)
         # The same bytes opened for stored results; formulas are never evaluated.
-        cached = load_workbook(io.BytesIO(data), data_only=True, keep_links=False)
+        cached = load_workbook(io.BytesIO(data), data_only=True, keep_links=False, keep_vba=False)
         try:
             for sheet in book.worksheets:
                 if sheet.max_row > MAX_ROWS or sheet.max_column > MAX_COLUMNS:

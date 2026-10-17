@@ -7,9 +7,12 @@ says "macro-enabled". It is accepted as a BOM source and read exactly like a .xl
   (staged_input_name), so no parser, reader or worker image needs to know about .xlsm;
 - provenance keeps the original file name and records the format (check_source).
 
-Macros are never loaded or run: openpyxl opens it values-only with keep_vba=False. A .xlsm that
-holds a VBA project is refused (fail closed, Nick 2026-10-14: macro-free .xlsm only), as is one
-openpyxl cannot read or whose workbook content type is not a plain or macro-enabled worksheet.
+Macros are never loaded or run, and external links are never followed or refreshed: openpyxl opens
+it read-only with data_only=True (the values Excel stored; no formula is evaluated), keep_vba=False
+(the VBA part is never loaded) and keep_links=False. A .xlsm that holds macros is accepted by its
+name and read as data only (QQ #99 D1, Nick 2026-10-17); its record says vba_project_present and
+carries one information finding, MACROS_IGNORED ("macros ignored"). It is refused when openpyxl
+cannot read it or its workbook content type is not a plain or macro-enabled worksheet.
 Input: a blob path or extension, and the source bytes. Output: names, extensions and a provenance
 dict; failures raise SourceFormatError with a stable code. No I/O beyond reading the given bytes.
 Run python -m pytest tests/test_source_format.py.
@@ -37,6 +40,11 @@ XLSM_MEDIA_TYPE = "application/vnd.ms-excel.sheet.macroEnabled.12"
 _CONTENT_TYPES_PART = "[Content_Types].xml"
 _TYPES_NAMESPACE = "{http://schemas.openxmlformats.org/package/2006/content-types}"
 _DOCTYPE = re.compile(rb"<!DOCTYPE|<!ENTITY", re.I)
+
+
+MACROS_IGNORED = "MACROS_IGNORED"
+MACROS_IGNORED_TEXT = ("macros ignored: the workbook holds macros; they were never loaded or run, "
+                       "and only the cell values Excel stored were read")
 
 
 class SourceFormatError(ValueError):
@@ -92,10 +100,11 @@ def _workbook_content_type(archive: zipfile.ZipFile) -> str:
 
 
 def check_source(blob_path: str, data: bytes) -> dict[str, Any] | None:
-    """Fail closed on a .xlsm that is not a readable, macro-free worksheet; None for other formats.
+    """Fail closed on a .xlsm that is not a readable worksheet; None for other formats.
 
     Returns the provenance record for a .xlsm. Every sheet is read through openpyxl, values only,
-    so a file a parser could not open is refused here, before any parser or model sees it.
+    so a file a parser could not open is refused here, before any parser or model sees it. Macros
+    are not a refusal: they are never loaded, and the record flags them (MACROS_IGNORED).
     """
     if not is_macro_enabled(blob_path):
         return None
@@ -107,14 +116,11 @@ def check_source(blob_path: str, data: bytes) -> dict[str, Any] | None:
         has_vba = _ooxml_guard(data)
     except _Unreadable as exc:
         raise SourceFormatError("SOURCE_WORKBOOK_UNREADABLE") from exc
-    if has_vba:
-        raise SourceFormatError("SOURCE_WORKBOOK_HAS_MACROS")
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = [name.casefold() for name in archive.namelist()]
-            # Any VBA part, wherever a writer put it, is active content (as the row inventory rules).
-            if any("vba" in name for name in names):
-                raise SourceFormatError("SOURCE_WORKBOOK_HAS_MACROS")
+            # Any VBA part, wherever a writer put it, counts as macros (as the row inventory rules).
+            has_vba = has_vba or any("vba" in name for name in names)
             content_type = _workbook_content_type(archive)
     except zipfile.BadZipFile as exc:
         raise SourceFormatError("SOURCE_WORKBOOK_UNREADABLE") from exc
@@ -136,5 +142,8 @@ def check_source(blob_path: str, data: bytes) -> dict[str, Any] | None:
     finally:
         if book is not None:
             book.close()
+    findings = ([{"code": MACROS_IGNORED, "severity": "information", "rationale": MACROS_IGNORED_TEXT,
+                  "raised_by": "code"}] if has_vba else [])
     return {"version": FORMAT_VERSION, "extension": MACRO_ENABLED_EXTENSION, "read_as": ".xlsx",
-            "workbook_content_type": content_type, "vba_project_present": False, "macros_run": False}
+            "workbook_content_type": content_type, "vba_project_present": has_vba, "macros_run": False,
+            "findings": findings}

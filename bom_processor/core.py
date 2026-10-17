@@ -36,7 +36,7 @@ from .canonical_format import (  # noqa: E402  (re-exported for existing importe
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
-# .xlsm (macro-free) is read and staged as the .xlsx it is (source_format.py).
+# .xlsm is read and staged as the .xlsx it is; macros are never loaded (source_format.py).
 _SOURCE_EXTENSIONS = SOURCE_EXTENSIONS
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,254}$")
 # Package files (plan 8.8 step 2, Nick 2026-10-08): the uploaded root files for the
@@ -758,7 +758,6 @@ def _sha256(data: bytes) -> str:
 
 _SOURCE_FORMAT_MESSAGES = {
     "SOURCE_WORKBOOK_UNREADABLE": "source workbook unreadable",
-    "SOURCE_WORKBOOK_HAS_MACROS": "source workbook contains macros",
     "SOURCE_WORKBOOK_CONTENT_TYPE": "source workbook type unsupported",
 }
 

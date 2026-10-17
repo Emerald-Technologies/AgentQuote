@@ -1,9 +1,11 @@
-"""Macro-free .xlsm workbooks as BOM sources, read exactly like .xlsx. Offline, synthetic files only.
+""".xlsm workbooks as BOM sources, read exactly like .xlsx. Offline, synthetic files only.
 
 Each fixture is an openpyxl-written .xlsx whose workbook part is relabelled with the macro-enabled
-content type, which is all that separates a macro-free .xlsm from a .xlsx. Covers: the intake rule,
-the fail-closed format check, the parse (local and remote worker staging), validation and the row
-inventory, registry layout matching, the survey and the name-match pre-pass, and retention.
+content type, which is all that separates a macro-free .xlsm from a .xlsx; the macro fixtures add a
+synthetic, non-executable xl/vbaProject.bin. A .xlsm with macros is read as data only and flagged
+"macros ignored" (QQ #99 D1, Nick 2026-10-17). Covers: the intake rule, the fail-closed format
+check, the parse (local and remote worker staging), validation and the row inventory, registry
+layout matching, the survey (loose and inside a zip) and the name-match pre-pass, and retention.
 Run: py -3.12 -m pytest tests/test_source_format.py -q -p no:cacheprovider
 """
 import hashlib
@@ -26,8 +28,8 @@ from bom_processor.master_registry import VariantSignature, profile_bytes
 from bom_processor.package_evidence_retention import validate_retained_sources
 from bom_processor.package_survey import file_kind
 from bom_processor.row_accounting import verify_row_map
-from bom_processor.source_format import (FORMAT_VERSION, SourceFormatError, check_source, is_macro_enabled,
-                                         reading_extension, staged_input_name)
+from bom_processor.source_format import (FORMAT_VERSION, MACROS_IGNORED, MACROS_IGNORED_TEXT, SourceFormatError,
+                                         check_source, is_macro_enabled, reading_extension, staged_input_name)
 
 XLSX_MAIN = b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
 XLSM_MAIN = b"application/vnd.ms-excel.sheet.macroEnabled.main+xml"
@@ -77,6 +79,9 @@ BOM_ROWS = [["Item", "Part Number", "Manufacturer", "MPN", "Qty"],
             [1, "P-1", "Maker", "M-1", 2], [2, "P-2", "Maker", "M-2", 1]]
 XLSX = sheet_bytes(BOM_ROWS)
 XLSM = xlsm(XLSX)
+XLSM_MACROS = xlsm(XLSX, vba=True)
+MACROS_IGNORED_FINDING = {"code": MACROS_IGNORED, "severity": "information", "rationale": MACROS_IGNORED_TEXT,
+                          "raised_by": "code"}
 
 
 # --- names, extensions and the fixture itself ---------------------------------------------------
@@ -113,7 +118,8 @@ def test_staged_input_names():
 def test_a_macro_free_xlsm_passes_with_provenance():
     assert check_source(f"{PREFIX}/doc1-bom.xlsm", XLSM) == {
         "version": FORMAT_VERSION, "extension": ".xlsm", "read_as": ".xlsx",
-        "workbook_content_type": XLSM_MAIN.decode(), "vba_project_present": False, "macros_run": False}
+        "workbook_content_type": XLSM_MAIN.decode(), "vba_project_present": False, "macros_run": False,
+        "findings": []}
     # A plain worksheet saved under the .xlsm name is macro-free too.
     assert check_source("doc.xlsm", XLSX)["workbook_content_type"] == XLSX_MAIN.decode()
 
@@ -124,7 +130,6 @@ def test_other_formats_are_not_checked_here():
 
 
 @pytest.mark.parametrize("data, code", [
-    (xlsm(XLSX, vba=True), "SOURCE_WORKBOOK_HAS_MACROS"),
     (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "SOURCE_WORKBOOK_UNREADABLE"),  # legacy .xls renamed
     (b"PK\x03\x04 truncated", "SOURCE_WORKBOOK_UNREADABLE"),
     (XLSM[: len(XLSM) // 2], "SOURCE_WORKBOOK_UNREADABLE"),
@@ -134,13 +139,21 @@ def test_other_formats_are_not_checked_here():
     (relabel(XLSX, drop=("xl/workbook.xml",)), "SOURCE_WORKBOOK_UNREADABLE"),
     (relabel(XLSX, drop=("xl/worksheets/sheet1.xml",)), "SOURCE_WORKBOOK_UNREADABLE"),
 ])
-def test_an_xlsm_that_is_not_a_readable_macro_free_worksheet_is_refused(data, code):
+def test_an_xlsm_that_is_not_a_readable_worksheet_is_refused(data, code):
     with pytest.raises(SourceFormatError) as error:
         check_source("doc.xlsm", data)
     assert error.value.code == code
 
 
-def test_a_vba_part_anywhere_in_the_package_is_refused():
+def test_an_xlsm_with_macros_is_read_as_data_and_flagged_macros_ignored():
+    assert check_source(f"{PREFIX}/doc1-bom.xlsm", XLSM_MACROS) == {
+        "version": FORMAT_VERSION, "extension": ".xlsm", "read_as": ".xlsx",
+        "workbook_content_type": XLSM_MAIN.decode(), "vba_project_present": True, "macros_run": False,
+        "findings": [MACROS_IGNORED_FINDING]}
+    assert MACROS_IGNORED_TEXT.startswith("macros ignored")
+
+
+def test_a_vba_part_anywhere_in_the_package_is_flagged():
     with zipfile.ZipFile(io.BytesIO(XLSM)) as source:
         parts = {name: source.read(name) for name in source.namelist()}
     out = io.BytesIO()
@@ -148,9 +161,8 @@ def test_a_vba_part_anywhere_in_the_package_is_refused():
         for name, part in parts.items():
             target.writestr(name, part)
         target.writestr("customXml/VBAData.xml", b"<x/>")
-    with pytest.raises(SourceFormatError) as error:
-        check_source("doc.xlsm", out.getvalue())
-    assert error.value.code == "SOURCE_WORKBOOK_HAS_MACROS"
+    record = check_source("doc.xlsm", out.getvalue())
+    assert record["vba_project_present"] is True and record["findings"] == [MACROS_IGNORED_FINDING]
 
 
 # --- intake and the parse -----------------------------------------------------------------------
@@ -196,6 +208,21 @@ def test_local_processing_parses_an_xlsm_as_input_xlsx_and_records_the_format():
     assert parsed["item_name"].tolist() == ["Widget from xlsm"]
 
 
+def test_local_processing_reads_an_xlsm_with_macros_as_data_and_flags_it():
+    source = xlsm(output_workbook(item_name="Widget beside macros"), vba=True)
+    path = f"{PREFIX}/doc1-bom.xlsm"
+    storage = InMemoryStorage(sources={path: source}, parsers={"Parser1/parse.py": READING_PARSER})
+    result = BomProcessor(storage).process(request(path, source))["results"][0]
+    assert result["source"]["sha256"] == hashlib.sha256(source).hexdigest()  # bytes unchanged
+    assert result["source_format"]["vba_project_present"] is True
+    assert result["source_format"]["macros_run"] is False
+    assert result["source_format"]["findings"] == [MACROS_IGNORED_FINDING]
+    parsed = pd.read_excel(io.BytesIO(storage.outputs[result["output"]["blob_path"]]))
+    assert parsed["item_name"].tolist() == ["Widget beside macros"]
+    with zipfile.ZipFile(io.BytesIO(storage.outputs[result["output"]["blob_path"]])) as output:
+        assert not [name for name in output.namelist() if "vba" in name.casefold()]
+
+
 def test_an_xlsx_manifest_is_unchanged():
     source = output_workbook()
     path = f"{PREFIX}/doc1-bom.xlsx"
@@ -205,7 +232,6 @@ def test_an_xlsx_manifest_is_unchanged():
 
 
 @pytest.mark.parametrize("data, message", [
-    (xlsm(output_workbook(), vba=True), "source workbook contains macros"),
     (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "source workbook unreadable"),
     (relabel(output_workbook(), b"application/vnd.ms-excel.template.macroEnabled.main+xml"),
      "source workbook type unsupported"),
@@ -238,10 +264,20 @@ def test_the_remote_worker_is_given_the_xlsm_bytes_as_input_xlsx():
     assert stored["results"][0]["source_format"]["extension"] == ".xlsm"
 
 
-def test_the_remote_processor_fails_closed_before_starting_a_worker():
+def test_the_remote_worker_is_given_an_xlsm_with_macros_unchanged_and_the_result_is_flagged():
     source, path = xlsm(output_workbook(), vba=True), f"{PREFIX}/doc1-bom.xlsm"
     processor, storage, orchestration = remote(path, source, output_workbook())
-    with pytest.raises(ProcessingError, match="source workbook contains macros"):
+    manifest = processor.process(request(path, source))
+    item = orchestration.calls[0]
+    assert item.input_name == "input.xlsx" and item.input_sha256 == hashlib.sha256(source).hexdigest()
+    assert manifest["results"][0]["source_format"]["vba_project_present"] is True
+    assert manifest["results"][0]["source_format"]["findings"] == [MACROS_IGNORED_FINDING]
+
+
+def test_the_remote_processor_fails_closed_before_starting_a_worker():
+    source, path = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, f"{PREFIX}/doc1-bom.xlsm"
+    processor, storage, orchestration = remote(path, source, output_workbook())
+    with pytest.raises(ProcessingError, match="source workbook unreadable"):
         processor.process(request(path, source))
     assert orchestration.calls == []
 
@@ -254,9 +290,23 @@ def test_the_row_inventory_reads_an_xlsm_exactly_like_the_xlsx():
     assert macro_enabled.sha256 == hashlib.sha256(XLSM).hexdigest()
 
 
-def test_the_row_inventory_still_refuses_active_content():
+def test_the_row_inventory_reads_an_xlsm_with_macros_as_data_only():
+    plain, with_macros = extract_inventory(XLSX, ".xlsx"), extract_inventory(XLSM_MACROS, ".xlsm")
+    assert with_macros.cells == plain.cells and with_macros.sheets == plain.sheets
+    assert with_macros.sha256 == hashlib.sha256(XLSM_MACROS).hexdigest()
+
+
+def test_the_row_inventory_still_refuses_macros_outside_an_xlsm_and_external_links_everywhere():
+    # A VBA part in a file not named .xlsm is unexpected active content.
     with pytest.raises(InventoryError, match="SOURCE_ACTIVE_OR_EXTERNAL_CONTENT"):
-        extract_inventory(xlsm(XLSX, vba=True), ".xlsm")
+        extract_inventory(relabel(XLSX, XLSX_MAIN, vba=True), ".xlsx")
+    linked = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(XLSM_MACROS)) as source, zipfile.ZipFile(linked, "w") as target:
+        for item in source.infolist():
+            target.writestr(item, source.read(item))
+        target.writestr("xl/externalLinks/externalLink1.xml", b"<externalLink/>")
+    with pytest.raises(InventoryError, match="SOURCE_ACTIVE_OR_EXTERNAL_CONTENT"):
+        extract_inventory(linked.getvalue(), ".xlsm")
 
 
 def test_row_accounting_verifies_a_row_map_against_an_xlsm_source():
@@ -264,6 +314,8 @@ def test_row_accounting_verifies_a_row_map_against_an_xlsm_source():
     source, out, row_map = good()
     result = verify_row_map(xlsm(source), ".xlsm", out, json.dumps(row_map).encode())
     assert result["valid"] is True and result["failed_rows"] == []
+    with_macros = verify_row_map(xlsm(source, vba=True), ".xlsm", out, json.dumps(row_map).encode())
+    assert with_macros["valid"] is True and with_macros["failed_rows"] == []
 
 
 def test_an_xlsm_profiles_as_xlsx_and_matches_a_layout_approved_from_an_xlsx():
@@ -325,11 +377,12 @@ def test_the_survey_types_an_xlsm_as_an_ooxml_spreadsheet():
     assert file_kind("folder/BOM.XLSM", XLSM) == "spreadsheet_ooxml"
 
 
-def test_the_name_match_pre_pass_maps_a_loose_xlsm_bom():
+@pytest.mark.parametrize("macros", [False, True])
+def test_the_name_match_pre_pass_maps_a_loose_xlsm_bom_as_an_assemblys_only_bom(macros):
     from bom_processor.bom_package_choice import decide
     from test_package_name_match import BOM_1, BOM_2, PCB_1, PCB_2, A1, A2, decisions, no_model, request as choice_request
 
-    bom_1 = xlsm(BOM_1)
+    bom_1 = xlsm(BOM_1, vba=macros)
     files = [("BOM 0100-11111 REV 01.xlsm", bom_1), ("BOM 0100-22222 REV 03.xlsx", BOM_2),
              ("XYZ0100-11111-TK.zip", PCB_1), ("XYZ0100-22222-TK.zip", PCB_2)]
     result = decide(choice_request({"doc-1": bom_1, "doc-2": BOM_2}), files, no_model)
@@ -337,6 +390,36 @@ def test_the_name_match_pre_pass_maps_a_loose_xlsm_bom():
     assert decisions(result) == {"doc-1": ("process", "only_bom", [A1]), "doc-2": ("process", "only_bom", [A2])}
     records = {item["path"]: item for item in result["survey"]["files"]}
     assert records["BOM 0100-11111 REV 01.xlsm"]["requested_assembly"]["link"] == "confirmed"
+
+
+def test_an_assemblys_only_bom_as_an_xlsm_with_macros_inside_a_zip_is_surveyed_as_data_and_parsed():
+    """The ASSY-100 folder holds no .xlsx/.xls/.csv BOM, only a macro .xlsm (the measured local failure)."""
+    from bom_processor.package_survey import build_view, expand_package
+    from test_package_survey import archive
+
+    # Already in the canonical layout, so the reading parser below can pass it through unchanged.
+    plain = output_workbook(item_number="P-1", item_name="ASSY-100 widget", manufacturer_1="Maker",
+                            manufacturer_item_number_1="M-2")
+    bom = xlsm(plain, vba=True)
+    package = [("package.zip", archive({
+        "ASSY-100/ASSY-100 BOM.xlsm": bom, "ASSY-100/fab/top.gbr": b"G04 synthetic*\n",
+        "ASSY-200/ASSY-200 BOM.xlsx": output_workbook(item_number="P-9", item_name="ASSY-200 widget"),
+    }))]
+    view = build_view(expand_package(package))
+    entry = next(view.entries[file_id] for file_id, item in view.files.items()
+                 if item.path.endswith("ASSY-100 BOM.xlsm"))
+    assert entry["kind"] == "spreadsheet_ooxml" and "unreadable" not in entry
+    assert entry["macros_present_not_opened"] is True  # survey finding SURVEY_MACROS_NOT_OPENED (information)
+    shown = json.dumps(entry["sheets"])
+    assert "ASSY-100" in shown and "P-1" in shown and "M-2" in shown
+    # The same member bytes, sent to processing as the assembly's BOM, parse as data and are flagged.
+    path = f"{PREFIX}/doc1-ASSY-100 BOM.xlsm"
+    storage = InMemoryStorage(sources={path: bom}, parsers={"Parser1/parse.py": READING_PARSER})
+    result = BomProcessor(storage).process(request(path, bom))["results"][0]
+    assert result["source_format"]["findings"] == [MACROS_IGNORED_FINDING]
+    parsed = pd.read_excel(io.BytesIO(storage.outputs[result["output"]["blob_path"]]))
+    assert parsed["item_name"].tolist() == ["ASSY-100 widget"]
+    assert extract_inventory(bom, ".xlsm").cells == extract_inventory(plain, ".xlsx").cells
 
 
 def test_an_original_xlsm_bom_is_a_retained_source():

@@ -117,7 +117,7 @@ class RemoteBomProcessor:
             source = self.storage.download_source(document.blob_path, self.max_source_bytes)
             if len(source) != document.size_bytes or _sha256(source).lower() != document.sha256.lower():
                 raise ProcessingError("source integrity check failed")
-            # Fail closed on a .xlsm openpyxl cannot read, or one holding macros, before any parser runs.
+            # Fail closed on a .xlsm openpyxl cannot read, before any parser runs; macros are only flagged.
             source_formats[document.document_id] = checked_source_format(document.blob_path, source)
             verified_sources[document.document_id] = source
         selections: dict[str, Any] = {}
