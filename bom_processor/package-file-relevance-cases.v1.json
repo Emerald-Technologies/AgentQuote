@@ -26,9 +26,9 @@
       "findings": []
     },
     {
-      "name": "Nested ODB++ archive next to a drill file",
-      "paths": ["Board-4.zip/Board-4_ODB.tgz", "Board-4.zip/NC Drill/board.xln", "Board-4.zip/Board-4.G1"],
-      "disregarded": {"Board-4.zip/Board-4_ODB.tgz": "not_used_odbpp"},
+      "name": "Nested archive named exactly ODB next to a drill file",
+      "paths": ["Board-4.zip/ODB.tgz", "Board-4.zip/NC Drill/board.xln", "Board-4.zip/Board-4.G1"],
+      "disregarded": {"Board-4.zip/ODB.tgz": "not_used_odbpp"},
       "findings": []
     },
     {
@@ -85,8 +85,8 @@
     },
     {
       "name": "A loose ODB++ archive is not used when the package has Gerbers",
-      "paths": ["Board-9 ODB++.tgz", "Board-9 Gerbers.zip", "Board-9 Gerbers.zip/top.gtl", "BOM 0100-9.xlsx"],
-      "disregarded": {"Board-9 ODB++.tgz": "not_used_odbpp"},
+      "paths": ["ODB++.tgz", "Board-9 Gerbers.zip", "Board-9 Gerbers.zip/top.gtl", "BOM 0100-9.xlsx"],
+      "disregarded": {"ODB++.tgz": "not_used_odbpp"},
       "findings": []
     },
     {
@@ -99,6 +99,32 @@
       "name": "Names that only contain the letters odb are not ODB++",
       "paths": ["Board-11.zip/Kodbase/notes.txt", "Board-11.zip/odbc-driver.txt", "Board-11.zip/Gerber/top.gtl"],
       "disregarded": {},
+      "findings": []
+    },
+    {
+      "name": "An upload whose name contains ODB but holds only Gerbers and drill files",
+      "paths": ["Board ODB and Gerbers.zip", "Board ODB and Gerbers.zip/Gerber/top.gtl", "Board ODB and Gerbers.zip/Drill/board.drl"],
+      "disregarded": {},
+      "findings": []
+    },
+    {
+      "name": "An archive whose name only contains ODB is not ODB++ without its structure",
+      "paths": ["Board-13.zip/Board-13_ODB.tgz", "Board-13.zip/Gerber/top.gtl"],
+      "disregarded": {},
+      "findings": []
+    },
+    {
+      "name": "An ODB++ job at an archive root next to Gerbers: only the job's own folders are ODB++",
+      "paths": ["Board-12.zip", "Board-12.zip/matrix/matrix", "Board-12.zip/misc/info", "Board-12.zip/steps/pcb/layers/top/features",
+        "Board-12.zip/Gerber/top.gtl"],
+      "disregarded": {"Board-12.zip/matrix/matrix": "not_used_odbpp", "Board-12.zip/misc/info": "not_used_odbpp",
+        "Board-12.zip/steps/pcb/layers/top/features": "not_used_odbpp"},
+      "findings": []
+    },
+    {
+      "name": "An ODB++ job recognised by misc/info",
+      "paths": ["Board-14.zip/job/misc/info", "Board-14.zip/job/fonts/standard", "Board-14.zip/top.gbr"],
+      "disregarded": {"Board-14.zip/job/misc/info": "not_used_odbpp", "Board-14.zip/job/fonts/standard": "not_used_odbpp"},
       "findings": []
     }
   ]

@@ -7,7 +7,9 @@
     "kind": "odbpp",
     "reasonCode": "not_used_odbpp",
     "reason": "ODB++ data, a second copy of the board layers the Gerber files already give",
-    "namePattern": "(^|[^a-z0-9])odb(\\+\\+|pp)?([^a-z0-9]|$)"
+    "rootNames": ["odb", "odb++", "odbpp"],
+    "jobFolders": ["matrix", "steps", "misc", "fonts", "symbols", "input", "output", "user", "ext", "wheels"],
+    "aboutRecognition": "ODB++ needs its structure (<job>/matrix/matrix, <job>/steps/<step>/layers/..., <job>/misc/info; only the job's own top-level folders count) or a folder or archive named exactly one of rootNames. A name that merely contains ODB is not a clue."
   },
   "extensionKinds": [
     {

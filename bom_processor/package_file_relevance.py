@@ -50,7 +50,8 @@ def _load() -> tuple[dict, str]:
 
 
 RULES, RULES_SHA256 = _load()
-_ODB = re.compile(RULES["odbpp"]["namePattern"])
+_ODB_ROOTS = frozenset(RULES["odbpp"]["rootNames"])
+_ODB_JOB = frozenset(RULES["odbpp"]["jobFolders"])
 _FAB_EXT = re.compile(RULES["fabClues"]["extensionPattern"])
 _FAB_NAME = re.compile(RULES["fabClues"]["namePattern"])
 _NAMED = [(rule, re.compile(rule["segmentPattern"])) for rule in RULES["namedRules"]]
@@ -81,26 +82,48 @@ def _stem(name: str) -> str:
 
 
 def _odb_marker(low: list[str]) -> int | None:
-    """Index of the first folder or archive whose name says ODB++, else None."""
+    """Index of the first folder or archive named exactly like an ODB++ root (odb, odb++, odbpp), else None.
+
+    A name that only contains ODB (for example "Board ODB and Gerbers.zip") is not a clue.
+    """
     for index, segment in enumerate(low):
         stem, archive = _archive_stem(segment)
         if index == len(low) - 1 and not archive:
             return None
-        if _ODB.search(stem):
+        if stem in _ODB_ROOTS:
             return index
     return None
 
 
 def _job_roots(lows: list[list[str]]) -> set[tuple[str, ...]]:
-    """ODB++ job folders recognised by their structure: <job>/matrix/matrix or <job>/steps/<step>/layers/..."""
+    """ODB++ job folders recognised by their structure: <job>/matrix/matrix, <job>/steps/<step>/layers/...
+    or <job>/misc/info."""
     roots: set[tuple[str, ...]] = set()
     for low in lows:
-        if len(low) >= 3 and low[-1] == "matrix" and low[-2] == "matrix":
+        if len(low) >= 3 and low[-2:] in (["matrix", "matrix"], ["misc", "info"]):
             roots.add(tuple(low[:-2]))
         for k in range(1, len(low) - 3):
             if low[k] == "steps" and low[k + 2] == "layers":
                 roots.add(tuple(low[:k]))
     return roots
+
+
+def _job_markers(lows: list[list[str]]) -> list[int | None]:
+    """Per path, the index of its ODB++ job folder when the path is part of the job, else None.
+
+    Only paths in the job's own top-level folders (matrix, steps, misc, ...) belong to it, so Gerbers kept in the
+    same archive as an ODB++ job are not ODB++. The job's archive itself is ODB++ only when everything in it is.
+    """
+    markers: list[int | None] = [None] * len(lows)
+    for root in _job_roots(lows):
+        size = len(root)
+        under = [low for low in lows if len(low) > size and _starts(low, root)]
+        whole = bool(under) and all(low[size] in _ODB_JOB for low in under)
+        for index, low in enumerate(lows):
+            inside = len(low) > size and _starts(low, root) and low[size] in _ODB_JOB
+            if (inside or (whole and tuple(low) == root)) and (markers[index] is None or size - 1 < markers[index]):
+                markers[index] = size - 1
+    return markers
 
 
 def _starts(low: list[str], prefix: tuple[str, ...] | list[str]) -> bool:
@@ -129,14 +152,11 @@ def classify(paths: list[list[str]]) -> tuple[list[dict | None], list[dict]]:
     lows = [[segment.lower() for segment in path] for path in paths]
     if any(not low for low in lows):
         raise ValueError("RELEVANCE_PATH_INVALID")
-    roots = _job_roots(lows)
+    jobs = _job_markers(lows)
     markers: list[int | None] = []
-    for low in lows:
-        marker = _odb_marker(low)
-        for root in roots:
-            if _starts(low, root) and (marker is None or len(root) - 1 < marker):
-                marker = len(root) - 1
-        markers.append(marker)
+    for low, job in zip(lows, jobs):
+        named = _odb_marker(low)
+        markers.append(min((m for m in (named, job) if m is not None), default=None))
     result: list[dict | None] = [None] * len(paths)
     odb: dict[tuple[str, ...], list[int]] = {}
     cad: list[int] = []

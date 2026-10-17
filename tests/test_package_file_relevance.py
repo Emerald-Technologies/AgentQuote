@@ -21,9 +21,9 @@ from compact_evidence_fixtures import ScriptedModel, package, produce
 HERE = Path(relevance.__file__).parent
 # Mirrored byte for byte (line endings normalised) in QuickQuote QuickQuoteFunctions/quote_package/
 # and its tests; the rules and cases also in the UI (lib/agentquote/).
-RULES_SHA256 = "77e2b6ee4bbe3ac84873b50dcd14c1f007b30356de1a03edf3811ff733cffd4a"
-CASES_SHA256 = "2f31e00142a662d0cb9a7e4d43741fd6a19e562dfdc0b0d86f4027b33d02db90"
-MODULE_SHA256 = "14d461faa76df331e1b0b283efb6e5f266d5a5b6c12fdfc1983b0bfab3e6ff1e"
+RULES_SHA256 = "fff8e8ca1dfb7746477d31d3c3e0a934a9f5dd69bea2fb55aaf81d102bf4ce50"
+CASES_SHA256 = "1e9f22782f19200d683ca06744ac615f972900565f9209e38c06f9d7fcebef9c"
+MODULE_SHA256 = "910412213daafeecf2ceec634c0a3bc3894acb8a1a837205b7ea4f49926a46e4"
 CASES = json.loads((HERE / "package-file-relevance-cases.v1.json").read_text(encoding="utf-8"))["cases"]
 U = "12345678-1234-4234-8234-123456789012"
 V = "12345678-1234-4234-8234-123456789013"
@@ -95,7 +95,7 @@ def test_inventory_keeps_odb_that_is_the_only_fab_data_and_counts_it():
 
 
 def test_v6_producer_marks_unused_files_not_needed_and_never_shows_them_to_the_model():
-    extra = [("Board-ODB.tgz", b"\x1f\x8b synthetic odb++ archive"), ("Housing.step", b"ISO-10303-21; synthetic"),
+    extra = [("ODB.tgz", b"\x1f\x8b synthetic odb++ archive"), ("Housing.step", b"ISO-10303-21; synthetic"),
              ("Board.PcbDoc", b"synthetic altium design")]
     args = package([("ASM-100200", "PCB-555001")], extra_files=extra)
     model = ScriptedModel()
@@ -104,14 +104,14 @@ def test_v6_producer_marks_unused_files_not_needed_and_never_shows_them_to_the_m
     names = {root["documentId"]: root["fileName"] for root in args[1]}
     objects = {names[item["documentId"]]: item for item in graph["evidenceObjects"] if not item["archiveChain"]}
     dispositions = {item["evidenceId"]: item for item in graph["dispositions"]}
-    for name, code in (("Board-ODB.tgz", "not_used_odbpp"), ("Housing.step", "not_used_3d_model"),
+    for name, code in (("ODB.tgz", "not_used_odbpp"), ("Housing.step", "not_used_3d_model"),
                        ("Board.PcbDoc", "not_used_design_source")):
         item = objects[name]
         assert item["category"] == code
         assert dispositions[item["evidenceId"]]["state"] == "unrelated"
         assert dispositions[item["evidenceId"]]["rationale"].startswith("Not used for quoting: " + relevance.reason_for(code))
     shown = {view["path"] for packet in model.packets for view in packet["files"]}
-    assert not shown & {"Board-ODB.tgz", "Housing.step", "Board.PcbDoc"}
+    assert not shown & {"ODB.tgz", "Housing.step", "Board.PcbDoc"}
     assert "PCB-555001_top.gbr" in shown
     gerber = objects["PCB-555001_top.gbr"]
     assert dispositions[gerber["evidenceId"]]["state"] == "included"
