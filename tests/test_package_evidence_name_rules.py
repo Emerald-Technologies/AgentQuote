@@ -116,6 +116,47 @@ def test_a_file_copied_into_each_assembly_folder_is_used_for_each():
     assert (found["e0"]["assembly"], found["e1"]["assembly"]) == ("u1", "u2")
 
 
+@pytest.mark.parametrize("path,assembly,lines", [
+    ("Boards/PCB 0110-00011 Rev A.zip/top.gbr", "u1", ["o1"]),        # a board zip named for a BOM line
+    ("Package.zip/Fab 0110-00012_RevA/drill.drl", "u2", ["o2"]),      # a fab folder
+    ("Package.zip/fab/0110-00012_top.gbr", "u2", ["o2"]),             # the file name
+    ("Package.zip/0100-00001/PCB-0110-00011.zip/top.gbr", "u1", ["o1"]),  # assembly folder and its board agree
+])
+def test_a_board_named_on_exactly_one_assembly_bom_is_a_board_clue(path, assembly, lines):
+    items, paths = _items([path])
+    found = match_names(items, paths, ASSEMBLIES, OCCURRENCES)
+    assert (found["e0"]["assembly"], found["e0"]["rule"], found["e0"]["occurrenceIds"]) == (assembly, "bom_line", lines)
+
+
+def test_an_ambiguous_board_goes_to_a_person():
+    items, paths = _items([
+        "Boards/PCB-0110-00099.zip/top.gbr",            # the board is on both assemblies' BOMs
+        "Package.zip/0100-00002/0110-00011/top.gbr",    # assembly folder of u2 holding a board of u1
+        "Boards/0110-00011 and 0110-00012/top.gbr"])    # one folder naming boards of both
+    assert match_names(items, paths, ASSEMBLIES, OCCURRENCES) == {}
+
+
+def test_short_or_unrelated_line_part_numbers_are_never_board_clues():
+    occurrences = OCCURRENCES + [{"assemblyUuid": "u1", "partNumber": "1", "occurrenceId": "o5"},
+                                 {"assemblyUuid": "u2", "partNumber": "PCB", "occurrenceId": "o6"}]
+    items, paths = _items(["Package.zip/1/PCB/top.gbr", "Package.zip/0110-00013/top.gbr"])
+    assert match_names(items, paths, ASSEMBLIES, occurrences) == {}
+
+
+def test_a_board_clue_reaches_the_model_view_with_its_lines():
+    from compact_evidence_fixtures import package
+    args = package([("ASM-100200", None), ("ASM-100300", None)], lines=5,
+                   extra_files=[("Boards.zip", archive([("PCB-555001/top.gbr", b"G04 synthetic board*\nM02*\n")]))])
+    context, roots, books = args
+    from compact_evidence_fixtures import bom
+    books[uuid(2, 1)] = bom(5, pcb="PCB-555001")
+    context["assemblies"][0]["canonicalBom"].update(sha256=digest(books[uuid(2, 1)]), sizeBytes=len(books[uuid(2, 1)]))
+    plan = _plan((context, roots, books))
+    board = next(identity for identity, path in plan.paths.items() if path.endswith("top.gbr") and "Boards.zip" in path)
+    assert plan.views[board]["survey"] == {"assembly": "A1", "link": "unconfirmed", "kind": "name rule bom_line"}
+    assert board not in plan.rule_links
+
+
 def test_package_family_rules_outrank_the_path_clue_on_the_same_path():
     items, paths = _items(["AMT0100-00001-TK.zip/AMT0100-00001-TK/0100-00001 notes.txt",
                            "AMT0110-00011.zip/0100-00001 fab.pdf"])
