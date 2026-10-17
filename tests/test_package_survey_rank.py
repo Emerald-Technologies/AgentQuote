@@ -70,9 +70,13 @@ def path(value):
 
 class Surveyor:
     """Stub survey model. refuse: file names whose evidence is always miscited (as role refuse_role);
-    unlinked: BOM names given no requested-assembly link."""
+    unlinked: BOM names given no requested-assembly link.
 
-    def __init__(self, refuse=(), refuse_role="other", unlinked=()):
+    Since QQ #182 a refused citation is dropped, and only a role other than 'other' with no matching
+    citation left refuses the file; so the stub claims a role ('work_instruction' unless stated).
+    """
+
+    def __init__(self, refuse=(), refuse_role="work_instruction", unlinked=()):
         self.refuse, self.refuse_role, self.unlinked = set(refuse), refuse_role, set(unlinked)
         self.batches = []
 
@@ -296,3 +300,24 @@ def test_the_name_match_pre_pass_records_its_examination_too():
     assert listed["XYZ0100-11111-TK.zip/XYZ0100-11111/assy/pick.csv"] == {
         "file_id": listed["XYZ0100-11111-TK.zip/XYZ0100-11111/assy/pick.csv"]["file_id"],
         "status": "not_examined", "reason": "not_needed"}
+
+
+# --- QQ #182 transport retry inside the ranked survey ---------------------------------------------
+
+def test_a_ranked_survey_call_with_no_reply_is_sent_again_without_using_an_attempt():
+    from bom_processor.package_survey_run import CALLS_PER_BATCH, survey_view
+    from test_package_survey import no_reply
+    model, waits, lost = Surveyor(), [], [2]
+
+    def flaky(instructions, text):
+        if lost[0]:
+            lost[0] -= 1
+            raise no_reply()
+        return model(instructions, text)
+
+    view = build_view(expand_package(roots()), REQUESTED)
+    survey = survey_view(view, flaky, sleep=waits.append)
+    # Two lost calls, then the likely files' reply: the survey completes and stops early as before.
+    assert waits == [2.0, 8.0] and survey["model_calls"] == 3 and CALLS_PER_BATCH == 4
+    assert not survey["has_blocking_findings"] and survey["examination"]["stopped_early"]
+    assert "private transport detail" not in json.dumps(survey)

@@ -65,38 +65,7 @@ def read_zip(data: bytes, budget: ArchiveBudget) -> list[tuple[str, bytes]]:
     """
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            infos = archive.infolist()
-            budget.members += len(infos)
-            require(budget.members <= budget.limits.members, "ARCHIVE_MEMBER_LIMIT")
-            seen: set[str] = set()
-            prefixes: dict[str, str] = {}
-            file_paths = {info.filename for info in infos if not info.is_dir()}
-            for info in infos:
-                require(info.orig_filename == info.filename, "INVALID_MEMBER_PATH")
-                name = info.filename[:-1] if info.is_dir() else info.filename
-                member_path(name)
-                folded = name.casefold()
-                require(folded not in seen, "ARCHIVE_DUPLICATE_MEMBER")
-                seen.add(folded)
-                parts = name.split("/")
-                for index in range(1, len(parts) + 1):
-                    prefix = "/".join(parts[:index])
-                    previous = prefixes.setdefault(prefix.casefold(), prefix)
-                    require(previous == prefix, "ARCHIVE_CASE_ALIAS")
-                    require(index == len(parts) or prefix not in file_paths,
-                            "ARCHIVE_LOCATION_CONFLICT")
-                mode = info.external_attr >> 16
-                require(not stat.S_ISLNK(mode) and stat.S_IFMT(mode) in
-                    ({0, stat.S_IFDIR} if info.is_dir() else {0, stat.S_IFREG}), "ARCHIVE_SPECIAL_MEMBER")
-                require(not info.is_dir() or info.file_size == 0, "ARCHIVE_DIRECTORY_PAYLOAD")
-                require(not info.flag_bits & (1 | 64), "ARCHIVE_ENCRYPTED")
-                require(info.compress_type in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED},
-                        "ARCHIVE_COMPRESSION")
-                require(0 <= info.file_size <= budget.limits.member_bytes, "ARCHIVE_BYTE_LIMIT")
-                require(info.file_size <= max(info.compress_size, 1) * budget.limits.ratio,
-                        "ARCHIVE_RATIO_LIMIT")
-                budget.expanded += info.file_size
-                require(budget.expanded <= budget.limits.aggregate_bytes, "ARCHIVE_AGGREGATE_LIMIT")
+            infos = _validated_infos(archive, budget)
             result = []
             for info in infos:
                 if info.is_dir():
@@ -111,6 +80,105 @@ def read_zip(data: bytes, budget: ArchiveBudget) -> list[tuple[str, bytes]]:
         raise
     except (Exception, ) as exc:
         raise PackageEvidenceError("ARCHIVE_INVALID") from exc
+
+
+def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggregate: bool = True) -> list:
+    """Every member record checked and counted; declared sizes reserved in budget.expanded."""
+    infos = archive.infolist()
+    budget.members += len(infos)
+    require(budget.members <= budget.limits.members, "ARCHIVE_MEMBER_LIMIT")
+    seen: set[str] = set()
+    prefixes: dict[str, str] = {}
+    file_paths = {info.filename for info in infos if not info.is_dir()}
+    for info in infos:
+        require(info.orig_filename == info.filename, "INVALID_MEMBER_PATH")
+        name = info.filename[:-1] if info.is_dir() else info.filename
+        member_path(name)
+        folded = name.casefold()
+        require(folded not in seen, "ARCHIVE_DUPLICATE_MEMBER")
+        seen.add(folded)
+        parts = name.split("/")
+        for index in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:index])
+            previous = prefixes.setdefault(prefix.casefold(), prefix)
+            require(previous == prefix, "ARCHIVE_CASE_ALIAS")
+            require(index == len(parts) or prefix not in file_paths,
+                    "ARCHIVE_LOCATION_CONFLICT")
+        mode = info.external_attr >> 16
+        require(not stat.S_ISLNK(mode) and stat.S_IFMT(mode) in
+            ({0, stat.S_IFDIR} if info.is_dir() else {0, stat.S_IFREG}), "ARCHIVE_SPECIAL_MEMBER")
+        require(not info.is_dir() or info.file_size == 0, "ARCHIVE_DIRECTORY_PAYLOAD")
+        require(not info.flag_bits & (1 | 64), "ARCHIVE_ENCRYPTED")
+        require(info.compress_type in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED},
+                "ARCHIVE_COMPRESSION")
+        require(0 <= info.file_size <= budget.limits.member_bytes, "ARCHIVE_BYTE_LIMIT")
+        require(info.file_size <= max(info.compress_size, 1) * budget.limits.ratio,
+                "ARCHIVE_RATIO_LIMIT")
+        budget.expanded += info.file_size
+        require(not aggregate or budget.expanded <= budget.limits.aggregate_bytes,
+                "ARCHIVE_AGGREGATE_LIMIT")
+    return infos
+
+
+# Recorded for a root archive whose members were not inventoried (mirrors QuickQuote
+# PACKAGE_EVIDENCE_NOT_INVENTORIED_REASON). Also its code-owned evidence category.
+NOT_INVENTORIED_REASON = "INVENTORY_SIZE_BUDGET"
+NOT_INVENTORIED_FORMAT = "archive_not_unpacked_size_budget"
+
+
+def measure_archive(data: bytes, limits: InventoryLimits, room: int) -> int | None:
+    """Declared unpacked bytes of one root archive, counted exactly as read_zip counts them.
+
+    Every member check except the aggregate byte budget still applies and raises. Returns
+    None once the total exceeds room; nested archives are read only while within room.
+    """
+    budget = ArchiveBudget(limits)
+
+    def walk(payload: bytes, depth: int) -> bool:
+        require(payload.startswith((b"PK", b"PK")), "ARCHIVE_INVALID")
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                infos = _validated_infos(archive, budget, aggregate=False)
+                if budget.expanded > room:
+                    return False
+                require(not any(not i.is_dir() for i in infos) or depth < limits.depth, "ARCHIVE_DEPTH_LIMIT")
+                for info in infos:
+                    if info.is_dir() or not info.filename.lower().endswith(".zip"):
+                        continue
+                    with archive.open(info) as stream:
+                        member = stream.read(limits.member_bytes + 1)
+                        require(len(member) == info.file_size and not stream.read(1), "ARCHIVE_SIZE_MISMATCH")
+                    if not walk(member, depth + 1):
+                        return False
+                return True
+        except PackageEvidenceError:
+            raise
+        except (Exception, ) as exc:
+            raise PackageEvidenceError("ARCHIVE_INVALID") from exc
+
+    return budget.expanded if walk(data, 0) else None
+
+
+def select_archives(roots: list[dict], limits: InventoryLimits) -> tuple[set[str], list[dict]]:
+    """Budget-aware selection shared with QuickQuote (package-evidence-inventory.ts).
+
+    Every root is inventoried and counted first. Root archives are measured alone against the
+    room left after all roots, then unpacked smallest-first (ties by documentId) while they fit.
+    Returns (documentIds to unpack, not-inventoried records sorted by documentId).
+    """
+    room = limits.aggregate_bytes - sum(len(root["data"]) for root in roots)
+    measured = [(root, measure_archive(root["data"], limits, room)) for root in roots
+                if text(root["fileName"]).lower().endswith(".zip")]
+    fitting = sorted(((size, root["documentId"]) for root, size in measured if size is not None))
+    unpack, used = set(), 0
+    for size, document_id in fitting:
+        if used + size <= room:
+            used += size
+            unpack.add(document_id)
+    skipped = [{"documentId": root["documentId"], "sha256": root["sha256"], "sizeBytes": root["sizeBytes"],
+                "fileName": root["fileName"], "expandedBytes": size, "reason": NOT_INVENTORIED_REASON}
+               for root, size in measured if root["documentId"] not in unpack]
+    return unpack, sorted(skipped, key=lambda item: item["documentId"])
 
 
 def _safe_excerpt(data: bytes, maximum: int) -> str | None:
@@ -172,16 +240,30 @@ def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None,
         budget.expanded += len(root["data"])
         require(budget.expanded <= limits.aggregate_bytes, "ROOT_AGGREGATE_LIMIT")
 
+    # Root archives that would exceed the aggregate budget stay one pinned evidence object
+    # with a code-owned format (QuickQuote computes the identical selection).
+    verified = []
+    for root in roots:
+        metadata = bom_metadata({key: root[key] for key in ("documentId", "sha256", "sizeBytes")})
+        require(metadata["documentId"] not in locations, "DUPLICATE_ROOT_DOCUMENT")
+        locations.add(metadata["documentId"])
+        verified.append((metadata, text(root["fileName"]), verified_bytes(metadata, root["data"], limits.root_bytes)))
+    unpack, _skipped = select_archives(roots, limits)
+
     def visit(metadata: dict, file_name: str, payload: bytes, chain: list[dict]) -> None:
         require(len(chain) <= limits.depth, "ARCHIVE_DEPTH_LIMIT")
         identity = {**metadata, "archiveChain": chain}
-        description = describe(file_name, payload, limits, budget)
+        set_aside = not chain and file_name.lower().endswith(".zip") and metadata["documentId"] not in unpack
+        # Workbook parts are read for format detection only, with their own transient budget:
+        # they are not inventory members (QuickQuote does not count them either).
+        description = ({"fileName": file_name, "format": NOT_INVENTORIED_FORMAT, "excerpt": None}
+                       if set_aside else describe(file_name, payload, limits))
         if observe is not None:
             observe(detached(identity), payload, file_name)
         result.append({"evidenceId": evidence_id(identity), **identity,
                        "category": description["format"], **description})
         require(len(result) <= limits.evidence, "EVIDENCE_LIMIT")
-        if file_name.lower().endswith(".zip"):
+        if file_name.lower().endswith(".zip") and not set_aside:
             require(payload.startswith((b"PK\x03\x04", b"PK\x05\x06")), "ARCHIVE_INVALID")
             members = read_zip(payload, budget)
             require(not members or len(chain) < limits.depth, "ARCHIVE_DEPTH_LIMIT")
@@ -189,12 +271,6 @@ def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None,
                 visit(metadata, name, member, [*chain, {"memberPath": name,
                       "sha256": digest(member), "sizeBytes": len(member)}])
 
-    for root in roots:
-        strict(root, {"documentId", "sha256", "sizeBytes", "fileName", "data"})
-        metadata = bom_metadata({key: root[key] for key in ("documentId", "sha256", "sizeBytes")})
-        require(metadata["documentId"] not in locations, "DUPLICATE_ROOT_DOCUMENT")
-        locations.add(metadata["documentId"])
-        file_name = text(root["fileName"])
-        payload = verified_bytes(metadata, root["data"], limits.root_bytes)
+    for metadata, file_name, payload in verified:
         visit(metadata, file_name, payload, [])
     return sorted(detached(result), key=lambda item: item["evidenceId"])

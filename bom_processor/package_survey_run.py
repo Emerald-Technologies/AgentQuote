@@ -12,12 +12,17 @@ likely BOM first and less likely files only until every requested assembly has a
 confirmed BOM; the rest are listed as not surveyed. A file still refused is
 listed as not examined with a warning, and blocks only when the evidence says
 the BOM choice is impossible or unsafe without it (package_survey_rank.py).
+A call that raised without any reply (QQ #182) does not use up one of the two
+attempts: the same request is sent again after a short wait, up to
+TRANSPORT_RETRIES_PER_BATCH times per batch, and every call counts against the
+call ceiling. A reply that is refused still gets exactly one retry.
 Run python -m pytest tests/test_package_survey.py tests/test_package_survey_rank.py.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -28,26 +33,36 @@ from .package_survey_check import assemble, verify_batch_files
 
 SURVEY_RESPONSE_FORMAT = {"type": "json_object"}
 ATTEMPTS_PER_BATCH = 2
+# QQ #182 (Nick 2026-10-15): a call that raised without a reply is sent again, at most this many
+# times per batch, after these waits in seconds; it does not use up a classification attempt.
+TRANSPORT_RETRIES_PER_BATCH = 2
+TRANSPORT_RETRY_DELAYS = (2.0, 8.0)
+CALLS_PER_BATCH = ATTEMPTS_PER_BATCH + TRANSPORT_RETRIES_PER_BATCH
 MAX_REPLY_BYTES = 1_000_000
 
 Caller = Callable[[str, str], Any]
+Sleep = Callable[[float], None]
 
 
-def survey_package(roots: list[tuple[str, bytes]], call: Caller, *, max_calls: int | None = None) -> dict[str, Any]:
+def survey_package(roots: list[tuple[str, bytes]], call: Caller, *, max_calls: int | None = None,
+                   sleep: Sleep | None = None) -> dict[str, Any]:
     """call(instructions, user_text) returns the parsed JSON reply for one batch."""
-    return survey_view(build_view(expand_package(roots)), call, max_calls=max_calls)
+    return survey_view(build_view(expand_package(roots)), call, max_calls=max_calls, sleep=sleep)
 
 
-def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dict[str, Any]:
+def survey_view(view: Any, call: Caller, *, max_calls: int | None = None,
+                sleep: Sleep | None = None) -> dict[str, Any]:
     """The survey of an already built view (stage 2 reuses the same view).
 
     With requested assemblies the files are surveyed most likely BOM first and a refused file is
     judged by package_survey_rank (QQ #99); without them every file is surveyed in path order.
+    max_calls caps every model call, transport retries included. By default each batch may use its
+    two attempts plus its transport retries, so one batch's retries never take another batch's calls.
     """
     if view.requested:
-        return _ranked_survey(view, call, max_calls=max_calls)
+        return _ranked_survey(view, call, max_calls=max_calls, sleep=sleep)
     batches = plan_batches(view)
-    budget = _Budget(max_calls if max_calls is not None else len(batches) * ATTEMPTS_PER_BATCH)
+    budget = _Budget(max_calls if max_calls is not None else len(batches) * CALLS_PER_BATCH, sleep or time.sleep)
     records: list[dict] = []
     package_findings: list[dict] = []
     for batch in batches:
@@ -60,6 +75,7 @@ def survey_view(view: Any, call: Caller, *, max_calls: int | None = None) -> dic
 @dataclass
 class _Budget:
     ceiling: int
+    sleep: Sleep
     used: int = 0
 
 
@@ -79,14 +95,35 @@ def _survey_batch(view: Any, batch: Any, call: Caller, budget: _Budget, records:
     pending = list(batch.file_ids)
     outcome = _Outcome(pending, {}, [], {})
     feedback, agent_findings_kept = None, False
-    for _ in range(ATTEMPTS_PER_BATCH):
+    used, transport_retries, wait = 0, 0, 0.0
+    while used < ATTEMPTS_PER_BATCH:
         if budget.used >= budget.ceiling:
             outcome.codes.update({file_id: "SURVEY_CALL_LIMIT" for file_id in pending})
             break
+        if wait:
+            budget.sleep(wait)
         budget.used += 1
         current = batch if len(pending) == len(batch.file_ids) else sub_batch(view, pending)
         try:
             reply = call(survey_instructions(view), current.user_text + (feedback or ""))
+        except SurveyError as exc:
+            reply = exc  # A reply came back but could not be read (cut off, not JSON, too long).
+        except Exception as exc:
+            # No reply came back (QQ #182). The same request is sent again after a wait; only a
+            # failure past the transport retries uses up an attempt. The model never saw this
+            # request, so the next call carries the same feedback as this one.
+            outcome.codes.update({file_id: "SURVEY_CALL_FAILED" for file_id in pending})
+            outcome.attempts.append(_call_failure(exc))
+            wait = TRANSPORT_RETRY_DELAYS[min(transport_retries, len(TRANSPORT_RETRY_DELAYS) - 1)]
+            if transport_retries < TRANSPORT_RETRIES_PER_BATCH:
+                transport_retries += 1
+            else:
+                used += 1
+            continue
+        used, wait = used + 1, 0.0
+        try:
+            if isinstance(reply, SurveyError):
+                raise reply
             found, findings, failed = verify_batch_files(view, current, reply)
         except Exception as exc:
             # The reply as a whole was unusable: every pending file is asked again.
@@ -118,6 +155,21 @@ def _survey_batch(view: Any, batch: Any, call: Caller, budget: _Budget, records:
     return outcome
 
 
+def _call_failure(exc: Exception) -> dict[str, Any]:
+    """The attempt record of a call that raised without a reply: class names and an HTTP status only.
+
+    The exception message may quote the request or the service's reply, so it is never kept (round 3,
+    A036 diagnosis). The model client wraps the underlying error, so that error's class and status
+    are named too when present.
+    """
+    cause = exc.__cause__
+    status = next((value for value in (getattr(exc, "status_code", None), getattr(cause, "status_code", None))
+                   if type(value) is int and 100 <= value <= 599), None)
+    return {"failure_code": "SURVEY_CALL_FAILED", "file_id": None, "exception_type": type(exc).__name__,
+            **({"cause_type": type(cause).__name__} if cause is not None else {}),
+            **({"status_code": status} if status is not None else {})}
+
+
 def _proposed_roles(reply: Any, failed: dict[str, Any]) -> dict[str, str]:
     """The role the model gave each refused file: unverified, kept only as a clue (QQ #99)."""
     roles = {}
@@ -127,7 +179,7 @@ def _proposed_roles(reply: Any, failed: dict[str, Any]) -> dict[str, str]:
     return roles
 
 
-def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None) -> dict[str, Any]:
+def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None, sleep: Sleep | None) -> dict[str, Any]:
     """Survey likely BOM candidates first; stop once each requested assembly has a confirmed BOM (QQ #99).
 
     Every likely candidate is surveyed, so a competing BOM for an assembly is never skipped. Less
@@ -141,7 +193,7 @@ def _ranked_survey(view: Any, call: Caller, *, max_calls: int | None) -> dict[st
     phases = [plan_batches(view, file_ids=[item["file_id"] for item in ranking if item["likely"]]),
               plan_batches(view, file_ids=[item["file_id"] for item in ranking if not item["likely"]])]
     budget = _Budget(max_calls if max_calls is not None
-                     else sum(len(batches) for batches in phases) * ATTEMPTS_PER_BATCH)
+                     else sum(len(batches) for batches in phases) * CALLS_PER_BATCH, sleep or time.sleep)
     records: list[dict] = []
     package_findings: list[dict] = []
     refused: list[str] = []
