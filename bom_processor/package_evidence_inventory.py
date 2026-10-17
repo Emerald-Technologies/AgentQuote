@@ -1,7 +1,11 @@
 """In-memory package inventory from supplied metadata and bytes; no file I/O.
 
 Every accepted archive member has a byte-bound identity. Unsafe/incomplete input
-fails closed. Run python -m pytest tests/test_package_evidence_inventory.py.
+fails closed. Files the reviewed relevance rules mark as known unused for quoting
+(QuickQuote #134, D9: ODB++, design source, 3D models, duplicate CAD drawings, viewer
+files) are still inventoried and hash-pinned, with their reason code as category, but
+their bytes do not count against the aggregate budget. QuickQuote computes the same
+selection (package-evidence-inventory.ts). Run python -m pytest tests/test_package_evidence_inventory.py.
 """
 from __future__ import annotations
 
@@ -58,14 +62,15 @@ def verified_bytes(metadata: dict, data: Any, maximum: int) -> bytes:
     return data
 
 
-def read_zip(data: bytes, budget: ArchiveBudget) -> list[tuple[str, bytes]]:
+def read_zip(data: bytes, budget: ArchiveBudget, uncounted=None) -> list[tuple[str, bytes]]:
     """Validate metadata before reading; enforce actual bytes and CRC during read.
 
     Directory records are validated/count toward limits, but are not file evidence.
+    uncounted(name): members known to be unused for quoting; their bytes are not counted (#134).
     """
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            infos = _validated_infos(archive, budget)
+            infos = _validated_infos(archive, budget, uncounted=uncounted)
             result = []
             for info in infos:
                 if info.is_dir():
@@ -82,7 +87,7 @@ def read_zip(data: bytes, budget: ArchiveBudget) -> list[tuple[str, bytes]]:
         raise PackageEvidenceError("ARCHIVE_INVALID") from exc
 
 
-def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggregate: bool = True) -> list:
+def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggregate: bool = True, uncounted=None) -> list:
     """Every member record checked and counted; declared sizes reserved in budget.expanded."""
     infos = archive.infolist()
     budget.members += len(infos)
@@ -114,7 +119,8 @@ def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggrega
         require(0 <= info.file_size <= budget.limits.member_bytes, "ARCHIVE_BYTE_LIMIT")
         require(info.file_size <= max(info.compress_size, 1) * budget.limits.ratio,
                 "ARCHIVE_RATIO_LIMIT")
-        budget.expanded += info.file_size
+        if uncounted is None or not uncounted(name):
+            budget.expanded += info.file_size
         require(not aggregate or budget.expanded <= budget.limits.aggregate_bytes,
                 "ARCHIVE_AGGREGATE_LIMIT")
     return infos
@@ -181,6 +187,92 @@ def select_archives(roots: list[dict], limits: InventoryLimits) -> tuple[set[str
     return unpack, sorted(skipped, key=lambda item: item["documentId"])
 
 
+def list_archive(data: bytes, limits: InventoryLimits) -> list[tuple[tuple[str, ...], int]]:
+    """Every file member of one root archive at any depth, as (member paths, declared size).
+
+    Same member checks as read_zip (and QuickQuote listArchive); the aggregate budget is not applied.
+    """
+    budget = ArchiveBudget(limits)
+    found: list[tuple[tuple[str, ...], int]] = []
+
+    def walk(payload: bytes, chain: tuple[str, ...]) -> None:
+        require(payload.startswith((b"PK", b"PK")), "ARCHIVE_INVALID")
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                infos = _validated_infos(archive, budget, aggregate=False)
+                require(not any(not i.is_dir() for i in infos) or len(chain) < limits.depth, "ARCHIVE_DEPTH_LIMIT")
+                nested = []
+                for info in infos:
+                    if info.is_dir():
+                        continue
+                    found.append(((*chain, info.filename), info.file_size))
+                    if info.filename.lower().endswith(".zip"):
+                        with archive.open(info) as stream:
+                            member = stream.read(limits.member_bytes + 1)
+                            require(len(member) == info.file_size and not stream.read(1), "ARCHIVE_SIZE_MISMATCH")
+                        nested.append((info.filename, member))
+        except PackageEvidenceError:
+            raise
+        except (Exception, ) as exc:
+            raise PackageEvidenceError("ARCHIVE_INVALID") from exc
+        for name, member in nested:
+            walk(member, (*chain, name))
+
+    walk(data, ())
+    return found
+
+
+def _file_key(document_id: str, member_paths) -> str:
+    return "\x1f".join((document_id, *member_paths))
+
+
+def select_archives_relevance(roots: list[dict], limits: InventoryLimits) -> dict:
+    """#134 (D9) selection, mirrored in QuickQuote: known-unused files do not count against the budget.
+
+    Returns unpack (documentIds), skipped (not-inventoried records), uncounted (file keys), disregarded
+    (documentId, fileName, memberPaths, sizeBytes, kind, reasonCode, reason) and findings.
+    """
+    from .package_file_relevance import classify, path_segments
+    files: list[dict] = []
+    for root in roots:
+        files.append({"documentId": root["documentId"], "fileName": root["fileName"], "memberPaths": (),
+                      "size": len(root["data"])})
+        if text(root["fileName"]).lower().endswith(".zip"):
+            files.extend({"documentId": root["documentId"], "fileName": root["fileName"], "memberPaths": paths,
+                          "size": size} for paths, size in list_archive(root["data"], limits))
+    results, findings = classify([path_segments((item["fileName"], *item["memberPaths"])) for item in files])
+    uncounted: set[str] = set()
+    disregarded = []
+    for item, label in zip(files, results):
+        if label is None:
+            continue
+        uncounted.add(_file_key(item["documentId"], item["memberPaths"]))
+        disregarded.append({"documentId": item["documentId"], "fileName": item["fileName"],
+                            "memberPaths": list(item["memberPaths"]), "sizeBytes": item["size"], **label})
+    room = limits.aggregate_bytes - sum(len(root["data"]) for root in roots
+                                        if _file_key(root["documentId"], ()) not in uncounted)
+    measured = []
+    for root in roots:
+        if not text(root["fileName"]).lower().endswith(".zip"):
+            continue
+        size = sum(item["size"] for item in files if item["documentId"] == root["documentId"] and item["memberPaths"]
+                   and _file_key(item["documentId"], item["memberPaths"]) not in uncounted)
+        # Same reporting as the budget-only rule: unpacked bytes over the room are reported as None.
+        measured.append((root, size if 0 <= room and size <= room else None))
+    fitting = sorted((size, root["documentId"]) for root, size in measured if size is not None)
+    unpack, used = set(), 0
+    for size, document_id in fitting:
+        if used + size <= room:
+            used += size
+            unpack.add(document_id)
+    skipped = [{"documentId": root["documentId"], "sha256": root["sha256"], "sizeBytes": root["sizeBytes"],
+                "fileName": root["fileName"], "expandedBytes": size, "reason": NOT_INVENTORIED_REASON}
+               for root, size in measured if root["documentId"] not in unpack]
+    disregarded.sort(key=lambda item: _file_key(item["documentId"], item["memberPaths"]))
+    return {"unpack": unpack, "skipped": sorted(skipped, key=lambda item: item["documentId"]),
+            "uncounted": uncounted, "disregarded": disregarded, "findings": findings}
+
+
 def _safe_excerpt(data: bytes, maximum: int) -> str | None:
     # Inspect a bounded prefix, without interpreting engineering meaning.
     prefix = data[:16_384]
@@ -232,27 +324,35 @@ def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None,
     result: list[dict] = []
     locations: set[str] = set()
 
-    # Count all supplied roots before expansion, so expansion cannot borrow the
-    # remaining budget from roots that have not yet been visited.
     for root in roots:
         strict(root, {"documentId", "sha256", "sizeBytes", "fileName", "data"})
         require(type(root["data"]) is bytes, "INVALID_BYTES")
-        budget.expanded += len(root["data"])
-        require(budget.expanded <= limits.aggregate_bytes, "ROOT_AGGREGATE_LIMIT")
 
     # Root archives that would exceed the aggregate budget stay one pinned evidence object
-    # with a code-owned format (QuickQuote computes the identical selection).
+    # with a code-owned format (QuickQuote computes the identical selection). Known-unused
+    # files (#134) do not count against the budget; they keep their reason code as category.
     verified = []
     for root in roots:
         metadata = bom_metadata({key: root[key] for key in ("documentId", "sha256", "sizeBytes")})
         require(metadata["documentId"] not in locations, "DUPLICATE_ROOT_DOCUMENT")
         locations.add(metadata["documentId"])
         verified.append((metadata, text(root["fileName"]), verified_bytes(metadata, root["data"], limits.root_bytes)))
-    unpack, _skipped = select_archives(roots, limits)
+    selection = select_archives_relevance(roots, limits)
+    unpack, uncounted = selection["unpack"], selection["uncounted"]
+    labels = {_file_key(item["documentId"], item["memberPaths"]): item for item in selection["disregarded"]}
+
+    # Count the supplied roots before expansion, so expansion cannot borrow the
+    # remaining budget from roots that have not yet been visited.
+    for root in roots:
+        if _file_key(root["documentId"], ()) in uncounted:
+            continue
+        budget.expanded += len(root["data"])
+        require(budget.expanded <= limits.aggregate_bytes, "ROOT_AGGREGATE_LIMIT")
 
     def visit(metadata: dict, file_name: str, payload: bytes, chain: list[dict]) -> None:
         require(len(chain) <= limits.depth, "ARCHIVE_DEPTH_LIMIT")
         identity = {**metadata, "archiveChain": chain}
+        paths = [step["memberPath"] for step in chain]
         set_aside = not chain and file_name.lower().endswith(".zip") and metadata["documentId"] not in unpack
         # Workbook parts are read for format detection only, with their own transient budget:
         # they are not inventory members (QuickQuote does not count them either).
@@ -260,12 +360,14 @@ def build_inventory(roots: list[dict], *, limits: InventoryLimits | None = None,
                        if set_aside else describe(file_name, payload, limits))
         if observe is not None:
             observe(detached(identity), payload, file_name)
+        label = labels.get(_file_key(metadata["documentId"], paths))
         result.append({"evidenceId": evidence_id(identity), **identity,
-                       "category": description["format"], **description})
+                       "category": label["reasonCode"] if label else description["format"], **description})
         require(len(result) <= limits.evidence, "EVIDENCE_LIMIT")
         if file_name.lower().endswith(".zip") and not set_aside:
             require(payload.startswith((b"PK\x03\x04", b"PK\x05\x06")), "ARCHIVE_INVALID")
-            members = read_zip(payload, budget)
+            members = read_zip(payload, budget,
+                               uncounted=lambda name: _file_key(metadata["documentId"], (*paths, name)) in uncounted)
             require(not members or len(chain) < limits.depth, "ARCHIVE_DEPTH_LIMIT")
             for name, member in members:
                 visit(metadata, name, member, [*chain, {"memberPath": name,

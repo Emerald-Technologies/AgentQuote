@@ -243,12 +243,17 @@ class _Plan:
         self.file_short = {item["evidenceId"]: f"F{i}" for i, item in enumerate(self.files, 1)}
         self.file_full = {v: k for k, v in self.file_short.items()}
         self.paths = {item["evidenceId"]: _path(item, names) for item in inventory}
+        # Known-unused files (QuickQuote #134, D9): the inventory gave them their reason code as category.
+        # Code marks them not needed with that reason; they are never sent to the model or linked by a name rule.
+        from .package_file_relevance import is_not_used
+        self.not_used = {item["evidenceId"]: item["category"] for item in self.files if is_not_used(item["category"])}
         # Package name rules (Nick 2026-10-14): code maps a file only when the rule and any survey
         # reading agree. Board and kit matches are linked by code and not sent to the model; a
         # BOM-file match is a placement clue only. A disagreement leaves the file to the model.
         from .package_evidence_name_rules import match_names
         self.rule_links: dict[str, dict] = {}
-        for identity, match in match_names(self.files, self.paths, self.assemblies, rows["occurrences"]).items():
+        used = [item for item in self.files if item["evidenceId"] not in self.not_used]
+        for identity, match in match_names(used, self.paths, self.assemblies, rows["occurrences"]).items():
             clue = self.clues.get(identity)
             if clue is not None and clue["assembly"] not in (None, match["assembly"]):
                 continue
@@ -362,13 +367,14 @@ class _Plan:
         everything = {"assemblies": [a["assemblyUuid"] for a in self.assemblies],
                       "subjects": {a["assemblyUuid"] for a in self.assemblies},
                       "line_indexes": list(range(len(self.lines))),
-                      "files": [item["evidenceId"] for item in self.files if item["evidenceId"] not in self.rule_links]}
+                      "files": [item["evidenceId"] for item in self.files
+                                if item["evidenceId"] not in self.rule_links and item["evidenceId"] not in self.not_used]}
         if self.fits(self.packet(everything)):
             return [everything]
         result = []
         for assembly in self.assemblies:
             uuid = assembly["assemblyUuid"]
-            files = sorted((set(self.placed[uuid]) | set(self.shared_files)) - set(self.rule_links),
+            files = sorted((set(self.placed[uuid]) | set(self.shared_files)) - set(self.rule_links) - set(self.not_used),
                            key=lambda i: int(self.file_short[i][1:]))
             indexes = [i for i, line in enumerate(self.lines) if self.line_asm[line["id"]] == uuid]
             base = {"assemblies": [uuid], "subjects": {uuid}, "line_indexes": [], "files": files}
@@ -693,6 +699,13 @@ def merge(plan: _Plan, calls: list[dict], answers: list[dict | None], failures: 
     final: dict[str, dict] = {}
     for item in plan.files:
         identity = item["evidenceId"]
+        if identity in plan.not_used:
+            # Code-owned (QuickQuote #134): listed as not needed with its reason; a person can bring it back.
+            from .package_file_relevance import reason_for
+            code = plan.not_used[identity]
+            final[identity] = {"state": "unrelated", "replacement": None, "category": code, "links": [],
+                               "rationale": f"Not used for quoting: {reason_for(code) or code}. A person can bring it back."}
+            continue
         rule = plan.rule_links.get(identity)
         if rule is not None:
             # Code-owned name-rule link; never text-verified, so a person confirms it in review.
