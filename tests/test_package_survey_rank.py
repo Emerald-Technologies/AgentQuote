@@ -4,6 +4,7 @@ A person looks at the shallow, BOM-named workbooks first, stops once each reques
 BOM, and never digs a CSV out of a PCB archive. A file whose survey reading is refused after its
 retry is listed as not examined; the package fails only when the BOM choice is impossible or unsafe.
 """
+import codecs
 import hashlib
 import json
 
@@ -398,7 +399,56 @@ NOTHING_TO_READ_CASES = [
     ("part on sheet two.xlsx", xlsx({"Cover": [["Title"]], "BOM": [HEADER] + lines(1)}), False),
     ("broken.xlsx", b"PK\x03\x04 not a workbook", False),
     ("drawing.pdf", b"%PDF-1.4\n", False),
+    # Byte-order marks (synthetic test kit, QuickQuote PR #232): UTF-8 and UTF-16 LE/BE are read.
+    ("utf-8 bom header.csv", b"\xef\xbb\xbf" + HEADER_ONLY, True),
+    ("utf-16 le header.csv", codecs.BOM_UTF16_LE + HEADER_ONLY.decode().encode("utf-16-le"), True),
+    ("utf-16 be header.csv", codecs.BOM_UTF16_BE + HEADER_ONLY.decode().encode("utf-16-be"), True),
+    ("utf-16 le one part.csv",
+     codecs.BOM_UTF16_LE + (HEADER_ONLY + b"1,P-1,Maker,M-1,2\r\n").decode().encode("utf-16-le"), False),
 ]
+
+
+def utf16(text, order="le"):
+    """CSV bytes as Excel's 'Unicode text' and other tools write them: a byte-order mark, then UTF-16."""
+    mark = codecs.BOM_UTF16_LE if order == "le" else codecs.BOM_UTF16_BE
+    return mark + text.encode(f"utf-16-{order}")
+
+
+@pytest.mark.parametrize("order", ["le", "be"])
+def test_a_utf16_csv_bom_is_read_ranked_and_chosen(order):
+    # Assembly 2's only BOM is a UTF-16 CSV inside its PCB archive (it was 'binary' before).
+    deep = utf16(DEEP_BOM_2.decode(), order)
+    pcb_2 = archive({"XYZ0100-22222/fab/top.gbr": GERBER + b"G04 two*\n",
+                     "XYZ0100-22222/docs/parts 0100-22222.csv": deep})
+    files = roots(**{"BOM 0100-22222 REV 03.xlsx": None, "XYZ0100-22222-TK.zip": pcb_2})
+    value = request(files)
+    value["documents"].append({"document_id": "doc-utf16", "blob_path": "src/doc-utf16", "size_bytes": len(deep),
+                               "sha256": hashlib.sha256(deep).hexdigest()})
+    model = Surveyor()
+    result = decide(value, files, model)
+    path = "XYZ0100-22222-TK.zip/XYZ0100-22222/docs/parts 0100-22222.csv"
+    record = records(result["survey"])[path]
+    assert record["kind"] == "spreadsheet_csv" and record["role"] == "bom"
+    assert record["requested_assembly"]["link"] == "confirmed"
+    assert {"csv", "bom_headings"} <= set(examination(result["survey"])[path]["clues"])
+    assert decisions(result)["doc-utf16"] == ("process", "only_bom")
+    assert not result["survey"]["has_blocking_findings"]
+
+
+@pytest.mark.parametrize("data, kind", [
+    (utf16("Item,Qty\r\n1,2\r\n"), "spreadsheet_csv"),
+    (utf16("Item,Qty\r\n1,2\r\n", "be"), "spreadsheet_csv"),
+    (b"\xef\xbb\xbfItem,Qty\r\n1,2\r\n", "spreadsheet_csv"),
+    # No byte-order mark: UTF-16 is not guessed, and the file stays binary as before.
+    ("Item,Qty\r\n".encode("utf-16-le"), "binary"),
+    # A UTF-32 mark begins like the UTF-16 LE one; it is not read as UTF-16.
+    ("Item,Qty\r\n".encode("utf-32"), "binary"),
+    # A UTF-16 mark followed by control characters is not text.
+    (codecs.BOM_UTF16_LE + "\x01\x02\x03".encode("utf-16-le"), "binary"),
+], ids=["utf-16 le", "utf-16 be", "utf-8 bom", "utf-16 without mark", "utf-32", "utf-16 control characters"])
+def test_csv_kind_follows_the_byte_order_mark(data, kind):
+    from bom_processor.package_survey import file_kind
+    assert file_kind("parts.csv", data) == kind
 
 
 @pytest.mark.parametrize("name, data, expected", NOTHING_TO_READ_CASES,
