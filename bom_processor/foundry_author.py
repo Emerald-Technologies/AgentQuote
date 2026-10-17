@@ -9,6 +9,7 @@ import re
 from html.parser import HTMLParser
 from typing import Any, Callable
 from .author_failure import failure_stage
+from .text_encoding import csv_encoding
 
 MAX_SHEETS = 4
 MAX_ROWS = 20
@@ -51,7 +52,7 @@ def _clean(value: Any) -> str:
 
 
 def _csv_preview(data: bytes) -> list[list[str]]:
-    text = data.decode("utf-8-sig", errors="replace")
+    text = data.decode(csv_encoding(data), errors="replace")
     return [list(row) for row in csv.reader(io.StringIO(text))][:MAX_ROWS]
 
 

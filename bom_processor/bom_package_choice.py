@@ -18,6 +18,10 @@ subassembly_of) and kept out of the primary choice, so review can put it under t
 (sub-assembly plan unit 6, Nick 2026-10-13).
 When each requested assembly is plainly named by one top-level spreadsheet, the name-match pre-pass
 (package_name_match.py) maps those files and the model survey is skipped (QQ #99, Nick 2026-10-14).
+Otherwise the survey reads likely BOM candidates first and stops once each requested assembly has a
+confirmed BOM; a file it could not read is listed as not examined and fails the package only when
+the BOM choice is impossible or unsafe without it (package_survey_rank.py). The survey's
+examination record says which files were examined, which were not, and why.
 Run python -m pytest tests/test_bom_package_choice.py.
 """
 from __future__ import annotations
@@ -37,6 +41,9 @@ RESULT_VERSION_V2 = "bom-package-choice.v2"
 RESULT_VERSIONS = {REQUEST_VERSION: RESULT_VERSION, REQUEST_VERSION_V2: RESULT_VERSION_V2}
 MAX_METADATA = 8 * 1024 * 1024
 _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}")
+# Survey roles of files that were listed but never read (QQ #99): not surveyed (name-match pre-pass or
+# ranked early stop) or not examined (the reading was refused and the file cannot be a chosen BOM).
+UNREAD_ROLES = frozenset({"not_examined", "not_surveyed"})
 _HASH = re.compile(r"[0-9a-f]{64}")
 
 Caller = Callable[[str, str], Any]
@@ -180,9 +187,13 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
                         if (records[file_id].get("requested_assembly") or {}).get("link") == "confirmed"})
         decision, reason, disposition = "process", "only_bom", None
         if not file_ids:
-            reason = "not_in_package"
+            # QQ #99 blocker 5: the survey never saw this document, so nothing says it is a BOM (it could
+            # be a pick-and-place or test export). It is held for a person, never parsed unseen; review
+            # shows it set aside as not in package, and a person can bring it back.
+            decision, reason = "excluded", "not_in_package"
             findings.append({"code": "CHOICE_DOCUMENT_NOT_IN_PACKAGE", "severity": "warning",
-                             "rationale": "A BOM document of the request is not among the package files; it is processed.",
+                             "rationale": "A BOM document of the request is not among the surveyed package files; "
+                                          "it is held for review and not processed unless a person brings it back.",
                              "document_id": document["document_id"], "raised_by": "code"})
         elif survey["has_blocking_findings"]:
             reason = "survey_blocking"
@@ -190,6 +201,9 @@ def decide(request: dict[str, Any], roots: list[tuple[str, bytes]], call: Caller
             reason = "choice_failed"
         elif subassembly.keys() & set(file_ids):
             reason = "subassembly_of"
+        elif "bom" not in roles and set(roles) <= UNREAD_ROLES:
+            # QQ #99: no copy was read; a person can bring it back (not_examined before not_surveyed).
+            decision, reason = "excluded", roles[0]
         elif "bom" not in roles:
             decision, reason = "excluded", roles[0] if len(roles) == 1 else "not_bom"
         elif linked and not links and len({a for f in file_ids for a in combined.get(f, [])}) >= 2:
@@ -475,10 +489,11 @@ def apply_reopen(state: dict[str, Any], reopen: tuple[str, ...] | list[str] | No
     reopen = sorted(set(reopen))
     result = state["result"]
     documents = {item["document_id"]: item for item in result["documents"]}
-    # A document the name-match pre-pass did not survey (QQ #99) can be brought back like a set-aside BOM.
+    # A document the survey did not survey or could not examine (QQ #99) can be brought back like a set-aside BOM.
     if not reopen or any(document_id not in documents or documents[document_id]["decision"] != "excluded"
                          or not ("bom" in documents[document_id]["roles"]
-                                 or documents[document_id]["reason"] == "not_surveyed")
+                                 or documents[document_id]["reason"] in UNREAD_ROLES
+                                 or documents[document_id]["reason"] == "not_in_package")
                          for document_id in reopen):
         raise PackageChoiceError("PACKAGE_CHOICE_REOPEN_INVALID")
     changed = [dict(item, decision="process", reason="reopened") if item["document_id"] in reopen else item

@@ -1446,8 +1446,9 @@ def package_file_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
             reason = document["reason"]
         rows.append({"file_id": record["file_id"], "path": record["path"], "kind": record["kind"],
                      "role": record["role"],
-                     # A file the name-match pre-pass listed but did not survey reads as unclassified (QQ #99).
-                     "classification_status": "unclassified" if record.get("classification_status") == "not_surveyed"
+                     # A file listed but not surveyed or not examined reads as unclassified (QQ #99).
+                     "classification_status": "unclassified"
+                     if record.get("classification_status") in ("not_surveyed", "not_examined")
                      else record.get("classification_status", "classified"),
                      "requested_assembly_id": None if link is None else link["assembly_id"],
                      "link": "none" if link is None else link["link"],

@@ -5,6 +5,7 @@ fails closed. Run python -m pytest tests/test_package_evidence_inventory.py.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 import stat
@@ -82,8 +83,58 @@ def read_zip(data: bytes, budget: ArchiveBudget) -> list[tuple[str, bytes]]:
         raise PackageEvidenceError("ARCHIVE_INVALID") from exc
 
 
-def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggregate: bool = True) -> list:
-    """Every member record checked and counted; declared sizes reserved in budget.expanded."""
+def read_zip_listing(data: bytes, budget: ArchiveBudget,
+                     hash_room: list[int]) -> list[tuple[str, bytes | None, str | None, int, str | None]]:
+    """The package survey's reading (QQ #99 blocker 5): read_zip, except one member over the per-member
+    byte or ratio limit no longer fails the whole archive. That member is listed, not read.
+
+    Returns (name, payload, sha256, size, code) per file member. A read member has its payload and no
+    code. A member listed, not read, has payload None and its limit code. Its bytes are streamed once
+    for their SHA-256 and true size and are never held. hash_room[0] bounds the bytes streamed that way
+    across the package; a member past it fails the archive with its limit code, as before. Every other
+    check (paths, duplicates, count, aggregate, encryption, compression, CRC) still fails the archive.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            over: dict[str, str] = {}
+            infos = _validated_infos(archive, budget, over_limit=over)
+            result: list[tuple[str, bytes | None, str | None, int, str | None]] = []
+            for info in infos:
+                if info.is_dir():
+                    continue
+                if info.filename in over:
+                    code = over[info.filename]
+                    require(info.file_size <= hash_room[0], code)
+                    hash_room[0] -= info.file_size
+                    hasher, size = hashlib.sha256(), 0
+                    with archive.open(info) as stream:
+                        while chunk := stream.read(1 << 20):
+                            size += len(chunk)
+                            # The declared size bounds the stream: a member that lies about it stops here.
+                            require(size <= info.file_size, "ARCHIVE_SIZE_MISMATCH")
+                            hasher.update(chunk)
+                    require(size == info.file_size, "ARCHIVE_SIZE_MISMATCH")
+                    result.append((info.filename, None, hasher.hexdigest(), size, code))
+                    continue
+                with archive.open(info) as stream:
+                    payload = stream.read(budget.limits.member_bytes + 1)
+                    require(len(payload) == info.file_size and not stream.read(1),
+                            "ARCHIVE_SIZE_MISMATCH")
+                result.append((info.filename, payload, None, len(payload), None))
+            return result
+    except PackageEvidenceError:
+        raise
+    except (Exception, ) as exc:
+        raise PackageEvidenceError("ARCHIVE_INVALID") from exc
+
+
+def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggregate: bool = True,
+                     over_limit: dict[str, str] | None = None) -> list:
+    """Every member record checked and counted; declared sizes reserved in budget.expanded.
+
+    over_limit (the survey's listing only): a file member over the per-member byte or ratio limit is
+    recorded there with its code and not reserved, instead of failing the archive.
+    """
     infos = archive.infolist()
     budget.members += len(infos)
     require(budget.members <= budget.limits.members, "ARCHIVE_MEMBER_LIMIT")
@@ -111,6 +162,13 @@ def _validated_infos(archive: zipfile.ZipFile, budget: ArchiveBudget, *, aggrega
         require(not info.flag_bits & (1 | 64), "ARCHIVE_ENCRYPTED")
         require(info.compress_type in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED},
                 "ARCHIVE_COMPRESSION")
+        if over_limit is not None and not info.is_dir():
+            code = ("ARCHIVE_BYTE_LIMIT" if info.file_size > budget.limits.member_bytes
+                    else "ARCHIVE_RATIO_LIMIT" if info.file_size > max(info.compress_size, 1) * budget.limits.ratio
+                    else None)
+            if code is not None:
+                over_limit[info.filename] = code
+                continue
         require(0 <= info.file_size <= budget.limits.member_bytes, "ARCHIVE_BYTE_LIMIT")
         require(info.file_size <= max(info.compress_size, 1) * budget.limits.ratio,
                 "ARCHIVE_RATIO_LIMIT")

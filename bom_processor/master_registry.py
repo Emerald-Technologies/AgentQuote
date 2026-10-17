@@ -22,6 +22,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 from xml.etree import ElementTree
 
+from .text_encoding import csv_encoding
+
 MAX_PROFILE_BYTES = 32 * 1024 * 1024
 MAX_CANDIDATE_BYTES = 8 * 1024 * 1024
 MAX_ZIP_ENTRIES = 256
@@ -126,7 +128,8 @@ class StructuralProfile:
 def _csv_profile(data: bytes):
     from .layout_heading import READ_ROWS
     rows = []
-    for row in csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace"))):
+    # A UTF-16 byte-order mark selects UTF-16 (text_encoding.csv_encoding); otherwise UTF-8 as before.
+    for row in csv.reader(io.StringIO(data.decode(csv_encoding(data), errors="replace"))):
         rows.append(tuple(normalize_header(cell) for cell in row[:MAX_HEADER_CELLS]))
         if len(rows) == READ_ROWS: break
     return ("Sheet1",), {"Sheet1": tuple(rows[:MAX_HEADER_ROWS])}, {"Sheet1": tuple(enumerate(rows, 1))}

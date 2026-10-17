@@ -164,3 +164,21 @@ def test_an_archive_that_cannot_be_opened_is_listed_and_does_not_stop_the_pre_pa
     record = next(item for item in result["survey"]["files"] if item["path"] == "XYZ0110-99999.zip")
     assert finding["file_ids"] == [record["file_id"]] and record["role"] == "not_surveyed"
     assert decisions(result)["doc-1"] == ("process", "only_bom", [A1])
+
+
+# --- QQ #99 D5: an empty or header-only spreadsheet has nothing to read ---------------------------
+
+@pytest.mark.parametrize("extra", [
+    # A header-only copy named for assembly 1 is not a second BOM for it.
+    {"0100-11111 BOM template.csv": b"Item,Part Number,Manufacturer,MPN,Qty\r\n"},
+    # An empty top-level spreadsheet names no assembly, yet does not make the package doubtful.
+    {"notes.csv": b""},
+    {"Quote request.xlsx": xlsx({"Request": [["Customer", "Date"]], "Blank": []})},
+])
+def test_an_empty_or_header_only_top_level_spreadsheet_does_not_stop_the_pre_pass(extra):
+    result = decide(request(), roots(**extra), no_model)
+    name = next(iter(extra))
+    record = next(item for item in result["survey"]["files"] if item["path"] == name)
+    assert record["role"] == "not_surveyed" and not result["survey"]["has_blocking_findings"]
+    assert decisions(result)["doc-1"] == ("process", "only_bom", [A1])
+    assert decisions(result)["doc-2"] == ("process", "only_bom", [A2])
