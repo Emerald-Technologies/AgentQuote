@@ -246,11 +246,14 @@ class _Plan:
         # Package name rules (Nick 2026-10-14): code maps a file only when the rule and any survey
         # reading agree. Board and kit matches are linked by code and not sent to the model; a
         # BOM-file match is a placement clue only. A disagreement leaves the file to the model.
-        from .package_evidence_name_rules import match_names
+        # A general path clue (D7, 2026-10-17) only fills in where the survey gave no reading.
+        from .package_evidence_name_rules import PATH_RULE, match_names
         self.rule_links: dict[str, dict] = {}
         for identity, match in match_names(self.files, self.paths, self.assemblies, rows["occurrences"]).items():
             clue = self.clues.get(identity)
             if clue is not None and clue["assembly"] not in (None, match["assembly"]):
+                continue
+            if match["rule"] == PATH_RULE and clue is not None and clue["assembly"] is not None:
                 continue
             self.clues[identity] = {"assembly": match["assembly"], "link": "unconfirmed",
                                     "kind": "name rule " + match["rule"], "rule": match}
